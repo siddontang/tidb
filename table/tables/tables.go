@@ -1612,6 +1612,8 @@ func (t *TableCommon) GetSequenceNextVal(ctx interface{}, dbName, seqName string
 	seq.mu.Lock()
 	defer seq.mu.Unlock()
 
+	SessionID := ctx.(sessionctx.Context).GetSessionVars().ConnectionID
+
 	err = func() error {
 		// Check if need to update the cache batch from storage.
 		// Because seq.base is not always the last allocated value (may be set by setval()).
@@ -1637,6 +1639,7 @@ func (t *TableCommon) GetSequenceNextVal(ctx interface{}, dbName, seqName string
 			}
 		}
 		if !updateCache {
+			nextVal = int64((SessionID%1000)*uint64(math.Pow(10, 15)) + uint64(nextVal))
 			return nil
 		}
 		// Update batch alloc from kv storage.
@@ -1671,6 +1674,7 @@ func (t *TableCommon) GetSequenceNextVal(ctx interface{}, dbName, seqName string
 		if !ok {
 			return errors.New("can't find the first value in sequence cache")
 		}
+		nextVal = int64((SessionID%1000)*uint64(math.Pow(10, 15)) + uint64(nextVal))
 		return nil
 	}()
 	// Sequence alloc in kv store error.
