@@ -1611,7 +1611,7 @@ func (t *TableCommon) GetSequenceNextVal(ctx interface{}, dbName, seqName string
 	}
 	seq.mu.Lock()
 	defer seq.mu.Unlock()
-	serverID := ctx.(sessionctx.Context).GetSessionVars().ConnectionInfo().ServerID
+	serverID := ctx.(sessionctx.Context).GetSessionVars().ConnectionInfo.ServerID
 	ConnectionID := ctx.(sessionctx.Context).GetSessionVars().ConnectionID
 	if err != nil {
 		err := errors.New("Parse ConnectionID failed: " + err.Error())

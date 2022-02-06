@@ -524,6 +524,7 @@ func (s *Server) onConn(conn *clientConn) {
 		terror.Log(conn.Close())
 		return
 	}
+	conn.ctx.GetSessionVars().ConnectionInfo = conn.connectInfo()
 
 	logutil.Logger(ctx).Debug("new connection", zap.String("remoteAddr", conn.bufReadConn.RemoteAddr().String()))
 
