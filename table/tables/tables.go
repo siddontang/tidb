@@ -1684,7 +1684,7 @@ func (t *TableCommon) GetSequenceNextVal(ctx interface{}, dbName, seqName string
 		}
 		return 0, err
 	}
-	seq.base = nextVal
+	seq.base = nextVal % int64(math.Pow(10, 15))
 	return nextVal, nil
 }
 
