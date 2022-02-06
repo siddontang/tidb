@@ -1612,7 +1612,12 @@ func (t *TableCommon) GetSequenceNextVal(ctx interface{}, dbName, seqName string
 	seq.mu.Lock()
 	defer seq.mu.Unlock()
 
-	SessionID := ctx.(sessionctx.Context).GetSessionVars().ConnectionID
+	ConnectionID := ctx.(sessionctx.Context).GetSessionVars().ConnectionID
+	GlobalConnID, _, err := util.ParseGlobalConnID(ConnectionID)
+	if err != nil {
+		err := errors.New("Parse ConnectionID failed: " + err.Error())
+		return 0, err
+	}
 
 	err = func() error {
 		// Check if need to update the cache batch from storage.
@@ -1639,7 +1644,7 @@ func (t *TableCommon) GetSequenceNextVal(ctx interface{}, dbName, seqName string
 			}
 		}
 		if !updateCache {
-			nextVal = int64((SessionID%1000)*uint64(math.Pow(10, 15)) + uint64(nextVal))
+			nextVal = AppendScalablePrefix(GlobalConnID, nextVal)
 			return nil
 		}
 		// Update batch alloc from kv storage.
@@ -1674,7 +1679,7 @@ func (t *TableCommon) GetSequenceNextVal(ctx interface{}, dbName, seqName string
 		if !ok {
 			return errors.New("can't find the first value in sequence cache")
 		}
-		nextVal = int64((SessionID%1000)*uint64(math.Pow(10, 15)) + uint64(nextVal))
+		nextVal = AppendScalablePrefix(GlobalConnID, nextVal)
 		return nil
 	}()
 	// Sequence alloc in kv store error.
@@ -1686,6 +1691,13 @@ func (t *TableCommon) GetSequenceNextVal(ctx interface{}, dbName, seqName string
 	}
 	seq.base = nextVal % int64(math.Pow(10, 15))
 	return nextVal, nil
+}
+
+func AppendScalablePrefix(GlobalConnID util.GlobalConnID, nextVal int64) int64 {
+	var highPrefix, lowPrefix uint64
+	highPrefix = ((GlobalConnID.ServerID + 1) % 100) * uint64(math.Pow(10, 18))
+	lowPrefix = ((GlobalConnID.LocalConnID + 1) % 1000) * uint64(math.Pow(10, 15))
+	return int64(highPrefix) + int64(lowPrefix) + nextVal
 }
 
 // SetSequenceVal implements util.SequenceTable SetSequenceVal interface.
