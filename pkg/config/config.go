@@ -328,6 +328,56 @@ type Config struct {
 
 	// MeteringConfigURI is the URI for metering configuration.
 	MeteringStorageURI string `toml:"metering-storage-uri" json:"metering-storage-uri"`
+
+	// Services contains the service architecture configuration.
+	Services ServicesConfig `toml:"services" json:"services"`
+}
+
+// ServicesConfig contains configuration for the multi-service architecture.
+type ServicesConfig struct {
+	// Mode determines whether services run in-process or distributed.
+	// Valid values: "monolithic" (default), "distributed"
+	Mode string `toml:"mode" json:"mode"`
+
+	// Enabled lists which services to run in this instance.
+	// Only used in distributed mode. If empty in monolithic mode, all services run.
+	Enabled []string `toml:"enabled" json:"enabled"`
+
+	// Registry contains service registry configuration.
+	Registry ServiceRegistryConfig `toml:"registry" json:"registry"`
+
+	// Remote contains addresses of remote services (distributed mode).
+	Remote RemoteServicesConfig `toml:"remote" json:"remote"`
+}
+
+// ServiceRegistryConfig contains configuration for the service registry.
+type ServiceRegistryConfig struct {
+	// Type is the registry type: "local" or "etcd".
+	Type string `toml:"type" json:"type"`
+
+	// Endpoints is the list of registry endpoints (for etcd).
+	Endpoints []string `toml:"endpoints" json:"endpoints"`
+
+	// Prefix is the key prefix for service registration.
+	Prefix string `toml:"prefix" json:"prefix"`
+}
+
+// RemoteServicesConfig contains addresses for remote services.
+type RemoteServicesConfig struct {
+	// DDL is the address of the DDL service.
+	DDL string `toml:"ddl" json:"ddl"`
+
+	// Statistics is the address of the statistics service.
+	Statistics string `toml:"statistics" json:"statistics"`
+
+	// Schema is the address of the schema service.
+	Schema string `toml:"schema" json:"schema"`
+
+	// Transaction is the address of the transaction service.
+	Transaction string `toml:"transaction" json:"transaction"`
+
+	// Coprocessor is the address of the coprocessor service.
+	Coprocessor string `toml:"coprocessor" json:"coprocessor"`
 }
 
 // UpdateTempStoragePath is to update the `TempStoragePath` if port/statusPort was changed
