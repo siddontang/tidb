@@ -49,7 +49,7 @@ func NewManager(cfg *Config) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	var registry Registry
-	if cfg.Mode == ModeDistributed {
+	if cfg.Mode == ModeDistributed && cfg.Registry.Type == "etcd" {
 		etcdCfg := EtcdRegistryConfig{
 			Endpoints: cfg.Registry.Endpoints,
 			Prefix:    cfg.Registry.Prefix,

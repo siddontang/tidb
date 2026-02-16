@@ -25,6 +25,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/service"
 	"github.com/pingcap/tidb/pkg/service/admin"
+	"github.com/pingcap/tidb/pkg/service/metadata"
 	schemaSvc "github.com/pingcap/tidb/pkg/service/schema"
 	"github.com/pingcap/tidb/pkg/service/stats"
 	"github.com/pingcap/tidb/pkg/service/storage"
@@ -64,6 +65,7 @@ func main() {
 		Mode: service.ModeDistributed,
 		EnabledServices: []string{
 			service.ServiceStorage,
+			service.ServiceMetadata,
 			service.ServiceSchema,
 			service.ServiceStatistics,
 			service.ServiceAdmin,
@@ -87,12 +89,16 @@ func main() {
 
 	// Register services
 	storageSvc := storage.New()
+	metadataSvc := metadata.New()
 	schemaService := schemaSvc.New()
 	statsSvc := stats.New()
 	adminSvc := admin.New()
 
 	if err := manager.Register(storageSvc); err != nil {
 		logger.Fatal("Failed to register storage service", zap.Error(err))
+	}
+	if err := manager.Register(metadataSvc); err != nil {
+		logger.Fatal("Failed to register metadata service", zap.Error(err))
 	}
 	if err := manager.Register(schemaService); err != nil {
 		logger.Fatal("Failed to register schema service", zap.Error(err))

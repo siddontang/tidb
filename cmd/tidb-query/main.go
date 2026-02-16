@@ -25,18 +25,20 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/service"
 	"github.com/pingcap/tidb/pkg/service/admin"
-	"github.com/pingcap/tidb/pkg/service/copr"
+	"github.com/pingcap/tidb/pkg/service/metadata"
 	"github.com/pingcap/tidb/pkg/service/query"
-	sessionSvc "github.com/pingcap/tidb/pkg/service/session"
+	"github.com/pingcap/tidb/pkg/service/storage"
 	"github.com/pingcap/tidb/pkg/util/logutil"
 	"github.com/pingcap/tidb/pkg/util/printer"
 	"go.uber.org/zap"
 )
 
 var (
-	version    = flag.Bool("V", false, "print version information and exit")
-	configPath = flag.String("config", "", "config file path")
-	statusPort = flag.Int("status", 10083, "tidb status port")
+	version     = flag.Bool("V", false, "print version information and exit")
+	configPath  = flag.String("config", "", "config file path")
+	storagePath = flag.String("path", "tikv://127.0.0.1:2379", "storage path")
+	grpcAddr    = flag.String("grpc-addr", "0.0.0.0:4001", "gRPC server address")
+	statusPort  = flag.Int("status", 10084, "tidb status port")
 )
 
 func main() {
@@ -55,21 +57,29 @@ func main() {
 	}
 
 	logger := logutil.BgLogger()
-	logger.Info("Starting TiDB Query Service",
+	logger.Info("Starting TiDB Query Service (Distributed Mode)",
 		zap.String("version", mysql.TiDBReleaseVersion))
 
 	// Create service configuration for distributed mode
 	svcCfg := &service.Config{
 		Mode: service.ModeDistributed,
 		EnabledServices: []string{
-			service.ServiceSession,
-			service.ServiceCoprocessor,
+			service.ServiceStorage,
+			service.ServiceMetadata,
 			service.ServiceQuery,
 			service.ServiceAdmin,
 		},
 		Registry: service.RegistryConfig{
 			Type:      "etcd",
 			Endpoints: []string{"127.0.0.1:2379"},
+		},
+		ServiceConfigs: map[string]any{
+			service.ServiceStorage: storage.Config{
+				Path: *storagePath,
+			},
+			service.ServiceQuery: query.Config{
+				GRPCAddr: *grpcAddr,
+			},
 		},
 	}
 
@@ -79,17 +89,17 @@ func main() {
 		logger.Fatal("Failed to create service manager", zap.Error(err))
 	}
 
-	// Register services
-	session := sessionSvc.New()
-	coprSvc := copr.New()
+	// Register services in dependency order
+	storageSvc := storage.New()
+	metadataSvc := metadata.New()
 	querySvc := query.New()
 	adminSvc := admin.New()
 
-	if err := manager.Register(session); err != nil {
-		logger.Fatal("Failed to register session service", zap.Error(err))
+	if err := manager.Register(storageSvc); err != nil {
+		logger.Fatal("Failed to register storage service", zap.Error(err))
 	}
-	if err := manager.Register(coprSvc); err != nil {
-		logger.Fatal("Failed to register coprocessor service", zap.Error(err))
+	if err := manager.Register(metadataSvc); err != nil {
+		logger.Fatal("Failed to register metadata service", zap.Error(err))
 	}
 	if err := manager.Register(querySvc); err != nil {
 		logger.Fatal("Failed to register query service", zap.Error(err))
@@ -106,7 +116,9 @@ func main() {
 		logger.Fatal("Failed to start services", zap.Error(err))
 	}
 
-	logger.Info("TiDB Query Service started",
+	logger.Info("TiDB Query Service started (Distributed Mode)",
+		zap.String("storage", *storagePath),
+		zap.String("grpc_addr", *grpcAddr),
 		zap.Int("status_port", *statusPort))
 
 	// Wait for shutdown signal

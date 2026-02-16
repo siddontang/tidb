@@ -18,7 +18,14 @@ import (
 	"context"
 	"sync"
 
+	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/pkg/domain"
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/service"
+	storageSvc "github.com/pingcap/tidb/pkg/service/storage"
+	"github.com/pingcap/tidb/pkg/session"
+	"github.com/pingcap/tidb/pkg/util/logutil"
+	"go.uber.org/zap"
 )
 
 // Config contains configuration for the query service.
@@ -28,6 +35,9 @@ type Config struct {
 
 	// MemQuotaQuery is the memory quota for a single query.
 	MemQuotaQuery int64 `toml:"mem-quota-query" json:"mem-quota-query"`
+
+	// GRPCAddr is the address for the gRPC server.
+	GRPCAddr string `toml:"grpc-addr" json:"grpc-addr"`
 }
 
 // DefaultConfig returns the default query service configuration.
@@ -35,6 +45,7 @@ func DefaultConfig() Config {
 	return Config{
 		MaxExecutionTime: 0,       // 0 means no limit
 		MemQuotaQuery:    1 << 30, // 1GB
+		GRPCAddr:         "0.0.0.0:4001",
 	}
 }
 
@@ -43,8 +54,11 @@ func DefaultConfig() Config {
 type Service struct {
 	*service.BaseService
 
-	mu     sync.RWMutex
-	config Config
+	mu          sync.RWMutex
+	config      Config
+	store       kv.Storage
+	dom         *domain.Domain
+	grpcHandler *GRPCHandler
 }
 
 // New creates a new query service.
@@ -52,16 +66,14 @@ func New() *Service {
 	return &Service{
 		BaseService: service.NewBaseService(
 			service.ServiceQuery,
-			service.ServiceSession,
-			service.ServiceSchema,
-			service.ServiceCoprocessor,
+			service.ServiceStorage,
 		),
 		config: DefaultConfig(),
 	}
 }
 
 // Init initializes the query service.
-func (s *Service) Init(_ context.Context, opts service.Options) error {
+func (s *Service) Init(ctx context.Context, opts service.Options) error {
 	s.InitBase(opts)
 
 	// Extract configuration
@@ -71,37 +83,108 @@ func (s *Service) Init(_ context.Context, opts service.Options) error {
 		s.config = cfg
 	}
 
+	// Get storage from registry
+	storageSvcAny, err := opts.Registry.GetClient(ctx, service.ServiceStorage)
+	if err != nil {
+		return errors.Wrap(err, "failed to get storage service")
+	}
+	storageService, ok := storageSvcAny.(*storageSvc.Service)
+	if !ok {
+		return errors.New("invalid storage service type")
+	}
+	s.store = storageService.Storage()
+
 	s.SetHealth(service.HealthStatus{State: service.StateHealthy})
 	return nil
 }
 
 // Start starts the query service.
 func (s *Service) Start(_ context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Bootstrap domain if we have storage
+	if s.store != nil && s.dom == nil {
+		dom, err := session.BootstrapSession(s.store)
+		if err != nil {
+			return errors.Wrap(err, "failed to bootstrap domain")
+		}
+		s.dom = dom
+	}
+
+	// Start gRPC server if configured
+	if s.config.GRPCAddr != "" && s.store != nil {
+		s.grpcHandler = NewGRPCHandler(s.store, s.dom, s.config.GRPCAddr)
+		if err := s.grpcHandler.Start(); err != nil {
+			return errors.Wrap(err, "failed to start gRPC server")
+		}
+		logutil.BgLogger().Info("Query service gRPC server started",
+			zap.String("addr", s.config.GRPCAddr))
+	}
+
 	s.SetHealth(service.HealthStatus{State: service.StateHealthy})
 	return nil
 }
 
 // Stop stops the query service.
 func (s *Service) Stop(_ context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.SetHealth(service.HealthStatus{State: service.StateStopping})
+
+	if s.grpcHandler != nil {
+		s.grpcHandler.Stop()
+		s.grpcHandler = nil
+	}
+
+	if s.dom != nil {
+		s.dom.Close()
+		s.dom = nil
+	}
+
 	s.SetHealth(service.HealthStatus{State: service.StateStopped})
 	return nil
+}
+
+// SetStore sets the storage (for testing).
+func (s *Service) SetStore(store kv.Storage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store = store
+}
+
+// SetDomain sets the domain (for testing).
+func (s *Service) SetDomain(dom *domain.Domain) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dom = dom
+}
+
+// GRPCAddr returns the gRPC server address.
+func (s *Service) GRPCAddr() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.grpcHandler != nil {
+		return s.grpcHandler.Addr()
+	}
+	return ""
 }
 
 // QueryClient defines the client interface for remote query execution.
 type QueryClient interface {
 	// Execute executes a SQL query.
-	Execute(ctx context.Context, req *QueryRequest) (*QueryResponse, error)
+	Execute(ctx context.Context, req *QueryExecRequest) (*QueryExecResponse, error)
 
 	// Prepare prepares a SQL statement.
 	Prepare(ctx context.Context, sql string) (*PreparedStatement, error)
 
 	// ExecutePrepared executes a prepared statement.
-	ExecutePrepared(ctx context.Context, stmtID uint32, params []any) (*QueryResponse, error)
+	ExecutePrepared(ctx context.Context, stmtID uint32, params []any) (*QueryExecResponse, error)
 }
 
-// QueryRequest represents a query execution request.
-type QueryRequest struct {
+// QueryExecRequest represents a query execution request.
+type QueryExecRequest struct {
 	// SessionID is the session identifier.
 	SessionID uint64
 
@@ -115,10 +198,10 @@ type QueryRequest struct {
 	Variables map[string]string
 }
 
-// QueryResponse represents a query execution response.
-type QueryResponse struct {
+// QueryExecResponse represents a query execution response.
+type QueryExecResponse struct {
 	// Columns contains column metadata.
-	Columns []*ColumnInfo
+	Columns []*ColumnMeta
 
 	// Rows contains the result rows.
 	Rows [][]any
@@ -133,8 +216,8 @@ type QueryResponse struct {
 	Warnings []string
 }
 
-// ColumnInfo contains column metadata.
-type ColumnInfo struct {
+// ColumnMeta contains column metadata.
+type ColumnMeta struct {
 	// Name is the column name.
 	Name string
 
@@ -154,7 +237,7 @@ type PreparedStatement struct {
 	ParamCount int
 
 	// Columns contains column metadata for the result set.
-	Columns []*ColumnInfo
+	Columns []*ColumnMeta
 }
 
 // Ensure Service implements service.Service.
@@ -172,11 +255,11 @@ type localClient struct {
 }
 
 // Execute executes a SQL query.
-func (c *localClient) Execute(_ context.Context, _ *QueryRequest) (*QueryResponse, error) {
+func (c *localClient) Execute(_ context.Context, _ *QueryExecRequest) (*QueryExecResponse, error) {
 	// In a full implementation, this would parse, plan, and execute the query
 	// using the session, planner, and executor components.
 	// For now, this is a placeholder that indicates the architecture.
-	return &QueryResponse{}, nil
+	return &QueryExecResponse{}, nil
 }
 
 // Prepare prepares a SQL statement.
@@ -185,6 +268,6 @@ func (c *localClient) Prepare(_ context.Context, _ string) (*PreparedStatement, 
 }
 
 // ExecutePrepared executes a prepared statement.
-func (c *localClient) ExecutePrepared(_ context.Context, _ uint32, _ []any) (*QueryResponse, error) {
-	return &QueryResponse{}, nil
+func (c *localClient) ExecutePrepared(_ context.Context, _ uint32, _ []any) (*QueryExecResponse, error) {
+	return &QueryExecResponse{}, nil
 }

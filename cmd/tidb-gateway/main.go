@@ -20,25 +20,34 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
+	"github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/ddl"
+	"github.com/pingcap/tidb/pkg/domain"
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
-	"github.com/pingcap/tidb/pkg/service"
-	"github.com/pingcap/tidb/pkg/service/admin"
-	"github.com/pingcap/tidb/pkg/service/gateway"
-	"github.com/pingcap/tidb/pkg/service/query"
-	"github.com/pingcap/tidb/pkg/service/session"
+	"github.com/pingcap/tidb/pkg/session"
+	kvstore "github.com/pingcap/tidb/pkg/store"
+	"github.com/pingcap/tidb/pkg/store/driver"
+	"github.com/pingcap/tidb/pkg/store/mockstore"
 	"github.com/pingcap/tidb/pkg/util/logutil"
 	"github.com/pingcap/tidb/pkg/util/printer"
 	"go.uber.org/zap"
+
+	"github.com/pingcap/tidb/pkg/service"
+	"github.com/pingcap/tidb/pkg/service/admin"
+	"github.com/pingcap/tidb/pkg/service/gateway"
 )
 
 var (
-	version    = flag.Bool("V", false, "print version information and exit")
-	configPath = flag.String("config", "", "config file path")
-	host       = flag.String("host", "0.0.0.0", "tidb gateway host")
-	port       = flag.Int("P", 4000, "tidb gateway port")
-	statusPort = flag.Int("status", 10080, "tidb status port")
+	version     = flag.Bool("V", false, "print version information and exit")
+	configPath  = flag.String("config", "", "config file path")
+	host        = flag.String("host", "0.0.0.0", "tidb gateway host")
+	port        = flag.Int("P", 4000, "tidb gateway port")
+	statusPort  = flag.Int("status", 10080, "tidb status port")
+	storagePath = flag.String("path", "tikv://127.0.0.1:2379", "TiKV storage path")
 )
 
 func main() {
@@ -50,8 +59,8 @@ func main() {
 	}
 
 	// Initialize logging
-	cfg := logutil.NewLogConfig("info", "text", "", "", logutil.EmptyFileLogConfig, false)
-	if err := logutil.InitLogger(cfg); err != nil {
+	logCfg := logutil.NewLogConfig("info", "text", "", "", logutil.EmptyFileLogConfig, false)
+	if err := logutil.InitLogger(logCfg); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
 		os.Exit(1)
 	}
@@ -60,39 +69,59 @@ func main() {
 	logger.Info("Starting TiDB Gateway Service",
 		zap.String("version", mysql.TiDBReleaseVersion))
 
-	// Create service configuration for distributed mode
+	// Initialize configuration
+	cfg := config.GetGlobalConfig()
+	cfg.Store = config.StoreTypeTiKV
+	cfg.Path = *storagePath
+	config.StoreGlobalConfig(cfg)
+
+	// Register drivers
+	registerDrivers(logger)
+
+	// Initialize storage and domain (like tidb-server does)
+	store, dom, err := initStorageAndDomain()
+	if err != nil {
+		logger.Fatal("Failed to initialize storage and domain", zap.Error(err))
+	}
+	defer func() {
+		dom.Close()
+		store.Close()
+	}()
+
+	logger.Info("Storage and domain initialized successfully")
+
+	// Create service manager
 	svcCfg := &service.Config{
 		Mode: service.ModeDistributed,
 		EnabledServices: []string{
 			service.ServiceGateway,
-			service.ServiceQuery,
-			service.ServiceSession,
 			service.ServiceAdmin,
 		},
 		Registry: service.RegistryConfig{
-			Type:      "etcd",
-			Endpoints: []string{"127.0.0.1:2379"},
+			Type: "local",
 		},
 	}
 
-	// Create service manager
 	manager, err := service.NewManager(svcCfg)
 	if err != nil {
 		logger.Fatal("Failed to create service manager", zap.Error(err))
 	}
 
-	// Register services
+	// Create gateway with pre-initialized backend
 	gatewaySvc := gateway.New()
-	sessionSvc := session.New()
-	querySvc := query.New()
+	backend := gateway.NewTiDBBackend(store, dom)
+	clients := gateway.NewLocalBackendClient(backend)
+
+	gatewayCfg := gateway.Config{
+		Host:            *host,
+		Port:            uint(*port),
+		UseLocalBackend: false, // We're setting clients directly
+	}
+	gatewaySvc.SetConfig(gatewayCfg)
+	gatewaySvc.SetClients(clients)
+
 	adminSvc := admin.New()
 
-	if err := manager.Register(sessionSvc); err != nil {
-		logger.Fatal("Failed to register session service", zap.Error(err))
-	}
-	if err := manager.Register(querySvc); err != nil {
-		logger.Fatal("Failed to register query service", zap.Error(err))
-	}
 	if err := manager.Register(gatewaySvc); err != nil {
 		logger.Fatal("Failed to register gateway service", zap.Error(err))
 	}
@@ -111,7 +140,8 @@ func main() {
 	logger.Info("TiDB Gateway Service started",
 		zap.String("host", *host),
 		zap.Int("port", *port),
-		zap.Int("status_port", *statusPort))
+		zap.Int("status_port", *statusPort),
+		zap.String("storage", *storagePath))
 
 	// Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)
@@ -126,4 +156,47 @@ func main() {
 	}
 
 	logger.Info("TiDB Gateway Service stopped")
+}
+
+func registerDrivers(logger *zap.Logger) {
+	if err := kvstore.Register(config.StoreTypeTiKV, &driver.TiKVDriver{}); err != nil {
+		if !isAlreadyRegisteredError(err) {
+			logger.Fatal("Failed to register TiKV driver", zap.Error(err))
+		}
+	}
+	if err := kvstore.Register(config.StoreTypeMockTiKV, mockstore.MockTiKVDriver{}); err != nil {
+		if !isAlreadyRegisteredError(err) {
+			logger.Fatal("Failed to register MockTiKV driver", zap.Error(err))
+		}
+	}
+}
+
+func initStorageAndDomain() (kv.Storage, *domain.Domain, error) {
+	cfg := config.GetGlobalConfig()
+
+	// Initialize storage using the same pattern as tidb-server
+	store, err := kvstore.New(cfg.Path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create store: %w", err)
+	}
+
+	// Start DDL owner manager before bootstrapping session (required for DDL)
+	err = ddl.StartOwnerManager(context.Background(), store)
+	if err != nil {
+		store.Close()
+		return nil, nil, fmt.Errorf("failed to start DDL owner manager: %w", err)
+	}
+
+	// Bootstrap session and domain
+	dom, err := session.BootstrapSession(store)
+	if err != nil {
+		store.Close()
+		return nil, nil, fmt.Errorf("failed to bootstrap session: %w", err)
+	}
+
+	return store, dom, nil
+}
+
+func isAlreadyRegisteredError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "already registered")
 }
