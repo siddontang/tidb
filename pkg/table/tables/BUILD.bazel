@@ -76,6 +76,7 @@ go_test(
         "cache_invalidation_notifier_test.go",
         "cache_invalidation_test.go",
         "cache_segment_integration_test.go",
+        "cache_segment_bench_test.go",
         "cache_test.go",
         "cache_segment_test.go",
         "export_test.go",
