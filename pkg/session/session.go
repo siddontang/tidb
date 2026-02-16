@@ -598,15 +598,19 @@ func (s *session) doCommit(ctx context.Context) error {
 
 var cachedTableInvalidationEpoch uint64
 
-func nextCachedTableInvalidationEpoch() uint64 {
+func nextCachedTableInvalidationEpoch(commitTS uint64) uint64 {
+	if commitTS > 0 {
+		// CommitTS is cluster-orderable and suitable as cross-instance invalidation epoch.
+		return commitTS
+	}
 	return atomic.AddUint64(&cachedTableInvalidationEpoch, 1)
 }
 
 func applyCachedTableInvalidationEvents(s *session, tables map[int64]any, commitTS uint64) {
 	events := make([]tablecache.CachedTableInvalidationEvent, 0, len(tables))
+	epoch := nextCachedTableInvalidationEpoch(commitTS)
 	for _, raw := range tables {
 		tbl := raw.(table.CachedTable)
-		epoch := nextCachedTableInvalidationEpoch()
 		tbl.ApplyLocalInvalidation(epoch, commitTS)
 		events = append(events, tablecache.CachedTableInvalidationEvent{
 			TableID:    tbl.Meta().ID,

@@ -3,6 +3,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "domain",
     srcs = [
+        "cached_table_invalidation.go",
         "domain.go",
         "domain_sysvars.go",
         "domainctx.go",
@@ -82,6 +83,8 @@ go_library(
         "//pkg/statistics/handle/util",
         "//pkg/statistics/util",
         "//pkg/store",
+        "//pkg/table",
+        "//pkg/table/tables",
         "//pkg/telemetry",
         "//pkg/ttl/ttlworker",
         "//pkg/types",
@@ -138,6 +141,7 @@ go_test(
     name = "domain_test",
     timeout = "short",
     srcs = [
+        "cached_table_invalidation_test.go",
         "db_test.go",
         "domain_test.go",
         "domain_utils_test.go",
@@ -178,6 +182,7 @@ go_test(
         "//pkg/sessionctx/vardef",
         "//pkg/sessionctx/variable",
         "//pkg/store/mockstore",
+        "//pkg/table/tables",
         "//pkg/testkit",
         "//pkg/testkit/testfailpoint",
         "//pkg/testkit/testsetup",

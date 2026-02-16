@@ -275,7 +275,14 @@ Completed:
 8. Added persistent invalidation log table scaffolding:
    - new system table `mysql.table_cache_invalidation_log` in bootstrap and upgrade.
    - session commit path now appends invalidation events into the log table (best-effort).
+9. Wired a domain-level invalidation replayer loop:
+   - each TiDB polls `mysql.table_cache_invalidation_log` in batches and applies local cache invalidation to matching cached tables.
+   - replay uses table/physical IDs and falls back to partition lookup when needed.
+10. Switched invalidation epoch generation to commit-ts based ordering on write commit:
+   - events now use cluster-orderable epochs for cross-instance replay correctness.
+   - local monotonic fallback remains only when commit-ts is unavailable.
+11. Added focused unit tests for invalidation event normalization/application helpers in `pkg/domain/cached_table_invalidation_test.go`.
 
 Notes:
 1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.
-2. Invalidation notifier currently uses in-memory implementation; cluster-wide fanout consumer/replayer from the log is not wired yet.
+2. Invalidation notifier currently uses in-memory implementation; cluster-wide replay now comes from log polling, while low-latency cross-instance push transport (DDL-like watch/notify) is still pending.
