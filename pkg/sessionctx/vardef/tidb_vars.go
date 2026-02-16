@@ -862,6 +862,10 @@ const (
 	TiDBTableCacheLease = "tidb_table_cache_lease"
 	// TiDBEnableCachedTableAsyncInvalidation indicates whether to use async invalidation scaffold for cached tables.
 	TiDBEnableCachedTableAsyncInvalidation = "tidb_enable_cached_table_async_invalidation"
+	// TiDBCachedTableInvalidationPullInterval controls the background replay polling interval in milliseconds.
+	TiDBCachedTableInvalidationPullInterval = "tidb_cached_table_invalidation_pull_interval"
+	// TiDBCachedTableInvalidationBatchSize controls the number of invalidation rows loaded per replay batch.
+	TiDBCachedTableInvalidationBatchSize = "tidb_cached_table_invalidation_batch_size"
 
 	// TiDBStatsLoadSyncWait indicates the time sql execution will sync-wait for stats load.
 	TiDBStatsLoadSyncWait = "tidb_stats_load_sync_wait"
@@ -1592,6 +1596,8 @@ const (
 	DefEnableLegacyInstanceScope                      = true
 	DefTiDBTableCacheLease                            = 3 // 3s
 	DefTiDBEnableCachedTableAsyncInvalidation         = false
+	DefTiDBCachedTableInvalidationPullInterval        = 200
+	DefTiDBCachedTableInvalidationBatchSize           = 256
 	DefTiDBPersistAnalyzeOptions                      = true
 	DefTiDBStatsLoadSyncWait                          = 100
 	DefTiDBStatsLoadPseudoTimeout                     = true
@@ -1808,29 +1814,31 @@ var (
 	DDLSlowOprThreshold = config.GetGlobalConfig().Instance.DDLSlowOprThreshold
 	GlobalSlowLogRules  = atomic.NewPointer[slowlogrule.GlobalSlowLogRules](
 		&slowlogrule.GlobalSlowLogRules{RulesMap: make(map[int64]*slowlogrule.SlowLogRules)})
-	ForcePriority                             = int32(DefTiDBForcePriority)
-	MaxOfMaxAllowedPacket              uint64 = 1073741824
-	ExpensiveQueryTimeThreshold        uint64 = DefTiDBExpensiveQueryTimeThreshold
-	ExpensiveTxnTimeThreshold          uint64 = DefTiDBExpensiveTxnTimeThreshold
-	MemoryUsageAlarmRatio                     = atomic.NewFloat64(DefMemoryUsageAlarmRatio)
-	MemoryUsageAlarmKeepRecordNum             = atomic.NewInt64(DefMemoryUsageAlarmKeepRecordNum)
-	EnableLocalTxn                            = atomic.NewBool(DefTiDBEnableLocalTxn)
-	MaxTSOBatchWaitInterval                   = atomic.NewFloat64(DefTiDBTSOClientBatchMaxWaitTime)
-	EnableTSOFollowerProxy                    = atomic.NewBool(DefTiDBEnableTSOFollowerProxy)
-	EnablePDFollowerHandleRegion              = atomic.NewBool(DefPDEnableFollowerHandleRegion)
-	EnableBatchQueryRegion                    = atomic.NewBool(DefTiDBEnableBatchQueryRegion)
-	RestrictedReadOnly                        = atomic.NewBool(DefTiDBRestrictedReadOnly)
-	VarTiDBSuperReadOnly                      = atomic.NewBool(DefTiDBSuperReadOnly)
-	PersistAnalyzeOptions                     = atomic.NewBool(DefTiDBPersistAnalyzeOptions)
-	TableCacheLease                           = atomic.NewInt64(DefTiDBTableCacheLease)
-	EnableCachedTableAsyncInvalidation        = atomic.NewBool(DefTiDBEnableCachedTableAsyncInvalidation)
-	StatsLoadSyncWait                         = atomic.NewInt64(DefTiDBStatsLoadSyncWait)
-	StatsLoadPseudoTimeout                    = atomic.NewBool(DefTiDBStatsLoadPseudoTimeout)
-	MemQuotaBindingCache                      = atomic.NewInt64(DefTiDBMemQuotaBindingCache)
-	GCMaxWaitTime                             = atomic.NewInt64(DefTiDBGCMaxWaitTime)
-	StatsCacheMemQuota                        = atomic.NewInt64(DefTiDBStatsCacheMemQuota)
-	OOMAction                                 = atomic.NewString(DefTiDBMemOOMAction)
-	MaxAutoAnalyzeTime                        = atomic.NewInt64(DefTiDBMaxAutoAnalyzeTime)
+	ForcePriority                              = int32(DefTiDBForcePriority)
+	MaxOfMaxAllowedPacket               uint64 = 1073741824
+	ExpensiveQueryTimeThreshold         uint64 = DefTiDBExpensiveQueryTimeThreshold
+	ExpensiveTxnTimeThreshold           uint64 = DefTiDBExpensiveTxnTimeThreshold
+	MemoryUsageAlarmRatio                      = atomic.NewFloat64(DefMemoryUsageAlarmRatio)
+	MemoryUsageAlarmKeepRecordNum              = atomic.NewInt64(DefMemoryUsageAlarmKeepRecordNum)
+	EnableLocalTxn                             = atomic.NewBool(DefTiDBEnableLocalTxn)
+	MaxTSOBatchWaitInterval                    = atomic.NewFloat64(DefTiDBTSOClientBatchMaxWaitTime)
+	EnableTSOFollowerProxy                     = atomic.NewBool(DefTiDBEnableTSOFollowerProxy)
+	EnablePDFollowerHandleRegion               = atomic.NewBool(DefPDEnableFollowerHandleRegion)
+	EnableBatchQueryRegion                     = atomic.NewBool(DefTiDBEnableBatchQueryRegion)
+	RestrictedReadOnly                         = atomic.NewBool(DefTiDBRestrictedReadOnly)
+	VarTiDBSuperReadOnly                       = atomic.NewBool(DefTiDBSuperReadOnly)
+	PersistAnalyzeOptions                      = atomic.NewBool(DefTiDBPersistAnalyzeOptions)
+	TableCacheLease                            = atomic.NewInt64(DefTiDBTableCacheLease)
+	EnableCachedTableAsyncInvalidation         = atomic.NewBool(DefTiDBEnableCachedTableAsyncInvalidation)
+	CachedTableInvalidationPullInterval        = atomic.NewInt64(DefTiDBCachedTableInvalidationPullInterval)
+	CachedTableInvalidationBatchSize           = atomic.NewInt64(DefTiDBCachedTableInvalidationBatchSize)
+	StatsLoadSyncWait                          = atomic.NewInt64(DefTiDBStatsLoadSyncWait)
+	StatsLoadPseudoTimeout                     = atomic.NewBool(DefTiDBStatsLoadPseudoTimeout)
+	MemQuotaBindingCache                       = atomic.NewInt64(DefTiDBMemQuotaBindingCache)
+	GCMaxWaitTime                              = atomic.NewInt64(DefTiDBGCMaxWaitTime)
+	StatsCacheMemQuota                         = atomic.NewInt64(DefTiDBStatsCacheMemQuota)
+	OOMAction                                  = atomic.NewString(DefTiDBMemOOMAction)
+	MaxAutoAnalyzeTime                         = atomic.NewInt64(DefTiDBMaxAutoAnalyzeTime)
 	// variables for plan cache
 	PreparedPlanCacheMemoryGuardRatio   = atomic.NewFloat64(DefTiDBPrepPlanCacheMemoryGuardRatio)
 	EnableInstancePlanCache             = atomic.NewBool(false)

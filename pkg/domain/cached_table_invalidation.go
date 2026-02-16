@@ -34,9 +34,7 @@ import (
 )
 
 const (
-	cachedTableInvalidationPullInterval = 200 * time.Millisecond
-	cachedTableInvalidationBatchSize    = 256
-	cachedTableInvalidationLogTable     = "table_cache_invalidation_log"
+	cachedTableInvalidationLogTable = "table_cache_invalidation_log"
 )
 
 type cachedTableInvalidationTarget interface {
@@ -64,7 +62,8 @@ func applyCachedTableInvalidationEventToTargets(event tablecache.CachedTableInva
 
 func (do *Domain) cachedTableInvalidationPullerLoop() {
 	defer util.Recover(metrics.LabelDomain, "cachedTableInvalidationPullerLoop", nil, false)
-	ticker := time.NewTicker(cachedTableInvalidationPullInterval)
+	pullInterval := loadCachedTableInvalidationPullInterval()
+	ticker := time.NewTicker(pullInterval)
 	defer func() {
 		ticker.Stop()
 		logutil.BgLogger().Info("cachedTableInvalidationPullerLoop exited")
@@ -86,8 +85,15 @@ func (do *Domain) cachedTableInvalidationPullerLoop() {
 			continue
 		}
 
+		latestPullInterval := loadCachedTableInvalidationPullInterval()
+		if latestPullInterval != pullInterval {
+			ticker.Reset(latestPullInterval)
+			pullInterval = latestPullInterval
+		}
+
+		batchSize := loadCachedTableInvalidationBatchSize()
 		for {
-			nextID, loaded, loadErr := do.pullCachedTableInvalidationEvents(lastID, cachedTableInvalidationBatchSize)
+			nextID, loaded, loadErr := do.pullCachedTableInvalidationEvents(lastID, batchSize)
 			if loadErr != nil {
 				if terror.ErrorEqual(loadErr, infoschema.ErrTableNotExists) {
 					break
@@ -96,11 +102,27 @@ func (do *Domain) cachedTableInvalidationPullerLoop() {
 				break
 			}
 			lastID = nextID
-			if loaded < cachedTableInvalidationBatchSize {
+			if loaded < batchSize {
 				break
 			}
 		}
 	}
+}
+
+func loadCachedTableInvalidationPullInterval() time.Duration {
+	ms := vardef.CachedTableInvalidationPullInterval.Load()
+	if ms <= 0 {
+		ms = vardef.DefTiDBCachedTableInvalidationPullInterval
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func loadCachedTableInvalidationBatchSize() int {
+	size := vardef.CachedTableInvalidationBatchSize.Load()
+	if size <= 0 {
+		size = vardef.DefTiDBCachedTableInvalidationBatchSize
+	}
+	return int(size)
 }
 
 func (do *Domain) getLatestCachedTableInvalidationLogID() (uint64, error) {

@@ -284,6 +284,10 @@ Completed:
 11. Added focused unit tests for invalidation event normalization/application helpers in `pkg/domain/cached_table_invalidation_test.go`.
 12. Optimized write-path invalidation-log persistence:
    - commit path now batches multiple table invalidation events into one `INSERT ... VALUES (...), ...` statement.
+13. Added replay tuning knobs for operations/performance:
+   - `tidb_cached_table_invalidation_pull_interval` (ms) to tune pull latency/overhead.
+   - `tidb_cached_table_invalidation_batch_size` to tune catch-up throughput.
+   - domain replay loop reloads these values dynamically.
 
 Notes:
 1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.
