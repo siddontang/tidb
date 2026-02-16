@@ -309,6 +309,9 @@ Completed:
 20. Added hot-range admission threshold control:
    - new switch `tidb_cached_table_hot_range_admission_threshold` (default `1`).
    - allows requiring repeated misses before caching a key to reduce one-hit cache pollution.
+21. Reduced invalidation-log write amplification in async persist path:
+   - queued/synchronous persistence now coalesces duplicate `(table_id, physical_id)` events by latest epoch before `INSERT`.
+   - keeps invalidation correctness while reducing redundant log rows under burst writes.
 
 Notes:
 1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.

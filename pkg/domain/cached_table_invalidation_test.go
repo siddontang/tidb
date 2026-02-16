@@ -111,6 +111,21 @@ func TestTryEnqueueCachedTableInvalidationPersistCopiesEvents(t *testing.T) {
 	require.Equal(t, int64(11), task.events[0].TableID)
 }
 
+func TestTryEnqueueCachedTableInvalidationPersistCoalesces(t *testing.T) {
+	do := &Domain{
+		exit:                             make(chan struct{}),
+		cachedTableInvalidationPersistCh: make(chan cachedTableInvalidationPersistTask, 1),
+	}
+	events := []tablecache.CachedTableInvalidationEvent{
+		{TableID: 11, PhysicalID: 11, CommitTS: 100, Epoch: 100},
+		{TableID: 11, PhysicalID: 11, CommitTS: 101, Epoch: 101},
+	}
+	require.True(t, do.TryEnqueueCachedTableInvalidationPersist(events))
+	task := <-do.cachedTableInvalidationPersistCh
+	require.Len(t, task.events, 1)
+	require.Equal(t, uint64(101), task.events[0].Epoch)
+}
+
 func TestTryEnqueueCachedTableInvalidationPersistQueueFull(t *testing.T) {
 	do := &Domain{
 		exit:                             make(chan struct{}),

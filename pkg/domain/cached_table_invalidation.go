@@ -294,6 +294,7 @@ func (do *Domain) cachedTableInvalidationPersistLoop() {
 					break drain
 				}
 			}
+			batch = coalesceCachedTableInvalidationEvents(batch)
 			if err := do.persistCachedTableInvalidationEvents(batch); err != nil && !terror.ErrorEqual(err, infoschema.ErrTableNotExists) {
 				logutil.BgLogger().Warn("persist cached-table invalidation events failed", zap.Error(err), zap.Int("events", len(batch)))
 			}
@@ -306,7 +307,7 @@ func (do *Domain) enqueueCachedTableInvalidationPersist(events []tablecache.Cach
 		return false
 	}
 	task := cachedTableInvalidationPersistTask{
-		events: append([]tablecache.CachedTableInvalidationEvent(nil), events...),
+		events: append([]tablecache.CachedTableInvalidationEvent(nil), coalesceCachedTableInvalidationEvents(events)...),
 	}
 	select {
 	case <-do.exit:
@@ -329,7 +330,7 @@ func (do *Domain) PersistCachedTableInvalidation(events []tablecache.CachedTable
 	if do == nil || len(events) == 0 {
 		return
 	}
-	err := do.persistCachedTableInvalidationEvents(events)
+	err := do.persistCachedTableInvalidationEvents(coalesceCachedTableInvalidationEvents(events))
 	if err == nil || terror.ErrorEqual(err, infoschema.ErrTableNotExists) {
 		return
 	}
