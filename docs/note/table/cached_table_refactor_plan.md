@@ -303,6 +303,9 @@ Completed:
 18. Added hot-range admission cap control:
    - new switch `tidb_cached_table_hot_range_max_segments` (default `4096`, `0` disables hot-range key admission).
    - prevents unbounded tiny-segment growth under high-cardinality point-get traffic.
+19. Added optional async invalidation-log persistence mode:
+   - new switch `tidb_enable_cached_table_invalidation_async_persist` (default `OFF`).
+   - when enabled, commit path queues log writes to a domain worker (with synchronous fallback on queue saturation) while keeping immediate etcd fanout.
 
 Notes:
 1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.

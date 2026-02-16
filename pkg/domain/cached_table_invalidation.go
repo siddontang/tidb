@@ -17,6 +17,7 @@ package domain
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	ddlutil "github.com/pingcap/tidb/pkg/ddl/util"
@@ -38,9 +39,11 @@ import (
 )
 
 const (
-	cachedTableInvalidationLogTable      = "table_cache_invalidation_log"
-	cachedTableInvalidationNotifyKey     = "/tidb/cached-table/invalidation"
-	cachedTableInvalidationLogGCTickTime = 10 * time.Second
+	cachedTableInvalidationLogTable         = "table_cache_invalidation_log"
+	cachedTableInvalidationNotifyKey        = "/tidb/cached-table/invalidation"
+	cachedTableInvalidationLogGCTickTime    = 10 * time.Second
+	cachedTableInvalidationPersistBatch     = 256
+	cachedTableInvalidationPersistQueueSize = 4096
 )
 
 type cachedTableInvalidationTarget interface {
@@ -55,6 +58,10 @@ type cachedTableInvalidationEventKey struct {
 type cachedTableInvalidationNotifyEvent struct {
 	ServerID uint64                                    `json:"server_id"`
 	Events   []tablecache.CachedTableInvalidationEvent `json:"events"`
+}
+
+type cachedTableInvalidationPersistTask struct {
+	events []tablecache.CachedTableInvalidationEvent
 }
 
 func normalizeCachedTableInvalidationEvent(event tablecache.CachedTableInvalidationEvent) tablecache.CachedTableInvalidationEvent {
@@ -262,6 +269,97 @@ func (do *Domain) cachedTableInvalidationLogGCLoop() {
 			logutil.BgLogger().Warn("cached-table invalidation log gc failed", zap.Error(err), zap.Uint64("cutoffID", cutoff))
 		}
 	}
+}
+
+func (do *Domain) cachedTableInvalidationPersistLoop() {
+	defer util.Recover(metrics.LabelDomain, "cachedTableInvalidationPersistLoop", nil, false)
+	defer logutil.BgLogger().Info("cachedTableInvalidationPersistLoop exited")
+	if do.cachedTableInvalidationPersistCh == nil {
+		return
+	}
+
+	for {
+		select {
+		case <-do.exit:
+			return
+		case task := <-do.cachedTableInvalidationPersistCh:
+			batch := make([]tablecache.CachedTableInvalidationEvent, 0, cachedTableInvalidationPersistBatch)
+			batch = append(batch, task.events...)
+		drain:
+			for len(batch) < cachedTableInvalidationPersistBatch {
+				select {
+				case next := <-do.cachedTableInvalidationPersistCh:
+					batch = append(batch, next.events...)
+				default:
+					break drain
+				}
+			}
+			if err := do.persistCachedTableInvalidationEvents(batch); err != nil && !terror.ErrorEqual(err, infoschema.ErrTableNotExists) {
+				logutil.BgLogger().Warn("persist cached-table invalidation events failed", zap.Error(err), zap.Int("events", len(batch)))
+			}
+		}
+	}
+}
+
+func (do *Domain) enqueueCachedTableInvalidationPersist(events []tablecache.CachedTableInvalidationEvent) bool {
+	if do == nil || len(events) == 0 || do.cachedTableInvalidationPersistCh == nil {
+		return false
+	}
+	task := cachedTableInvalidationPersistTask{
+		events: append([]tablecache.CachedTableInvalidationEvent(nil), events...),
+	}
+	select {
+	case <-do.exit:
+		return false
+	case do.cachedTableInvalidationPersistCh <- task:
+		return true
+	default:
+		return false
+	}
+}
+
+// TryEnqueueCachedTableInvalidationPersist tries queueing invalidation events for async persistence.
+// It returns false when queue is unavailable/full so caller can fallback to synchronous persistence.
+func (do *Domain) TryEnqueueCachedTableInvalidationPersist(events []tablecache.CachedTableInvalidationEvent) bool {
+	return do.enqueueCachedTableInvalidationPersist(events)
+}
+
+// PersistCachedTableInvalidation persists invalidation events synchronously.
+func (do *Domain) PersistCachedTableInvalidation(events []tablecache.CachedTableInvalidationEvent) {
+	if do == nil || len(events) == 0 {
+		return
+	}
+	err := do.persistCachedTableInvalidationEvents(events)
+	if err == nil || terror.ErrorEqual(err, infoschema.ErrTableNotExists) {
+		return
+	}
+	logutil.BgLogger().Warn("persist cached-table invalidation events failed", zap.Error(err), zap.Int("events", len(events)))
+}
+
+func (do *Domain) persistCachedTableInvalidationEvents(events []tablecache.CachedTableInvalidationEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	sql, args := buildCachedTableInvalidationInsertSQL(events)
+	_, err := do.execCachedTableInvalidationRestrictedSQL(sql, args...)
+	return err
+}
+
+func buildCachedTableInvalidationInsertSQL(events []tablecache.CachedTableInvalidationEvent) (string, []any) {
+	var sqlBuilder strings.Builder
+	sqlBuilder.Grow(128 + len(events)*24)
+	sqlBuilder.WriteString("INSERT HIGH_PRIORITY INTO %n.%n (table_id, physical_id, commit_ts, invalidation_epoch) VALUES ")
+
+	args := make([]any, 0, 2+len(events)*4)
+	args = append(args, mysql.SystemDB, cachedTableInvalidationLogTable)
+	for i, event := range events {
+		if i > 0 {
+			sqlBuilder.WriteString(", ")
+		}
+		sqlBuilder.WriteString("(%?, %?, %?, %?)")
+		args = append(args, event.TableID, event.PhysicalID, event.CommitTS, event.Epoch)
+	}
+	return sqlBuilder.String(), args
 }
 
 func loadCachedTableInvalidationPullInterval() time.Duration {

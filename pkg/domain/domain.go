@@ -230,6 +230,8 @@ type Domain struct {
 
 	statsOwner owner.Manager
 
+	cachedTableInvalidationPersistCh chan cachedTableInvalidationPersistTask
+
 	// only used for nextgen
 	crossKSSessMgr           *crossks.Manager
 	crossKSSessFactoryGetter func(string, validatorapi.Validator) pools.Factory
@@ -564,7 +566,8 @@ func NewDomainWithEtcdClient(
 		slowQuery:         newTopNSlowQueries(config.GetGlobalConfig().InMemSlowQueryTopNNum, time.Hour*24*7, config.GetGlobalConfig().InMemSlowQueryRecentNum),
 		dumpFileGcChecker: &dumpFileGcChecker{gcLease: dumpFileGcLease, paths: []string{replayer.GetPlanReplayerDirName(), GetOptimizerTraceDirName(), GetExtractTaskDirName()}},
 
-		crossKSSessFactoryGetter: crossKSSessFactoryGetter,
+		crossKSSessFactoryGetter:         crossKSSessFactoryGetter,
+		cachedTableInvalidationPersistCh: make(chan cachedTableInvalidationPersistTask, cachedTableInvalidationPersistQueueSize),
 	}
 
 	do.advancedSysSessionPool = syssession.NewAdvancedSessionPool(systemSessionPoolSize, func() (syssession.SessionContext, error) {
@@ -816,6 +819,7 @@ func (do *Domain) Start(startMode ddl.StartMode) error {
 	do.wg.Run(do.cachedTableInvalidationPullerLoop, "cachedTableInvalidationPullerLoop")
 	do.wg.Run(do.cachedTableInvalidationWatchLoop, "cachedTableInvalidationWatchLoop")
 	do.wg.Run(do.cachedTableInvalidationLogGCLoop, "cachedTableInvalidationLogGCLoop")
+	do.wg.Run(do.cachedTableInvalidationPersistLoop, "cachedTableInvalidationPersistLoop")
 	skipRegisterToDashboard := gCfg.SkipRegisterToDashboard
 	if !skipRegisterToDashboard {
 		do.wg.Run(func() {

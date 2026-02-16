@@ -85,3 +85,37 @@ func TestCoalesceCachedTableInvalidationEvents(t *testing.T) {
 	require.Equal(t, uint64(91), got[cachedTableInvalidationEventKey{tableID: 12, physicalID: 1201}].Epoch)
 	require.Equal(t, uint64(91), got[cachedTableInvalidationEventKey{tableID: 12, physicalID: 1201}].CommitTS)
 }
+
+func TestBuildCachedTableInvalidationInsertSQL(t *testing.T) {
+	events := []tablecache.CachedTableInvalidationEvent{
+		{TableID: 11, PhysicalID: 11, CommitTS: 101, Epoch: 101},
+		{TableID: 12, PhysicalID: 1201, CommitTS: 102, Epoch: 102},
+	}
+	sql, args := buildCachedTableInvalidationInsertSQL(events)
+	require.Equal(t, "INSERT HIGH_PRIORITY INTO %n.%n (table_id, physical_id, commit_ts, invalidation_epoch) VALUES (%?, %?, %?, %?), (%?, %?, %?, %?)", sql)
+	require.Equal(t, []any{"mysql", cachedTableInvalidationLogTable, int64(11), int64(11), uint64(101), uint64(101), int64(12), int64(1201), uint64(102), uint64(102)}, args)
+}
+
+func TestTryEnqueueCachedTableInvalidationPersistCopiesEvents(t *testing.T) {
+	do := &Domain{
+		exit:                             make(chan struct{}),
+		cachedTableInvalidationPersistCh: make(chan cachedTableInvalidationPersistTask, 1),
+	}
+	events := []tablecache.CachedTableInvalidationEvent{
+		{TableID: 11, PhysicalID: 11, CommitTS: 101, Epoch: 101},
+	}
+	require.True(t, do.TryEnqueueCachedTableInvalidationPersist(events))
+	events[0].TableID = 999
+
+	task := <-do.cachedTableInvalidationPersistCh
+	require.Equal(t, int64(11), task.events[0].TableID)
+}
+
+func TestTryEnqueueCachedTableInvalidationPersistQueueFull(t *testing.T) {
+	do := &Domain{
+		exit:                             make(chan struct{}),
+		cachedTableInvalidationPersistCh: make(chan cachedTableInvalidationPersistTask, 1),
+	}
+	require.True(t, do.TryEnqueueCachedTableInvalidationPersist([]tablecache.CachedTableInvalidationEvent{{TableID: 1}}))
+	require.False(t, do.TryEnqueueCachedTableInvalidationPersist([]tablecache.CachedTableInvalidationEvent{{TableID: 2}}))
+}

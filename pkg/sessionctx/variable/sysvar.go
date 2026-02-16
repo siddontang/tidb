@@ -1094,6 +1094,12 @@ var defaultSysVars = []*SysVar{
 	}, GetGlobal: func(_ context.Context, _ *SessionVars) (string, error) {
 		return BoolToOnOff(vardef.EnableCachedTableAsyncInvalidation.Load()), nil
 	}},
+	{Scope: vardef.ScopeGlobal, Name: vardef.TiDBEnableCachedTableInvalidationAsyncPersist, Value: BoolToOnOff(vardef.DefTiDBEnableCachedTableInvalidationAsyncPersist), Type: vardef.TypeBool, SetGlobal: func(_ context.Context, _ *SessionVars, s string) error {
+		vardef.EnableCachedTableInvalidationAsyncPersist.Store(TiDBOptOn(s))
+		return nil
+	}, GetGlobal: func(_ context.Context, _ *SessionVars) (string, error) {
+		return BoolToOnOff(vardef.EnableCachedTableInvalidationAsyncPersist.Load()), nil
+	}},
 	{Scope: vardef.ScopeGlobal, Name: vardef.TiDBEnableCachedTableHotRangePointGet, Value: BoolToOnOff(vardef.DefTiDBEnableCachedTableHotRangePointGet), Type: vardef.TypeBool, SetGlobal: func(_ context.Context, _ *SessionVars, s string) error {
 		vardef.EnableCachedTableHotRangePointGet.Store(TiDBOptOn(s))
 		return nil

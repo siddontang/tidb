@@ -620,43 +620,19 @@ func applyCachedTableInvalidationEvents(s *session, tables map[int64]any, commit
 		})
 	}
 	if len(events) > 0 {
-		persistCachedTableInvalidationEvents(s, events)
-		domain.GetDomain(s).NotifyCachedTableInvalidation(events)
+		do := domain.GetDomain(s)
+		if vardef.EnableCachedTableInvalidationAsyncPersist.Load() {
+			if do == nil || !do.TryEnqueueCachedTableInvalidationPersist(events) {
+				do.PersistCachedTableInvalidation(events)
+			}
+		} else {
+			do.PersistCachedTableInvalidation(events)
+		}
+		if do != nil {
+			do.NotifyCachedTableInvalidation(events)
+		}
 		tablecache.PublishCachedTableInvalidationEvents(events)
 	}
-}
-
-func persistCachedTableInvalidationEvents(s *session, events []tablecache.CachedTableInvalidationEvent) {
-	if len(events) == 0 {
-		return
-	}
-	ctx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnCacheTable)
-	sql, args := buildCachedTableInvalidationInsertSQL(events)
-	_, _, err := s.ExecRestrictedSQL(ctx, nil, sql, args...)
-	if err == nil {
-		return
-	}
-	if terror.ErrorEqual(err, infoschema.ErrTableNotExists) {
-		return
-	}
-	logutil.BgLogger().Warn("persist cached table invalidation events failed", zap.Error(err), zap.Int("events", len(events)))
-}
-
-func buildCachedTableInvalidationInsertSQL(events []tablecache.CachedTableInvalidationEvent) (string, []any) {
-	var sqlBuilder strings.Builder
-	sqlBuilder.Grow(128 + len(events)*24)
-	sqlBuilder.WriteString("INSERT HIGH_PRIORITY INTO %n.%n (table_id, physical_id, commit_ts, invalidation_epoch) VALUES ")
-
-	args := make([]any, 0, 2+len(events)*4)
-	args = append(args, mysql.SystemDB, "table_cache_invalidation_log")
-	for i, event := range events {
-		if i > 0 {
-			sqlBuilder.WriteString(", ")
-		}
-		sqlBuilder.WriteString("(%?, %?, %?, %?)")
-		args = append(args, event.TableID, event.PhysicalID, event.CommitTS, event.Epoch)
-	}
-	return sqlBuilder.String(), args
 }
 
 type cachedTableRenewLease struct {
