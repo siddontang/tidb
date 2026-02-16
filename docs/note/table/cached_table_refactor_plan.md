@@ -266,7 +266,10 @@ Completed:
 2. Added segment overlap/invalidating tests in `pkg/table/tables/cache_segment_test.go`.
 3. Wired current full-table cache data path to mirror segment state in `pkg/table/tables/cache.go` using one full-table segment.
 4. Added local invalidation event scaffold in `pkg/table/tables/cache_invalidation.go` and tests in `pkg/table/tables/cache_invalidation_test.go`.
+5. Added epoch-aware cache validation in `TryReadFromCache` and local invalidation epoch tracking.
+6. Added global feature gate `tidb_enable_cached_table_async_invalidation` and session commit-path scaffold:
+   - when enabled, skip cached-table write lease waiting and apply local invalidation events after successful commit.
 
 Notes:
 1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.
-2. Invalidation events are local scaffolding only; cross-instance fanout is not wired yet.
+2. Invalidation events are still local scaffolding only; cross-instance fanout is not wired yet.

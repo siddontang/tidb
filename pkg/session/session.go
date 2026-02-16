@@ -566,16 +566,21 @@ func (s *session) doCommit(ctx context.Context) error {
 	sessVars := s.GetSessionVars()
 
 	var commitTSChecker func(uint64) bool
+	var cachedTablesForAsyncInvalidation map[int64]any
 	if tables := sessVars.TxnCtx.CachedTables; len(tables) > 0 {
-		c := cachedTableRenewLease{tables: tables}
-		now := time.Now()
-		err := c.start(ctx)
-		defer c.stop(ctx)
-		sessVars.StmtCtx.WaitLockLeaseTime += time.Since(now)
-		if err != nil {
-			return errors.Trace(err)
+		if vardef.EnableCachedTableAsyncInvalidation.Load() {
+			cachedTablesForAsyncInvalidation = tables
+		} else {
+			c := cachedTableRenewLease{tables: tables}
+			now := time.Now()
+			err := c.start(ctx)
+			defer c.stop(ctx)
+			sessVars.StmtCtx.WaitLockLeaseTime += time.Since(now)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			commitTSChecker = c.commitTSCheck
 		}
-		commitTSChecker = c.commitTSCheck
 	}
 	if err = sessiontxn.GetTxnManager(s).SetOptionsBeforeCommit(s.txn.Transaction, commitTSChecker); err != nil {
 		return err
@@ -584,8 +589,23 @@ func (s *session) doCommit(ctx context.Context) error {
 	err = s.commitTxnWithTemporaryData(tikvutil.SetSessionID(ctx, sessVars.ConnectionID), &s.txn)
 	if err != nil {
 		err = s.handleAssertionFailure(ctx, err)
+	} else if len(cachedTablesForAsyncInvalidation) > 0 {
+		applyCachedTableInvalidationEvents(cachedTablesForAsyncInvalidation, s.txn.lastCommitTS)
 	}
 	return err
+}
+
+var cachedTableInvalidationEpoch uint64
+
+func nextCachedTableInvalidationEpoch() uint64 {
+	return atomic.AddUint64(&cachedTableInvalidationEpoch, 1)
+}
+
+func applyCachedTableInvalidationEvents(tables map[int64]any, commitTS uint64) {
+	for _, raw := range tables {
+		tbl := raw.(table.CachedTable)
+		tbl.ApplyLocalInvalidation(nextCachedTableInvalidationEpoch(), commitTS)
+	}
 }
 
 type cachedTableRenewLease struct {

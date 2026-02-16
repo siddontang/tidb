@@ -1088,6 +1088,12 @@ var defaultSysVars = []*SysVar{
 		vardef.TableCacheLease.Store(val)
 		return nil
 	}},
+	{Scope: vardef.ScopeGlobal, Name: vardef.TiDBEnableCachedTableAsyncInvalidation, Value: BoolToOnOff(vardef.DefTiDBEnableCachedTableAsyncInvalidation), Type: vardef.TypeBool, SetGlobal: func(_ context.Context, _ *SessionVars, s string) error {
+		vardef.EnableCachedTableAsyncInvalidation.Store(TiDBOptOn(s))
+		return nil
+	}, GetGlobal: func(_ context.Context, _ *SessionVars) (string, error) {
+		return BoolToOnOff(vardef.EnableCachedTableAsyncInvalidation.Load()), nil
+	}},
 	{Scope: vardef.ScopeGlobal, Name: vardef.TiDBAutoAnalyzePartitionBatchSize,
 		Value: strconv.Itoa(vardef.DefTiDBAutoAnalyzePartitionBatchSize),
 		Type:  vardef.TypeUnsigned, MinValue: 1, MaxValue: mysql.PartitionCountLimit,

@@ -16,6 +16,7 @@ package tables
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -60,4 +61,42 @@ func TestApplyInvalidationClearsLocalCache(t *testing.T) {
 	_, ok, err := c.segments.get(keySpan{})
 	require.NoError(t, err)
 	require.False(t, ok)
+}
+
+func TestApplyInvalidationIgnoresOlderEpoch(t *testing.T) {
+	c := &cachedTable{
+		TableCommon: TableCommon{tableID: 42},
+		segments:    newSegmentIndex(),
+	}
+	c.updateInvalidationEpoch(5)
+	c.setCacheData(&cacheData{
+		Start: 100,
+		Lease: 200,
+		Epoch: 5,
+	}, 64)
+
+	removed := c.applyInvalidation(cacheInvalidationEvent{
+		tableID: 42,
+		epoch:   3,
+	})
+	require.Equal(t, 0, removed)
+	require.NotNil(t, c.cacheData.Load())
+}
+
+func TestTryReadFromCacheFallsBackOnStaleEpoch(t *testing.T) {
+	c := &cachedTable{
+		TableCommon: TableCommon{tableID: 42},
+		segments:    newSegmentIndex(),
+	}
+	c.setCacheData(&cacheData{
+		Start: 100,
+		Lease: 200,
+		Epoch: 1,
+	}, 64)
+	c.updateInvalidationEpoch(2)
+
+	buf, loading := c.TryReadFromCache(150, time.Second)
+	require.Nil(t, buf)
+	require.False(t, loading)
+	require.Nil(t, c.cacheData.Load())
 }

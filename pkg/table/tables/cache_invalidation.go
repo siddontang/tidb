@@ -26,17 +26,33 @@ type cacheInvalidationEvent struct {
 	spans      []keySpan
 }
 
+func (c *cachedTable) updateInvalidationEpoch(newEpoch uint64) uint64 {
+	for {
+		old := atomic.LoadUint64(&c.invalidationEpoch)
+		if newEpoch <= old {
+			return old
+		}
+		if atomic.CompareAndSwapUint64(&c.invalidationEpoch, old, newEpoch) {
+			return newEpoch
+		}
+	}
+}
+
 func (c *cachedTable) applyInvalidation(event cacheInvalidationEvent) int {
 	if event.tableID != 0 && event.tableID != c.tableID {
 		return 0
 	}
+	currentEpoch := c.updateInvalidationEpoch(event.epoch)
 
 	removed := 0
 	if c.segments != nil {
-		removed = c.segments.invalidate(event.spans, event.epoch)
+		removed = c.segments.invalidate(event.spans, currentEpoch)
 	}
 
 	if data := c.cacheData.Load(); data != nil {
+		if data.Epoch >= currentEpoch {
+			return removed
+		}
 		// Full-table cache always overlaps any invalidated span.
 		c.cacheData.Store(nil)
 		atomic.StoreInt64(&c.totalSize, 0)

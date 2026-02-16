@@ -553,6 +553,10 @@ type CachedTable interface {
 	// 'exit' is a channel to tell the keep alive goroutine to exit.
 	// The result is sent to the 'wg' channel.
 	WriteLockAndKeepAlive(ctx context.Context, exit chan struct{}, leasePtr *uint64, wg chan error)
+
+	// ApplyLocalInvalidation applies a local invalidation event to this cached table.
+	// It returns the number of cache entries evicted.
+	ApplyLocalInvalidation(epoch, commitTS uint64) int
 }
 
 // CheckRowConstraint verify row check constraints.

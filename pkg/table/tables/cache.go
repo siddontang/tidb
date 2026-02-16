@@ -41,8 +41,10 @@ var (
 type cachedTable struct {
 	TableCommon
 	cacheData atomic.Pointer[cacheData]
-	segments  *segmentIndex
-	totalSize int64
+	// invalidationEpoch tracks the latest local invalidation epoch observed by this table.
+	invalidationEpoch uint64
+	segments          *segmentIndex
+	totalSize         int64
 	// StateRemote is not thread-safe, this tokenLimit is used to keep only one visitor.
 	tokenLimit
 }
@@ -71,10 +73,14 @@ func (t tokenLimit) PutStateRemoteHandle(handle StateRemote) {
 type cacheData struct {
 	Start uint64
 	Lease uint64
+	Epoch uint64
 	kv.MemBuffer
 }
 
 func (c *cachedTable) setCacheData(data *cacheData, totalSize int64) {
+	if data != nil && data.Epoch == 0 {
+		data.Epoch = atomic.LoadUint64(&c.invalidationEpoch)
+	}
 	c.cacheData.Store(data)
 
 	if c.segments == nil || data == nil {
@@ -84,7 +90,7 @@ func (c *cachedTable) setCacheData(data *cacheData, totalSize int64) {
 	// This allows follow-up refactor steps to switch read/invalidation logic to segments incrementally.
 	_ = c.segments.upsert(cacheSegment{
 		span:       keySpan{},
-		epoch:      0,
+		epoch:      data.Epoch,
 		startTS:    data.Start,
 		leaseTS:    data.Lease,
 		sizeBytes:  totalSize,
@@ -115,6 +121,10 @@ func newMemBuffer(store kv.Storage) (kv.MemBuffer, error) {
 func (c *cachedTable) TryReadFromCache(ts uint64, leaseDuration time.Duration) (kv.MemBuffer, bool /*loading*/) {
 	data := c.cacheData.Load()
 	if data == nil {
+		return nil, false
+	}
+	if data.Epoch < atomic.LoadUint64(&c.invalidationEpoch) {
+		c.cacheData.Store(nil)
 		return nil, false
 	}
 	if ts >= data.Start && ts < data.Lease {
@@ -350,6 +360,15 @@ func (c *cachedTable) WriteLockAndKeepAlive(ctx context.Context, exit chan struc
 			return
 		}
 	}
+}
+
+// ApplyLocalInvalidation implements table.CachedTable.
+func (c *cachedTable) ApplyLocalInvalidation(epoch, commitTS uint64) int {
+	return c.applyInvalidation(cacheInvalidationEvent{
+		tableID:  c.tableID,
+		epoch:    epoch,
+		commitTS: commitTS,
+	})
 }
 
 func (c *cachedTable) renew(ctx context.Context, leasePtr *uint64) error {

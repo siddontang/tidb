@@ -35,6 +35,7 @@ func TestCachedTableSetCacheDataSyncsSegmentLease(t *testing.T) {
 	seg, ok, err := c.segments.get(keySpan{})
 	require.NoError(t, err)
 	require.True(t, ok)
+	require.Equal(t, uint64(0), seg.epoch)
 	require.Equal(t, uint64(100), seg.startTS)
 	require.Equal(t, uint64(200), seg.leaseTS)
 	require.Nil(t, seg.memBuffer)
@@ -49,6 +50,17 @@ func TestCachedTableSetCacheDataSyncsSegmentLease(t *testing.T) {
 	seg, ok, err = c.segments.get(keySpan{})
 	require.NoError(t, err)
 	require.True(t, ok)
+	require.Equal(t, uint64(0), seg.epoch)
 	require.Equal(t, uint64(120), seg.startTS)
 	require.Equal(t, uint64(240), seg.leaseTS)
+
+	c.updateInvalidationEpoch(3)
+	c.setCacheData(&cacheData{
+		Start: 130,
+		Lease: 260,
+	}, 256)
+	seg, ok, err = c.segments.get(keySpan{})
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(3), seg.epoch)
 }
