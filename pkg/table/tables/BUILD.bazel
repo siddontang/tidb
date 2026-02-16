@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "assertion.go",
         "cache.go",
+        "cache_segment.go",
         "index.go",
         "mutation_checker.go",
         "partition.go",
@@ -71,6 +72,7 @@ go_test(
         "assertion_test.go",
         "bench_test.go",
         "cache_test.go",
+        "cache_segment_test.go",
         "export_test.go",
         "index_test.go",
         "main_test.go",

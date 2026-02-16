@@ -1,0 +1,258 @@
+# Cached Table Refactor Plan
+
+Date: 2026-02-16
+
+## Context
+
+Current Cached Table in TiDB is a full-table cache with table-level invalidation and lease-based write blocking.
+This has two major problems:
+
+1. Coverage limitations:
+- Partition mode is blocked.
+- Many operations are blocked or degraded on cached tables (for example DDL variants, `IMPORT INTO`, stale read, pipelined DML).
+- Cache is all-or-nothing; workloads with localized hotspots cannot benefit if the full table is too large.
+
+2. Performance limitations:
+- Writes are expensive because commit waits for write-lock acquisition and lease conditions.
+- Any write causes coarse invalidation behavior.
+- Initial cache load and refresh are full-table operations.
+
+This note defines a staged refactor to support more scenarios and improve performance.
+
+## Objectives
+
+1. Add segmented cache modes in addition to full-table cache:
+- `FULL`
+- `RANGE`
+- `HOT_RANGE`
+
+2. Replace commit-path write blocking with asynchronous invalidation propagation to all TiDB instances.
+
+3. Keep strict correctness guarantees for snapshot reads and transaction semantics.
+
+4. Expand compatibility with existing SQL features in controlled rollout phases.
+
+## Non-goals (initial phases)
+
+1. No cross-version behavior changes without explicit compatibility gates.
+2. No immediate removal of current full-table cache implementation.
+3. No hard requirement to support every blocked DDL in phase 1.
+
+## Current Behavior Summary (baseline)
+
+Main code paths:
+- Cache data and lease handling: `pkg/table/tables/cache.go`
+- Remote lock state machine: `pkg/table/tables/state_remote.go`
+- Commit-time write lock orchestration: `pkg/session/session.go`
+- Cache eligibility and feature guardrails: `pkg/executor/builder.go`, `pkg/planner/core/*`, `pkg/ddl/executor.go`
+
+Observed constraints:
+- Full-table only.
+- Table-level lock and invalidation granularity.
+- Write path pays lock/lease overhead on commit.
+- Several planner/executor features are explicitly blocked on cached tables.
+
+## Target Architecture
+
+### 1) Segmented Cache
+
+Introduce segment-based cache entries keyed by:
+- `table_id`
+- `physical_id` (table or partition physical ID)
+- `start_key`, `end_key`
+- `epoch`
+- `cached_start_ts`, `cached_end_ts` (or equivalent validity markers)
+- `size_bytes`, `last_access_ts`, `hit_count`
+
+Cache modes:
+- `FULL`: one segment covering whole table or whole partition.
+- `RANGE`: user-defined key ranges.
+- `HOT_RANGE`: system-managed hot spans admitted via runtime access statistics.
+
+Read path:
+1. Resolve required key spans from plan/executor.
+2. Probe segment index.
+3. Use matching valid segments.
+4. Missed spans fallback to TiKV and become admission candidates.
+
+Admission policy for `HOT_RANGE`:
+- Start with simple LFU + recency scoring.
+- Enforce memory budget and per-table cap.
+- Promote only when repeated access count reaches threshold.
+
+### 2) Async Invalidation Broadcast
+
+Replace write-path lease blocking with event-driven invalidation:
+
+1. On write commit, record invalidation event:
+- `event_id`, `table_id`, `physical_id`, `affected_spans`, `commit_ts`, `new_epoch`
+
+2. Publish event to all TiDB instances via cluster notification channel (DDL-like fanout pattern, but not schema-version DDL per write).
+
+3. On each TiDB instance:
+- Consume event.
+- Invalidate or mark stale only overlapping segments.
+- Advance local table/partition epoch.
+
+Correctness constraints:
+- Reader can use segment only when segment epoch is not stale against known invalidation epoch and segment validity satisfies snapshot requirements.
+- On uncertainty or lag, fallback to storage read.
+
+### 3) Partition-aware cache metadata
+
+Make cache state and invalidation partition-aware:
+- Metadata keyed by `table_id + physical_id`.
+- Allow independent cache warmup and invalidation per partition.
+
+## Metadata and Control Plane
+
+Add metadata for segments and invalidation log:
+- `mysql.table_cache_segment_meta`
+- `mysql.table_cache_invalidation_log`
+
+Keep existing `mysql.table_cache_meta` for compatibility while migrating behavior.
+
+Garbage collection:
+- Invalidation log retention by watermark.
+- Segment metadata cleanup on table/partition drop and mode changes.
+
+## Rollout Plan
+
+### Phase 0: Instrumentation and Guardrails
+
+Deliverables:
+1. Add metrics:
+- cache hit/miss by mode and table
+- segment load duration/bytes
+- invalidation event lag
+- invalidation queue depth
+- write amplification from invalidation
+2. Add failpoint tests for event lag/reorder/drop and fallback behavior.
+3. Add benchmark matrix for:
+- point get / batch point get
+- range scan
+- join with small-hot inner table
+- mixed read/write contention
+
+Exit criteria:
+- Baseline numbers recorded.
+- No correctness regression.
+
+### Phase 1: Introduce segmented cache in `FULL` compatibility mode
+
+Deliverables:
+1. Internal segment abstractions and in-memory index.
+2. Keep SQL surface unchanged.
+3. Existing full-table behavior mapped into one segment.
+
+Exit criteria:
+- Existing cached-table tests pass with no behavior change.
+
+### Phase 2: `RANGE` and `HOT_RANGE` mode (read path)
+
+Deliverables:
+1. Add cache mode metadata and parser/DDL plumbing for mode selection.
+2. Implement range admission and hot-range admission.
+3. Add memory budgeting and eviction.
+
+Exit criteria:
+- Hot-range benchmarks show improved hit rate with lower memory than full cache.
+
+### Phase 3: Async invalidation propagation (write path)
+
+Deliverables:
+1. Invalidation event creation on writes.
+2. Broadcast + subscriber handling.
+3. Reader validation against epochs.
+4. Keep legacy write-lock path behind compatibility flag during migration.
+
+Exit criteria:
+- Write latency reduced versus baseline under mixed workloads.
+- Correctness tests pass under event lag/failure failpoints.
+
+### Phase 4: Partition support + feature expansion
+
+Deliverables:
+1. Partition-level cache state and segmenting.
+2. Relax selected restrictions currently blocked on cached tables.
+3. Add managed transition mode for operations that temporarily require recache.
+
+Exit criteria:
+- Partition cached-table scenarios covered in integration tests.
+
+## Detailed PR Slices (execution backlog)
+
+PR-1 (now): Planning and scaffolding
+1. Add this note.
+2. Add TODO issue checklist in code comments and package docs where needed.
+3. Add metrics design section and naming conventions.
+
+PR-2: Segment abstraction
+1. Add segment structs and interfaces in `pkg/table/tables`.
+2. Implement in-memory segment index.
+3. Bridge existing full-table data into segment representation.
+
+PR-3: Read-path integration
+1. Update cache probe path in executor/builder to resolve span-level probes.
+2. Add miss accounting and admission hooks.
+
+PR-4: Invalidation log + notifier
+1. Add metadata table definitions and upgrade path.
+2. Add invalidation event producer on write commit.
+3. Add subscriber and local cache invalidator.
+
+PR-5: Partition-aware mode
+1. Physical ID based segmentation and invalidation.
+2. Partition test coverage.
+
+PR-6: Compatibility expansion
+1. Re-enable selected operations behind gates.
+2. Add managed fallback mode for blocked operations.
+
+## Testing Strategy
+
+Unit tests:
+1. Segment overlap lookup, eviction, admission thresholds.
+2. Epoch comparison logic and fallback behavior.
+3. Invalidation ordering and idempotency.
+
+Integration tests:
+1. Existing cached-table suites remain green.
+2. New suites:
+- hot-range read promotion
+- range overlap invalidation
+- lagging subscriber fallback correctness
+- partition cache invalidation independence
+
+Concurrency and fault tests:
+1. Event delay/reorder.
+2. Subscriber restart.
+3. Instance join/leave while writes continue.
+
+Performance tests:
+1. Compare baseline and new path for:
+- P95 write latency
+- read throughput
+- cache memory usage
+- invalidation propagation delay
+
+## Risks and Mitigations
+
+1. Event lag causes stale cache window.
+- Mitigation: epoch validation on read and strict fallback on uncertainty.
+
+2. Metadata growth from invalidation logs.
+- Mitigation: retention GC by low-watermark.
+
+3. Complexity increase in planner/executor.
+- Mitigation: mode-gated rollout and strict compatibility path.
+
+4. Operational surprises.
+- Mitigation: session/global switches to disable segmented mode or async invalidation quickly.
+
+## Success Criteria
+
+1. Range/hot-range cache yields better memory efficiency than full cache for skewed workloads.
+2. Mixed workload write latency improves significantly over lease-blocking baseline.
+3. No correctness regressions under failpoint and integration test matrices.
+4. Partitioned cached table scenario is supported.
