@@ -1100,6 +1100,12 @@ var defaultSysVars = []*SysVar{
 	}, GetGlobal: func(_ context.Context, _ *SessionVars) (string, error) {
 		return BoolToOnOff(vardef.EnableCachedTableHotRangePointGet.Load()), nil
 	}},
+	{Scope: vardef.ScopeGlobal, Name: vardef.TiDBCachedTableHotRangeMaxSegments, Value: strconv.Itoa(vardef.DefTiDBCachedTableHotRangeMaxSegments), Type: vardef.TypeUnsigned, MinValue: 0, MaxValue: 1000000, SetGlobal: func(_ context.Context, _ *SessionVars, s string) error {
+		vardef.CachedTableHotRangeMaxSegments.Store(TidbOptInt64(s, vardef.DefTiDBCachedTableHotRangeMaxSegments))
+		return nil
+	}, GetGlobal: func(_ context.Context, _ *SessionVars) (string, error) {
+		return strconv.FormatInt(vardef.CachedTableHotRangeMaxSegments.Load(), 10), nil
+	}},
 	{Scope: vardef.ScopeGlobal, Name: vardef.TiDBCachedTableInvalidationPullInterval, Value: strconv.Itoa(vardef.DefTiDBCachedTableInvalidationPullInterval), Type: vardef.TypeUnsigned, MinValue: 10, MaxValue: 10000, SetGlobal: func(_ context.Context, _ *SessionVars, s string) error {
 		vardef.CachedTableInvalidationPullInterval.Store(TidbOptInt64(s, vardef.DefTiDBCachedTableInvalidationPullInterval))
 		return nil

@@ -24,6 +24,7 @@ import (
 	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/metrics"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/tablecodec"
 	"github.com/pingcap/tidb/pkg/types"
@@ -193,6 +194,15 @@ func (c *cachedTable) StoreKeyInCache(store kv.Storage, ts uint64, leaseDuration
 	if store == nil || len(key) == 0 || value.IsValueEmpty() || c.segments == nil {
 		return
 	}
+	maxSegments := vardef.CachedTableHotRangeMaxSegments.Load()
+	if maxSegments == 0 {
+		return
+	}
+	start := key.Clone()
+	span := keySpan{start: start, end: start.Next()}
+	if _, exist, err := c.segments.get(span); err == nil && !exist && int64(c.segments.hotRangeLen()) >= maxSegments {
+		return
+	}
 	memBuffer, err := newMemBuffer(store)
 	if err != nil {
 		logutil.BgLogger().Warn("create mem buffer for cached key failed", zap.Error(err))
@@ -202,9 +212,8 @@ func (c *cachedTable) StoreKeyInCache(store kv.Storage, ts uint64, leaseDuration
 		logutil.BgLogger().Warn("store cached key value failed", zap.Error(err))
 		return
 	}
-	start := key.Clone()
 	seg := cacheSegment{
-		span:       keySpan{start: start, end: start.Next()},
+		span:       span,
 		epoch:      atomic.LoadUint64(&c.invalidationEpoch),
 		startTS:    ts,
 		leaseTS:    leaseFromTS(ts, leaseDuration),

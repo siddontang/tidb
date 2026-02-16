@@ -300,7 +300,10 @@ Completed:
    - new switch `tidb_enable_cached_table_hot_range_point_get`.
    - when enabled, point-get and direct-handle batch-point-get skip full-table cache loading and cache queried row keys as tiny segments.
    - subsequent point-get / batch-point-get on the same key can be served from cache (`ReadFromTableCache=true`).
+18. Added hot-range admission cap control:
+   - new switch `tidb_cached_table_hot_range_max_segments` (default `4096`, `0` disables hot-range key admission).
+   - prevents unbounded tiny-segment growth under high-cardinality point-get traffic.
 
 Notes:
 1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.
-2. Invalidation notifier currently uses in-memory implementation; cluster-wide replay now comes from log polling, while low-latency cross-instance push transport (DDL-like watch/notify) is still pending.
+2. Invalidation notifier still keeps in-memory implementation for local tests; production fanout now has etcd watch/notify fast-path plus log-polling durability fallback.

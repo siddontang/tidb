@@ -226,3 +226,15 @@ func (i *segmentIndex) len() int {
 	defer i.mu.RUnlock()
 	return len(i.segments)
 }
+
+func (i *segmentIndex) hotRangeLen() int {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	count := 0
+	for _, seg := range i.segments {
+		if !seg.span.isFullTable() {
+			count++
+		}
+	}
+	return count
+}

@@ -127,4 +127,5 @@ func TestSegmentIndexFindByKey(t *testing.T) {
 	seg, ok = idx.findByKey(key("z"))
 	require.True(t, ok)
 	require.Equal(t, uint64(2), seg.epoch)
+	require.Equal(t, 1, idx.hotRangeLen())
 }
