@@ -256,3 +256,17 @@ Performance tests:
 2. Mixed workload write latency improves significantly over lease-blocking baseline.
 3. No correctness regressions under failpoint and integration test matrices.
 4. Partitioned cached table scenario is supported.
+
+## Implementation Progress
+
+### 2026-02-16 (initial refactor slices)
+
+Completed:
+1. Added segment primitives and in-memory segment index in `pkg/table/tables/cache_segment.go`.
+2. Added segment overlap/invalidating tests in `pkg/table/tables/cache_segment_test.go`.
+3. Wired current full-table cache data path to mirror segment state in `pkg/table/tables/cache.go` using one full-table segment.
+4. Added local invalidation event scaffold in `pkg/table/tables/cache_invalidation.go` and tests in `pkg/table/tables/cache_invalidation_test.go`.
+
+Notes:
+1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.
+2. Invalidation events are local scaffolding only; cross-instance fanout is not wired yet.

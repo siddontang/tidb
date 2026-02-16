@@ -41,6 +41,7 @@ var (
 type cachedTable struct {
 	TableCommon
 	cacheData atomic.Pointer[cacheData]
+	segments  *segmentIndex
 	totalSize int64
 	// StateRemote is not thread-safe, this tokenLimit is used to keep only one visitor.
 	tokenLimit
@@ -71,6 +72,28 @@ type cacheData struct {
 	Start uint64
 	Lease uint64
 	kv.MemBuffer
+}
+
+func (c *cachedTable) setCacheData(data *cacheData, totalSize int64) {
+	c.cacheData.Store(data)
+
+	if c.segments == nil || data == nil {
+		return
+	}
+	// Keep the current full-table cache path represented as a single segment.
+	// This allows follow-up refactor steps to switch read/invalidation logic to segments incrementally.
+	_ = c.segments.upsert(cacheSegment{
+		span:       keySpan{},
+		epoch:      0,
+		startTS:    data.Start,
+		leaseTS:    data.Lease,
+		sizeBytes:  totalSize,
+		lastAccess: time.Now(),
+		memBuffer:  data.MemBuffer,
+	})
+	if data.MemBuffer != nil {
+		atomic.StoreInt64(&c.totalSize, totalSize)
+	}
 }
 
 func leaseFromTS(ts uint64, leaseDuration time.Duration) uint64 {
@@ -120,6 +143,7 @@ func (c *cachedTable) TryReadFromCache(ts uint64, leaseDuration time.Duration) (
 func newCachedTable(tbl *TableCommon) (table.Table, error) {
 	ret := &cachedTable{
 		TableCommon: tbl.Copy(),
+		segments:    newSegmentIndex(),
 		tokenLimit:  make(chan StateRemote, 1),
 	}
 	return ret, nil
@@ -205,11 +229,11 @@ func (c *cachedTable) updateLockForRead(ctx context.Context, handle StateRemote,
 		return
 	}
 	if succ {
-		c.cacheData.Store(&cacheData{
+		c.setCacheData(&cacheData{
 			Start:     ts,
 			Lease:     lease,
 			MemBuffer: nil, // Async loading, this will be set later.
-		})
+		}, atomic.LoadInt64(&c.totalSize))
 
 		// Make the load data process async, in case that loading data takes longer the
 		// lease duration, then the loaded data get staled and that process repeats forever.
@@ -224,12 +248,11 @@ func (c *cachedTable) updateLockForRead(ctx context.Context, handle StateRemote,
 
 			tmp := c.cacheData.Load()
 			if tmp != nil && tmp.Start == ts {
-				c.cacheData.Store(&cacheData{
+				c.setCacheData(&cacheData{
 					Start:     startTS,
 					Lease:     tmp.Lease,
 					MemBuffer: mb,
-				})
-				atomic.StoreInt64(&c.totalSize, totalSize)
+				}, totalSize)
 			}
 		}()
 	}
@@ -291,11 +314,11 @@ func (c *cachedTable) renewLease(handle StateRemote, ts uint64, data *cacheData,
 		return
 	}
 	if newLease > 0 {
-		c.cacheData.Store(&cacheData{
+		c.setCacheData(&cacheData{
 			Start:     data.Start,
 			Lease:     newLease,
 			MemBuffer: data.MemBuffer,
-		})
+		}, atomic.LoadInt64(&c.totalSize))
 	}
 
 	failpoint.Inject("mockRenewLeaseABA2", func(_ failpoint.Value) {

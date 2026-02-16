@@ -77,6 +77,11 @@ func TestSegmentIndexUpsertAndFindOverlaps(t *testing.T) {
 
 	_, err = idx.findOverlaps(keySpan{start: key("x")})
 	require.ErrorIs(t, err, errInvalidKeySpan)
+
+	seg, ok, err := idx.get(keySpan{start: key("a"), end: key("d")})
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(2), seg.epoch)
 }
 
 func TestSegmentIndexInvalidate(t *testing.T) {

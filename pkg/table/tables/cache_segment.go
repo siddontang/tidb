@@ -160,6 +160,22 @@ func (i *segmentIndex) findOverlaps(span keySpan) ([]cacheSegment, error) {
 	return result, nil
 }
 
+func (i *segmentIndex) get(span keySpan) (cacheSegment, bool, error) {
+	if !span.isValid() {
+		return cacheSegment{}, false, errInvalidKeySpan
+	}
+
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+
+	for _, seg := range i.segments {
+		if sameSpan(seg.span, span) {
+			return seg, true, nil
+		}
+	}
+	return cacheSegment{}, false, nil
+}
+
 // invalidate removes stale segments that overlap invalidation spans.
 // Empty spans means invalidating the full table.
 func (i *segmentIndex) invalidate(spans []keySpan, newEpoch uint64) int {
