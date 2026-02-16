@@ -304,6 +304,7 @@ var (
 		{ID: metadef.CapturePlanBaselinesBlacklistTableID, Name: "capture_plan_baselines_blacklist", SQL: metadef.CreateCapturePlanBaselinesBlacklistTable},
 		{ID: metadef.ColumnStatsUsageTableID, Name: "column_stats_usage", SQL: metadef.CreateColumnStatsUsageTable},
 		{ID: metadef.TableCacheMetaTableID, Name: "table_cache_meta", SQL: metadef.CreateTableCacheMetaTable},
+		{ID: metadef.TableCacheInvalidationLogTableID, Name: "table_cache_invalidation_log", SQL: metadef.CreateTableCacheInvalidationLogTable},
 		{ID: metadef.AnalyzeOptionsTableID, Name: "analyze_options", SQL: metadef.CreateAnalyzeOptionsTable},
 		{ID: metadef.StatsHistoryTableID, Name: "stats_history", SQL: metadef.CreateStatsHistoryTable},
 		{ID: metadef.StatsMetaHistoryTableID, Name: "stats_meta_history", SQL: metadef.CreateStatsMetaHistoryTable},

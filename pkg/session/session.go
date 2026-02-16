@@ -591,7 +591,7 @@ func (s *session) doCommit(ctx context.Context) error {
 	if err != nil {
 		err = s.handleAssertionFailure(ctx, err)
 	} else if len(cachedTablesForAsyncInvalidation) > 0 {
-		applyCachedTableInvalidationEvents(cachedTablesForAsyncInvalidation, s.txn.lastCommitTS)
+		applyCachedTableInvalidationEvents(s, cachedTablesForAsyncInvalidation, s.txn.lastCommitTS)
 	}
 	return err
 }
@@ -602,20 +602,47 @@ func nextCachedTableInvalidationEpoch() uint64 {
 	return atomic.AddUint64(&cachedTableInvalidationEpoch, 1)
 }
 
-func applyCachedTableInvalidationEvents(tables map[int64]any, commitTS uint64) {
+func applyCachedTableInvalidationEvents(s *session, tables map[int64]any, commitTS uint64) {
 	events := make([]tablecache.CachedTableInvalidationEvent, 0, len(tables))
 	for _, raw := range tables {
 		tbl := raw.(table.CachedTable)
 		epoch := nextCachedTableInvalidationEpoch()
 		tbl.ApplyLocalInvalidation(epoch, commitTS)
 		events = append(events, tablecache.CachedTableInvalidationEvent{
-			TableID:  tbl.Meta().ID,
-			Epoch:    epoch,
-			CommitTS: commitTS,
+			TableID:    tbl.Meta().ID,
+			PhysicalID: tbl.Meta().ID,
+			Epoch:      epoch,
+			CommitTS:   commitTS,
 		})
 	}
 	if len(events) > 0 {
+		persistCachedTableInvalidationEvents(s, events)
 		tablecache.PublishCachedTableInvalidationEvents(events)
+	}
+}
+
+func persistCachedTableInvalidationEvents(s *session, events []tablecache.CachedTableInvalidationEvent) {
+	ctx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnCacheTable)
+	for _, event := range events {
+		_, _, err := s.ExecRestrictedSQL(
+			ctx,
+			nil,
+			"INSERT HIGH_PRIORITY INTO %n.%n (table_id, physical_id, commit_ts, invalidation_epoch) VALUES (%?, %?, %?, %?)",
+			mysql.SystemDB,
+			"table_cache_invalidation_log",
+			event.TableID,
+			event.PhysicalID,
+			event.CommitTS,
+			event.Epoch,
+		)
+		if err == nil {
+			continue
+		}
+		if terror.ErrorEqual(err, infoschema.ErrTableNotExists) {
+			return
+		}
+		logutil.BgLogger().Warn("persist cached table invalidation event failed", zap.Error(err))
+		return
 	}
 }
 

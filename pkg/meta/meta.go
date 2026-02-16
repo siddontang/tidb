@@ -174,7 +174,7 @@ const (
 	// InitNextGenBootTableVersion means it's a fresh cluster, we haven't bootstrapped yet.
 	InitNextGenBootTableVersion NextGenBootTableVersion = 0
 	// BaseNextGenBootTableVersion is the first version of nextgen bootstrapping, we
-	// will create 52 physical tables.
+	// will create 53 physical tables.
 	// Note: DDL related tables are created separately, see DDLTableVersion.
 	BaseNextGenBootTableVersion NextGenBootTableVersion = 1
 )

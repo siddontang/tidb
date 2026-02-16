@@ -53,7 +53,7 @@ import (
 )
 
 func TestMySQLDBTables(t *testing.T) {
-	require.Len(t, systemTablesOfBaseNextGenVersion, 52, "DO NOT CHANGE IT")
+	require.Len(t, systemTablesOfBaseNextGenVersion, 53, "DO NOT CHANGE IT")
 	for _, verBoot := range versionedBootstrapSchemas {
 		for _, schInfo := range verBoot.databases {
 			testTableBasicInfoSlice(t, schInfo.Tables, "IF NOT EXISTS mysql.%s (")
@@ -282,6 +282,8 @@ func TestBootstrapWithError(t *testing.T) {
 	MustExec(t, se, "SELECT * from mysql.tidb_ttl_table_status")
 	// Check mysql.tidb_workload_values table
 	MustExec(t, se, "SELECT * from mysql.tidb_workload_values")
+	// Check mysql.table_cache_invalidation_log table
+	MustExec(t, se, "SELECT * from mysql.table_cache_invalidation_log")
 }
 
 func TestDDLTableCreateBackfillTable(t *testing.T) {

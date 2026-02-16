@@ -272,7 +272,10 @@ Completed:
 7. Added cached-table invalidation notifier scaffolding in `pkg/table/tables`:
    - publish/watch API with an in-memory notifier implementation.
    - session commit path now publishes invalidation events after local application.
+8. Added persistent invalidation log table scaffolding:
+   - new system table `mysql.table_cache_invalidation_log` in bootstrap and upgrade.
+   - session commit path now appends invalidation events into the log table (best-effort).
 
 Notes:
 1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.
-2. Invalidation notifier currently uses in-memory implementation; cluster-wide fanout (for example via etcd/table-store) is not wired yet.
+2. Invalidation notifier currently uses in-memory implementation; cluster-wide fanout consumer/replayer from the log is not wired yet.

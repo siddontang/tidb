@@ -364,6 +364,19 @@ const (
 		oldReadLease bigint(20) NOT NULL DEFAULT 0,
 		PRIMARY KEY (tid)
 	);`
+	// CreateTableCacheInvalidationLogTable stores cached-table invalidation events.
+	CreateTableCacheInvalidationLogTable = `CREATE TABLE IF NOT EXISTS mysql.table_cache_invalidation_log (
+		id BIGINT(64) UNSIGNED NOT NULL AUTO_INCREMENT,
+		table_id BIGINT(64) NOT NULL,
+		physical_id BIGINT(64) NOT NULL DEFAULT 0,
+		commit_ts BIGINT(64) UNSIGNED NOT NULL,
+		invalidation_epoch BIGINT(64) UNSIGNED NOT NULL,
+		processed TINYINT(1) NOT NULL DEFAULT 0,
+		created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+		PRIMARY KEY (id),
+		KEY idx_processed_id (processed, id),
+		KEY idx_table_epoch (table_id, invalidation_epoch)
+	);`
 	// CreateAnalyzeOptionsTable stores the analyze options used by analyze and auto analyze.
 	CreateAnalyzeOptionsTable = `CREATE TABLE IF NOT EXISTS mysql.analyze_options (
 		table_id BIGINT(64) NOT NULL,
