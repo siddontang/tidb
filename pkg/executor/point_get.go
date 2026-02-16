@@ -34,6 +34,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/planner/core/operator/physicalop"
 	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/table/tables"
 	"github.com/pingcap/tidb/pkg/tablecodec"
@@ -102,8 +103,16 @@ func (b *executorBuilder) buildPointGet(p *physicalop.PointGetPlan) exec.Executo
 		return nil
 	}
 	if p.TblInfo.TableCacheStatusType == model.TableCacheStatusEnable {
-		if cacheTable := b.getCacheTable(p.TblInfo, snapshotTS); cacheTable != nil {
+		loadFullCache := !vardef.EnableCachedTableHotRangePointGet.Load()
+		if cacheTable := b.getCacheTable(p.TblInfo, snapshotTS, loadFullCache); cacheTable != nil {
 			e.snapshot = cacheTableSnapshot{e.snapshot, cacheTable}
+		}
+		if cachedTable, ok := b.is.TableByID(context.Background(), p.TblInfo.ID); ok {
+			if hotReader, ok := cachedTable.(pointGetHotRangeCache); ok {
+				e.hotRangeCache = hotReader
+				e.cacheSnapshotTS = snapshotTS
+				e.cacheLease = time.Duration(vardef.TableCacheLease.Load()) * time.Second
+			}
 		}
 	}
 
@@ -112,6 +121,11 @@ func (b *executorBuilder) buildPointGet(p *physicalop.PointGetPlan) exec.Executo
 	}
 
 	return e
+}
+
+type pointGetHotRangeCache interface {
+	TryReadFromCacheByKey(ts uint64, leaseDuration time.Duration, key kv.Key) (kv.ValueEntry, bool, bool)
+	StoreKeyInCache(store kv.Storage, ts uint64, leaseDuration time.Duration, key kv.Key, value kv.ValueEntry)
 }
 
 // PointGetExecutor executes point select query.
@@ -146,6 +160,10 @@ type PointGetExecutor struct {
 	virtualColumnRetFieldTypes []*types.FieldType
 
 	stats *runtimeStatsWithSnapshot
+
+	hotRangeCache   pointGetHotRangeCache
+	cacheSnapshotTS uint64
+	cacheLease      time.Duration
 }
 
 // GetPhysID returns the physical id used, either the table's id or a partition's ID
@@ -403,6 +421,15 @@ func (e *PointGetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 	}
 
 	key := tablecodec.EncodeRowKeyWithHandle(tblID, e.handle)
+	if !e.lock && e.hotRangeCache != nil {
+		if cachedVal, hit, _ := e.hotRangeCache.TryReadFromCacheByKey(e.cacheSnapshotTS, e.cacheLease, key); hit {
+			e.Ctx().GetSessionVars().StmtCtx.ReadFromTableCache = true
+			if cachedVal.IsValueEmpty() {
+				return nil
+			}
+			return e.decodePointGetRow(cachedVal.Value, req)
+		}
+	}
 	val, err := e.getAndLock(ctx, key)
 	if err != nil {
 		return err
@@ -430,22 +457,26 @@ func (e *PointGetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 		}
 		return nil
 	}
+	if !e.lock && e.hotRangeCache != nil {
+		e.hotRangeCache.StoreKeyInCache(e.Ctx().GetStore(), e.cacheSnapshotTS, e.cacheLease, key, kv.NewValueEntry(val, 0))
+	}
 
+	return e.decodePointGetRow(val, req)
+}
+
+func (e *PointGetExecutor) decodePointGetRow(val []byte, req *chunk.Chunk) error {
 	sctx := e.BaseExecutor.Ctx()
 	schema := e.Schema()
-	err = DecodeRowValToChunk(sctx, schema, e.tblInfo, e.handle, val, req, e.rowDecoder)
-	if err != nil {
+	if err := DecodeRowValToChunk(sctx, schema, e.tblInfo, e.handle, val, req, e.rowDecoder); err != nil {
 		return err
 	}
 
-	err = fillRowChecksum(sctx, 0, 1, schema, e.tblInfo, [][]byte{val}, []kv.Handle{e.handle}, req, nil)
-	if err != nil {
+	if err := fillRowChecksum(sctx, 0, 1, schema, e.tblInfo, [][]byte{val}, []kv.Handle{e.handle}, req, nil); err != nil {
 		return err
 	}
 
-	err = table.FillVirtualColumnValue(e.virtualColumnRetFieldTypes, e.virtualColumnIndex,
-		schema.Columns, e.columns, sctx.GetExprCtx(), req)
-	if err != nil {
+	if err := table.FillVirtualColumnValue(e.virtualColumnRetFieldTypes, e.virtualColumnIndex,
+		schema.Columns, e.columns, sctx.GetExprCtx(), req); err != nil {
 		return err
 	}
 	return nil

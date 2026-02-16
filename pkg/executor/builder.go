@@ -5803,7 +5803,8 @@ func (b *executorBuilder) buildBatchPointGet(plan *physicalop.BatchPointGetPlan)
 		return nil
 	}
 	if plan.TblInfo.TableCacheStatusType == model.TableCacheStatusEnable {
-		if cacheTable := b.getCacheTable(plan.TblInfo, snapshotTS); cacheTable != nil {
+		loadFullCache := !vardef.EnableCachedTableHotRangePointGet.Load()
+		if cacheTable := b.getCacheTable(plan.TblInfo, snapshotTS, loadFullCache); cacheTable != nil {
 			e.snapshot = cacheTableSnapshot{e.snapshot, cacheTable}
 		}
 	}
@@ -6134,7 +6135,7 @@ func (b *executorBuilder) validCanReadTemporaryTable(tbl *model.TableInfo) error
 	return nil
 }
 
-func (b *executorBuilder) getCacheTable(tblInfo *model.TableInfo, startTS uint64) kv.MemBuffer {
+func (b *executorBuilder) getCacheTable(tblInfo *model.TableInfo, startTS uint64, triggerLoad bool) kv.MemBuffer {
 	tbl, ok := b.is.TableByID(context.Background(), tblInfo.ID)
 	if !ok {
 		b.err = errors.Trace(infoschema.ErrTableNotExists.GenWithStackByArgs(b.ctx.GetSessionVars().CurrentDB, tblInfo.Name))
@@ -6149,7 +6150,7 @@ func (b *executorBuilder) getCacheTable(tblInfo *model.TableInfo, startTS uint64
 	} else if loading {
 		return nil
 	}
-	if !b.ctx.GetSessionVars().StmtCtx.InExplainStmt && !b.inDeleteStmt && !b.inUpdateStmt {
+	if triggerLoad && !b.ctx.GetSessionVars().StmtCtx.InExplainStmt && !b.inDeleteStmt && !b.inUpdateStmt {
 		tbl.(table.CachedTable).UpdateLockForRead(context.Background(), b.ctx.GetStore(), startTS, leaseDuration)
 	}
 	return nil

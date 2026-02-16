@@ -108,3 +108,23 @@ func TestSegmentIndexInvalidate(t *testing.T) {
 	require.Equal(t, 1, removed)
 	require.Equal(t, 0, idx.len())
 }
+
+func TestSegmentIndexFindByKey(t *testing.T) {
+	idx := newSegmentIndex()
+	require.NoError(t, idx.upsert(cacheSegment{
+		span:  keySpan{start: key("a"), end: key("c")},
+		epoch: 1,
+	}))
+	require.NoError(t, idx.upsert(cacheSegment{
+		span:  keySpan{},
+		epoch: 2,
+	}))
+
+	seg, ok := idx.findByKey(key("b"))
+	require.True(t, ok)
+	require.Equal(t, uint64(1), seg.epoch)
+
+	seg, ok = idx.findByKey(key("z"))
+	require.True(t, ok)
+	require.Equal(t, uint64(2), seg.epoch)
+}

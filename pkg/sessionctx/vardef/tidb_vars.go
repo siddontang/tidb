@@ -866,6 +866,8 @@ const (
 	TiDBCachedTableInvalidationPullInterval = "tidb_cached_table_invalidation_pull_interval"
 	// TiDBCachedTableInvalidationBatchSize controls the number of invalidation rows loaded per replay batch.
 	TiDBCachedTableInvalidationBatchSize = "tidb_cached_table_invalidation_batch_size"
+	// TiDBEnableCachedTableHotRangePointGet enables point-get hot-range key cache for cached tables.
+	TiDBEnableCachedTableHotRangePointGet = "tidb_enable_cached_table_hot_range_point_get"
 	// TiDBCachedTableInvalidationLogKeepCount controls how many latest invalidation rows are retained (0 disables GC).
 	TiDBCachedTableInvalidationLogKeepCount = "tidb_cached_table_invalidation_log_keep_count"
 	// TiDBCachedTableInvalidationLogGCBatchSize controls delete batch size for invalidation-log GC.
@@ -1600,6 +1602,7 @@ const (
 	DefEnableLegacyInstanceScope                        = true
 	DefTiDBTableCacheLease                              = 3 // 3s
 	DefTiDBEnableCachedTableAsyncInvalidation           = false
+	DefTiDBEnableCachedTableHotRangePointGet            = false
 	DefTiDBCachedTableInvalidationPullInterval          = 200
 	DefTiDBCachedTableInvalidationBatchSize             = 256
 	DefTiDBCachedTableInvalidationLogKeepCount          = 0
@@ -1836,6 +1839,7 @@ var (
 	PersistAnalyzeOptions                        = atomic.NewBool(DefTiDBPersistAnalyzeOptions)
 	TableCacheLease                              = atomic.NewInt64(DefTiDBTableCacheLease)
 	EnableCachedTableAsyncInvalidation           = atomic.NewBool(DefTiDBEnableCachedTableAsyncInvalidation)
+	EnableCachedTableHotRangePointGet            = atomic.NewBool(DefTiDBEnableCachedTableHotRangePointGet)
 	CachedTableInvalidationPullInterval          = atomic.NewInt64(DefTiDBCachedTableInvalidationPullInterval)
 	CachedTableInvalidationBatchSize             = atomic.NewInt64(DefTiDBCachedTableInvalidationBatchSize)
 	CachedTableInvalidationLogKeepCount          = atomic.NewInt64(DefTiDBCachedTableInvalidationLogKeepCount)

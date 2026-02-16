@@ -149,6 +149,75 @@ func (c *cachedTable) TryReadFromCache(ts uint64, leaseDuration time.Duration) (
 	return nil, false
 }
 
+// TryReadFromCacheByKey tries reading a specific row key from cached segments.
+// It supports both full-table cache and key-range (hot-range) segments.
+func (c *cachedTable) TryReadFromCacheByKey(ts uint64, leaseDuration time.Duration, key kv.Key) (kv.ValueEntry, bool, bool) {
+	memBuffer, loading := c.TryReadFromCache(ts, leaseDuration)
+	if memBuffer != nil {
+		value, err := memBuffer.Get(context.Background(), key)
+		if kv.ErrNotExist.Equal(err) {
+			return kv.ValueEntry{}, true, false
+		}
+		if err != nil {
+			return kv.ValueEntry{}, false, false
+		}
+		return value, true, false
+	}
+	if loading || c.segments == nil {
+		return kv.ValueEntry{}, false, loading
+	}
+
+	seg, ok := c.segments.findByKey(key)
+	if !ok {
+		return kv.ValueEntry{}, false, false
+	}
+	currentEpoch := atomic.LoadUint64(&c.invalidationEpoch)
+	if seg.epoch < currentEpoch || ts < seg.startTS || ts >= seg.leaseTS {
+		return kv.ValueEntry{}, false, false
+	}
+	if seg.memBuffer == nil {
+		return kv.ValueEntry{}, false, true
+	}
+	value, err := seg.memBuffer.Get(context.Background(), key)
+	if kv.ErrNotExist.Equal(err) {
+		return kv.ValueEntry{}, true, false
+	}
+	if err != nil {
+		return kv.ValueEntry{}, false, false
+	}
+	return value, true, false
+}
+
+// StoreKeyInCache stores one row key/value as a tiny cache segment for hot-range point queries.
+func (c *cachedTable) StoreKeyInCache(store kv.Storage, ts uint64, leaseDuration time.Duration, key kv.Key, value kv.ValueEntry) {
+	if store == nil || len(key) == 0 || value.IsValueEmpty() || c.segments == nil {
+		return
+	}
+	memBuffer, err := newMemBuffer(store)
+	if err != nil {
+		logutil.BgLogger().Warn("create mem buffer for cached key failed", zap.Error(err))
+		return
+	}
+	if err = memBuffer.Set(key, value.Value); err != nil {
+		logutil.BgLogger().Warn("store cached key value failed", zap.Error(err))
+		return
+	}
+	start := key.Clone()
+	seg := cacheSegment{
+		span:       keySpan{start: start, end: start.Next()},
+		epoch:      atomic.LoadUint64(&c.invalidationEpoch),
+		startTS:    ts,
+		leaseTS:    leaseFromTS(ts, leaseDuration),
+		sizeBytes:  int64(len(key) + len(value.Value)),
+		hitCount:   1,
+		lastAccess: time.Now(),
+		memBuffer:  memBuffer,
+	}
+	if err = c.segments.upsert(seg); err != nil {
+		logutil.BgLogger().Warn("upsert cached key segment failed", zap.Error(err))
+	}
+}
+
 // newCachedTable creates a new CachedTable Instance
 func newCachedTable(tbl *TableCommon) (table.Table, error) {
 	ret := &cachedTable{

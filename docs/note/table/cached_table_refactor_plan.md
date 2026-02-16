@@ -296,6 +296,10 @@ Completed:
 16. Added invalidation-log GC controls and background worker:
    - `tidb_cached_table_invalidation_log_keep_count` (default `0`, disabled) keeps latest N rows.
    - `tidb_cached_table_invalidation_log_gc_batch_size` controls delete batch size.
+17. Added `HOT_RANGE` first-step behavior for point-get:
+   - new switch `tidb_enable_cached_table_hot_range_point_get`.
+   - when enabled, point-get skips full-table cache loading and caches queried row keys as tiny segments.
+   - subsequent point-get on the same key can be served from cache (`ReadFromTableCache=true`).
 
 Notes:
 1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.

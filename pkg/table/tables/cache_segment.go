@@ -176,6 +176,28 @@ func (i *segmentIndex) get(span keySpan) (cacheSegment, bool, error) {
 	return cacheSegment{}, false, nil
 }
 
+func (i *segmentIndex) findByKey(key kv.Key) (cacheSegment, bool) {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+
+	var full cacheSegment
+	hasFull := false
+	for _, seg := range i.segments {
+		if seg.span.isFullTable() {
+			full = seg
+			hasFull = true
+			continue
+		}
+		if seg.span.containsKey(key) {
+			return seg, true
+		}
+	}
+	if hasFull {
+		return full, true
+	}
+	return cacheSegment{}, false
+}
+
 // invalidate removes stale segments that overlap invalidation spans.
 // Empty spans means invalidating the full table.
 func (i *segmentIndex) invalidate(spans []keySpan, newEpoch uint64) int {
