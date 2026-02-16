@@ -421,7 +421,11 @@ func (e *PointGetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 	}
 
 	key := tablecodec.EncodeRowKeyWithHandle(tblID, e.handle)
-	if !e.lock && e.hotRangeCache != nil {
+	hotRangeUsable := !e.lock &&
+		e.hotRangeCache != nil &&
+		vardef.EnableCachedTableHotRangePointGet.Load() &&
+		!hasDirtyContentForCachedTable(e.Ctx(), e.tblInfo, 0, nil, tblID)
+	if hotRangeUsable {
 		if cachedVal, hit, _ := e.hotRangeCache.TryReadFromCacheByKey(e.cacheSnapshotTS, e.cacheLease, key); hit {
 			e.Ctx().GetSessionVars().StmtCtx.ReadFromTableCache = true
 			if cachedVal.IsValueEmpty() {
@@ -457,11 +461,58 @@ func (e *PointGetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 		}
 		return nil
 	}
-	if !e.lock && e.hotRangeCache != nil {
+	if hotRangeUsable {
 		e.hotRangeCache.StoreKeyInCache(e.Ctx().GetStore(), e.cacheSnapshotTS, e.cacheLease, key, kv.NewValueEntry(val, 0))
 	}
 
 	return e.decodePointGetRow(val, req)
+}
+
+func hasDirtyContentForCachedTable(
+	sctx sessionctx.Context,
+	tblInfo *model.TableInfo,
+	singlePartID int64,
+	planPhysIDs []int64,
+	fallbackPhysID int64,
+) bool {
+	planCtx := sctx.GetPlanCtx()
+	if planCtx == nil || tblInfo == nil {
+		return false
+	}
+	checked := make(map[int64]struct{}, 8)
+	checkID := func(id int64) bool {
+		if id == 0 {
+			return false
+		}
+		if _, ok := checked[id]; ok {
+			return false
+		}
+		checked[id] = struct{}{}
+		return planCtx.HasDirtyContent(id)
+	}
+
+	if checkID(tblInfo.ID) {
+		return true
+	}
+	if checkID(singlePartID) {
+		return true
+	}
+	if checkID(fallbackPhysID) {
+		return true
+	}
+	for _, id := range planPhysIDs {
+		if checkID(id) {
+			return true
+		}
+	}
+	if pi := tblInfo.GetPartitionInfo(); pi != nil {
+		for _, partition := range pi.Definitions {
+			if checkID(partition.ID) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (e *PointGetExecutor) decodePointGetRow(val []byte, req *chunk.Chunk) error {

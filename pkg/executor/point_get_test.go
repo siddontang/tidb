@@ -336,6 +336,46 @@ func TestCachedTableHotRangeBatchPointGetByUniqueIndex(t *testing.T) {
 	tk.MustExec("alter table hot_idx nocache")
 }
 
+func TestCachedTableHotRangeBatchPointGetDirtyTxnFallback(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set global tidb_enable_cached_table_hot_range_point_get = 1")
+	defer tk.MustExec("set global tidb_enable_cached_table_hot_range_point_get = 0")
+
+	tk.MustExec("drop table if exists hot_idx_txn")
+	tk.MustExec("create table hot_idx_txn(id int primary key, uk int unique, v int)")
+	tk.MustExec("insert into hot_idx_txn values (1, 11, 10), (2, 22, 20)")
+	tk.MustExec("alter table hot_idx_txn cache")
+
+	tk.MustExec("begin")
+	tk.MustExec("insert into hot_idx_txn values (6, 16, 106)")
+	tk.MustQuery("select v from hot_idx_txn where uk in (11, 16) order by uk").Check(testkit.Rows("10", "106"))
+	require.False(t, tk.Session().GetSessionVars().StmtCtx.ReadFromTableCache)
+	tk.MustExec("commit")
+
+	tk.MustExec("alter table hot_idx_txn nocache")
+}
+
+func TestCachedTableBatchPointGetDirtyTxnWithoutHotRange(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set global tidb_enable_cached_table_hot_range_point_get = 0")
+
+	tk.MustExec("drop table if exists cache_idx_txn")
+	tk.MustExec("create table cache_idx_txn(id int primary key, uk int unique, v int)")
+	tk.MustExec("insert into cache_idx_txn values (1, 11, 10), (2, 22, 20)")
+	tk.MustExec("alter table cache_idx_txn cache")
+
+	tk.MustExec("begin")
+	tk.MustExec("insert into cache_idx_txn values (6, 16, 106)")
+	tk.MustQuery("select v from cache_idx_txn where uk in (11, 16) order by uk").Check(testkit.Rows("10", "106"))
+	tk.MustExec("commit")
+
+	tk.MustExec("alter table cache_idx_txn nocache")
+}
+
 func TestPointGetLockExistKey(t *testing.T) {
 	testLock := func(t *testing.T, rc bool, key string, tableName string) {
 		store := testkit.CreateMockStore(t)
