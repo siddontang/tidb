@@ -298,7 +298,7 @@ Completed:
    - `tidb_cached_table_invalidation_log_gc_batch_size` controls delete batch size.
 17. Added `HOT_RANGE` first-step behavior for point-get / batch-point-get:
    - new switch `tidb_enable_cached_table_hot_range_point_get`.
-   - when enabled, point-get and direct-handle batch-point-get skip full-table cache loading and cache queried row keys as tiny segments.
+   - when enabled, point-get and batch-point-get (direct-handle and unique-index path) skip full-table cache loading and cache queried row keys as tiny segments.
    - subsequent point-get / batch-point-get on the same key can be served from cache (`ReadFromTableCache=true`).
 18. Added hot-range admission cap control:
    - new switch `tidb_cached_table_hot_range_max_segments` (default `4096`, `0` disables hot-range key admission).

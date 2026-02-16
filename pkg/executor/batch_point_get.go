@@ -434,7 +434,7 @@ func (e *BatchPointGetExec) initialize(ctx context.Context) error {
 	e.handles = newHandles
 
 	var values map[string]kv.ValueEntry
-	if !e.lock && e.hotRangeCache != nil && e.idxInfo == nil {
+	if !e.lock && e.hotRangeCache != nil {
 		values = make(map[string]kv.ValueEntry, len(keys))
 		missKeys := make([]kv.Key, 0, len(keys))
 		for _, key := range keys {
@@ -502,7 +502,7 @@ func (e *BatchPointGetExec) initialize(ctx context.Context) error {
 		}
 		e.values = append(e.values, val.Value)
 		handles = append(handles, e.handles[i])
-		if !e.lock && e.hotRangeCache != nil && e.idxInfo == nil {
+		if !e.lock && e.hotRangeCache != nil {
 			e.hotRangeCache.StoreKeyInCache(e.Ctx().GetStore(), e.cacheSnapshotTS, e.cacheLease, key, val)
 		}
 		if e.lock && rc {

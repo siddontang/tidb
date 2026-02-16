@@ -290,6 +290,26 @@ func TestCachedTableHotRangePointGetAdmissionLimit(t *testing.T) {
 	tk.MustExec("alter table hot_point_limit nocache")
 }
 
+func TestCachedTableHotRangeBatchPointGetByUniqueIndex(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set global tidb_enable_cached_table_hot_range_point_get = 1")
+	defer tk.MustExec("set global tidb_enable_cached_table_hot_range_point_get = 0")
+
+	tk.MustExec("drop table if exists hot_idx")
+	tk.MustExec("create table hot_idx(id int primary key, uk int unique, v int)")
+	tk.MustExec("insert into hot_idx values (1, 11, 10), (2, 22, 20)")
+	tk.MustExec("alter table hot_idx cache")
+
+	tk.MustQuery("select v from hot_idx where uk in (11, 22) order by uk").Check(testkit.Rows("10", "20"))
+	require.False(t, tk.Session().GetSessionVars().StmtCtx.ReadFromTableCache)
+	tk.MustQuery("select v from hot_idx where uk in (11, 22) order by uk").Check(testkit.Rows("10", "20"))
+	require.True(t, tk.Session().GetSessionVars().StmtCtx.ReadFromTableCache)
+
+	tk.MustExec("alter table hot_idx nocache")
+}
+
 func TestPointGetLockExistKey(t *testing.T) {
 	testLock := func(t *testing.T, rc bool, key string, tableName string) {
 		store := testkit.CreateMockStore(t)
