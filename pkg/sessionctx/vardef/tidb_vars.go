@@ -872,6 +872,8 @@ const (
 	TiDBEnableCachedTableHotRangePointGet = "tidb_enable_cached_table_hot_range_point_get"
 	// TiDBCachedTableHotRangeMaxSegments controls maximum admitted hot-range segments per cached table (0 disables).
 	TiDBCachedTableHotRangeMaxSegments = "tidb_cached_table_hot_range_max_segments"
+	// TiDBCachedTableHotRangeAdmissionThreshold controls how many misses are required before admitting a hot-range key.
+	TiDBCachedTableHotRangeAdmissionThreshold = "tidb_cached_table_hot_range_admission_threshold"
 	// TiDBCachedTableInvalidationLogKeepCount controls how many latest invalidation rows are retained (0 disables GC).
 	TiDBCachedTableInvalidationLogKeepCount = "tidb_cached_table_invalidation_log_keep_count"
 	// TiDBCachedTableInvalidationLogGCBatchSize controls delete batch size for invalidation-log GC.
@@ -1609,6 +1611,7 @@ const (
 	DefTiDBEnableCachedTableInvalidationAsyncPersist        = false
 	DefTiDBEnableCachedTableHotRangePointGet                = false
 	DefTiDBCachedTableHotRangeMaxSegments                   = 4096
+	DefTiDBCachedTableHotRangeAdmissionThreshold            = 1
 	DefTiDBCachedTableInvalidationPullInterval              = 200
 	DefTiDBCachedTableInvalidationBatchSize                 = 256
 	DefTiDBCachedTableInvalidationLogKeepCount              = 0
@@ -1848,6 +1851,7 @@ var (
 	EnableCachedTableInvalidationAsyncPersist        = atomic.NewBool(DefTiDBEnableCachedTableInvalidationAsyncPersist)
 	EnableCachedTableHotRangePointGet                = atomic.NewBool(DefTiDBEnableCachedTableHotRangePointGet)
 	CachedTableHotRangeMaxSegments                   = atomic.NewInt64(DefTiDBCachedTableHotRangeMaxSegments)
+	CachedTableHotRangeAdmissionThreshold            = atomic.NewInt64(DefTiDBCachedTableHotRangeAdmissionThreshold)
 	CachedTableInvalidationPullInterval              = atomic.NewInt64(DefTiDBCachedTableInvalidationPullInterval)
 	CachedTableInvalidationBatchSize                 = atomic.NewInt64(DefTiDBCachedTableInvalidationBatchSize)
 	CachedTableInvalidationLogKeepCount              = atomic.NewInt64(DefTiDBCachedTableInvalidationLogKeepCount)

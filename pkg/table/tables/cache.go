@@ -16,6 +16,7 @@ package tables
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -46,6 +47,8 @@ type cachedTable struct {
 	invalidationEpoch uint64
 	segments          *segmentIndex
 	totalSize         int64
+	hotAccessMu       sync.Mutex
+	hotAccessCount    map[string]uint8
 	// StateRemote is not thread-safe, this tokenLimit is used to keep only one visitor.
 	tokenLimit
 }
@@ -100,6 +103,7 @@ func (c *cachedTable) setCacheData(data *cacheData, totalSize int64) {
 	})
 	if data.MemBuffer != nil {
 		atomic.StoreInt64(&c.totalSize, totalSize)
+		c.resetHotAccessCount()
 	}
 }
 
@@ -198,9 +202,16 @@ func (c *cachedTable) StoreKeyInCache(store kv.Storage, ts uint64, leaseDuration
 	if maxSegments == 0 {
 		return
 	}
+	admissionThreshold := vardef.CachedTableHotRangeAdmissionThreshold.Load()
+	if admissionThreshold < 1 {
+		admissionThreshold = 1
+	}
 	start := key.Clone()
 	span := keySpan{start: start, end: start.Next()}
 	if _, exist, err := c.segments.get(span); err == nil && !exist && int64(c.segments.hotRangeLen()) >= maxSegments {
+		return
+	}
+	if !c.shouldAdmitHotRangeKey(start, maxSegments, admissionThreshold) {
 		return
 	}
 	memBuffer, err := newMemBuffer(store)
@@ -225,6 +236,44 @@ func (c *cachedTable) StoreKeyInCache(store kv.Storage, ts uint64, leaseDuration
 	if err = c.segments.upsert(seg); err != nil {
 		logutil.BgLogger().Warn("upsert cached key segment failed", zap.Error(err))
 	}
+}
+
+func (c *cachedTable) shouldAdmitHotRangeKey(key kv.Key, maxSegments int64, threshold int64) bool {
+	if threshold <= 1 {
+		return true
+	}
+
+	c.hotAccessMu.Lock()
+	defer c.hotAccessMu.Unlock()
+
+	if c.hotAccessCount == nil {
+		c.hotAccessCount = make(map[string]uint8)
+	}
+	keyString := string(key)
+	count := c.hotAccessCount[keyString] + 1
+	if int64(count) >= threshold {
+		delete(c.hotAccessCount, keyString)
+		return true
+	}
+	c.hotAccessCount[keyString] = count
+
+	trackLimit := int(maxSegments * 8)
+	if trackLimit < 1024 {
+		trackLimit = 1024
+	}
+	if len(c.hotAccessCount) > trackLimit {
+		c.hotAccessCount = make(map[string]uint8)
+	}
+	return false
+}
+
+func (c *cachedTable) resetHotAccessCount() {
+	c.hotAccessMu.Lock()
+	defer c.hotAccessMu.Unlock()
+	if len(c.hotAccessCount) == 0 {
+		return
+	}
+	c.hotAccessCount = make(map[string]uint8)
 }
 
 // newCachedTable creates a new CachedTable Instance

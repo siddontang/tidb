@@ -290,6 +290,32 @@ func TestCachedTableHotRangePointGetAdmissionLimit(t *testing.T) {
 	tk.MustExec("alter table hot_point_limit nocache")
 }
 
+func TestCachedTableHotRangePointGetAdmissionThreshold(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set global tidb_enable_cached_table_hot_range_point_get = 1")
+	tk.MustExec("set global tidb_cached_table_hot_range_admission_threshold = 2")
+	defer func() {
+		tk.MustExec(fmt.Sprintf("set global tidb_cached_table_hot_range_admission_threshold = %d", vardef.DefTiDBCachedTableHotRangeAdmissionThreshold))
+		tk.MustExec("set global tidb_enable_cached_table_hot_range_point_get = 0")
+	}()
+
+	tk.MustExec("drop table if exists hot_point_threshold")
+	tk.MustExec("create table hot_point_threshold(id int primary key, v int)")
+	tk.MustExec("insert into hot_point_threshold values (1, 10)")
+	tk.MustExec("alter table hot_point_threshold cache")
+
+	tk.MustQuery("select * from hot_point_threshold where id = 1").Check(testkit.Rows("1 10"))
+	require.False(t, tk.Session().GetSessionVars().StmtCtx.ReadFromTableCache)
+	tk.MustQuery("select * from hot_point_threshold where id = 1").Check(testkit.Rows("1 10"))
+	require.False(t, tk.Session().GetSessionVars().StmtCtx.ReadFromTableCache)
+	tk.MustQuery("select * from hot_point_threshold where id = 1").Check(testkit.Rows("1 10"))
+	require.True(t, tk.Session().GetSessionVars().StmtCtx.ReadFromTableCache)
+
+	tk.MustExec("alter table hot_point_threshold nocache")
+}
+
 func TestCachedTableHotRangeBatchPointGetByUniqueIndex(t *testing.T) {
 	store := testkit.CreateMockStore(t)
 	tk := testkit.NewTestKit(t, store)

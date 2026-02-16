@@ -306,6 +306,9 @@ Completed:
 19. Added optional async invalidation-log persistence mode:
    - new switch `tidb_enable_cached_table_invalidation_async_persist` (default `OFF`).
    - when enabled, commit path queues log writes to a domain worker (with synchronous fallback on queue saturation) while keeping immediate etcd fanout.
+20. Added hot-range admission threshold control:
+   - new switch `tidb_cached_table_hot_range_admission_threshold` (default `1`).
+   - allows requiring repeated misses before caching a key to reduce one-hit cache pollution.
 
 Notes:
 1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.

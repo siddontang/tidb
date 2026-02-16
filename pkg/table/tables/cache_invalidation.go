@@ -51,6 +51,7 @@ func (c *cachedTable) applyInvalidation(event cacheInvalidationEvent) int {
 
 	if data := c.cacheData.Load(); data != nil {
 		if data.Epoch >= currentEpoch {
+			c.resetHotAccessCount()
 			return removed
 		}
 		// Full-table cache always overlaps any invalidated span.
@@ -60,5 +61,6 @@ func (c *cachedTable) applyInvalidation(event cacheInvalidationEvent) int {
 			removed = 1
 		}
 	}
+	c.resetHotAccessCount()
 	return removed
 }
