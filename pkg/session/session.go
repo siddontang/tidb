@@ -110,6 +110,7 @@ import (
 	storeerr "github.com/pingcap/tidb/pkg/store/driver/error"
 	"github.com/pingcap/tidb/pkg/store/helper"
 	"github.com/pingcap/tidb/pkg/table"
+	tablecache "github.com/pingcap/tidb/pkg/table/tables"
 	"github.com/pingcap/tidb/pkg/table/tblctx"
 	"github.com/pingcap/tidb/pkg/table/tblsession"
 	"github.com/pingcap/tidb/pkg/table/temptable"
@@ -602,9 +603,19 @@ func nextCachedTableInvalidationEpoch() uint64 {
 }
 
 func applyCachedTableInvalidationEvents(tables map[int64]any, commitTS uint64) {
+	events := make([]tablecache.CachedTableInvalidationEvent, 0, len(tables))
 	for _, raw := range tables {
 		tbl := raw.(table.CachedTable)
-		tbl.ApplyLocalInvalidation(nextCachedTableInvalidationEpoch(), commitTS)
+		epoch := nextCachedTableInvalidationEpoch()
+		tbl.ApplyLocalInvalidation(epoch, commitTS)
+		events = append(events, tablecache.CachedTableInvalidationEvent{
+			TableID:  tbl.Meta().ID,
+			Epoch:    epoch,
+			CommitTS: commitTS,
+		})
+	}
+	if len(events) > 0 {
+		tablecache.PublishCachedTableInvalidationEvents(events)
 	}
 }
 

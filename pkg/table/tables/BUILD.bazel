@@ -6,6 +6,7 @@ go_library(
         "assertion.go",
         "cache.go",
         "cache_invalidation.go",
+        "cache_invalidation_notifier.go",
         "cache_segment.go",
         "index.go",
         "mutation_checker.go",
@@ -72,6 +73,7 @@ go_test(
     srcs = [
         "assertion_test.go",
         "bench_test.go",
+        "cache_invalidation_notifier_test.go",
         "cache_invalidation_test.go",
         "cache_segment_integration_test.go",
         "cache_test.go",

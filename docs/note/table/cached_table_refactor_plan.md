@@ -269,7 +269,10 @@ Completed:
 5. Added epoch-aware cache validation in `TryReadFromCache` and local invalidation epoch tracking.
 6. Added global feature gate `tidb_enable_cached_table_async_invalidation` and session commit-path scaffold:
    - when enabled, skip cached-table write lease waiting and apply local invalidation events after successful commit.
+7. Added cached-table invalidation notifier scaffolding in `pkg/table/tables`:
+   - publish/watch API with an in-memory notifier implementation.
+   - session commit path now publishes invalidation events after local application.
 
 Notes:
 1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.
-2. Invalidation events are still local scaffolding only; cross-instance fanout is not wired yet.
+2. Invalidation notifier currently uses in-memory implementation; cluster-wide fanout (for example via etcd/table-store) is not wired yet.
