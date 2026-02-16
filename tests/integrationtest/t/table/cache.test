@@ -118,3 +118,36 @@ select * from cache_add_column use index(k) where f1 = 1;
 alter table cache_add_column nocache;
 drop table cache_add_column;
 
+# TestCachedTableHotRangeVariables
+select @@global.tidb_enable_cached_table_hot_range_point_get;
+set @@global.tidb_enable_cached_table_hot_range_point_get = 1;
+select @@global.tidb_enable_cached_table_hot_range_point_get;
+set @@global.tidb_enable_cached_table_hot_range_point_get = 0;
+select @@global.tidb_enable_cached_table_hot_range_point_get;
+
+select @@global.tidb_cached_table_hot_range_max_segments;
+set @@global.tidb_cached_table_hot_range_max_segments = 8;
+select @@global.tidb_cached_table_hot_range_max_segments;
+set @@global.tidb_cached_table_hot_range_max_segments = 1000001;
+show warnings;
+select @@global.tidb_cached_table_hot_range_max_segments;
+set @@global.tidb_cached_table_hot_range_max_segments = 0;
+select @@global.tidb_cached_table_hot_range_max_segments;
+set @@global.tidb_cached_table_hot_range_max_segments = 4096;
+
+select @@global.tidb_cached_table_hot_range_admission_threshold;
+set @@global.tidb_cached_table_hot_range_admission_threshold = 2;
+select @@global.tidb_cached_table_hot_range_admission_threshold;
+set @@global.tidb_cached_table_hot_range_admission_threshold = 0;
+show warnings;
+select @@global.tidb_cached_table_hot_range_admission_threshold;
+set @@global.tidb_cached_table_hot_range_admission_threshold = 17;
+show warnings;
+select @@global.tidb_cached_table_hot_range_admission_threshold;
+set @@global.tidb_cached_table_hot_range_admission_threshold = 1;
+
+select @@global.tidb_enable_cached_table_invalidation_async_persist;
+set @@global.tidb_enable_cached_table_invalidation_async_persist = 1;
+select @@global.tidb_enable_cached_table_invalidation_async_persist;
+set @@global.tidb_enable_cached_table_invalidation_async_persist = 0;
+select @@global.tidb_enable_cached_table_invalidation_async_persist;

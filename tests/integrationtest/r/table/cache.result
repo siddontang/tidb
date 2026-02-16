@@ -274,3 +274,66 @@ f1	f2	f3	f4
 1	0	3	NULL
 alter table cache_add_column nocache;
 drop table cache_add_column;
+select @@global.tidb_enable_cached_table_hot_range_point_get;
+@@global.tidb_enable_cached_table_hot_range_point_get
+0
+set @@global.tidb_enable_cached_table_hot_range_point_get = 1;
+select @@global.tidb_enable_cached_table_hot_range_point_get;
+@@global.tidb_enable_cached_table_hot_range_point_get
+1
+set @@global.tidb_enable_cached_table_hot_range_point_get = 0;
+select @@global.tidb_enable_cached_table_hot_range_point_get;
+@@global.tidb_enable_cached_table_hot_range_point_get
+0
+select @@global.tidb_cached_table_hot_range_max_segments;
+@@global.tidb_cached_table_hot_range_max_segments
+4096
+set @@global.tidb_cached_table_hot_range_max_segments = 8;
+select @@global.tidb_cached_table_hot_range_max_segments;
+@@global.tidb_cached_table_hot_range_max_segments
+8
+set @@global.tidb_cached_table_hot_range_max_segments = 1000001;
+show warnings;
+Level	Code	Message
+Warning	1292	Truncated incorrect tidb_cached_table_hot_range_max_segments value: '1000001'
+select @@global.tidb_cached_table_hot_range_max_segments;
+@@global.tidb_cached_table_hot_range_max_segments
+1000000
+set @@global.tidb_cached_table_hot_range_max_segments = 0;
+select @@global.tidb_cached_table_hot_range_max_segments;
+@@global.tidb_cached_table_hot_range_max_segments
+0
+set @@global.tidb_cached_table_hot_range_max_segments = 4096;
+select @@global.tidb_cached_table_hot_range_admission_threshold;
+@@global.tidb_cached_table_hot_range_admission_threshold
+1
+set @@global.tidb_cached_table_hot_range_admission_threshold = 2;
+select @@global.tidb_cached_table_hot_range_admission_threshold;
+@@global.tidb_cached_table_hot_range_admission_threshold
+2
+set @@global.tidb_cached_table_hot_range_admission_threshold = 0;
+show warnings;
+Level	Code	Message
+Warning	1292	Truncated incorrect tidb_cached_table_hot_range_admission_threshold value: '0'
+select @@global.tidb_cached_table_hot_range_admission_threshold;
+@@global.tidb_cached_table_hot_range_admission_threshold
+1
+set @@global.tidb_cached_table_hot_range_admission_threshold = 17;
+show warnings;
+Level	Code	Message
+Warning	1292	Truncated incorrect tidb_cached_table_hot_range_admission_threshold value: '17'
+select @@global.tidb_cached_table_hot_range_admission_threshold;
+@@global.tidb_cached_table_hot_range_admission_threshold
+16
+set @@global.tidb_cached_table_hot_range_admission_threshold = 1;
+select @@global.tidb_enable_cached_table_invalidation_async_persist;
+@@global.tidb_enable_cached_table_invalidation_async_persist
+0
+set @@global.tidb_enable_cached_table_invalidation_async_persist = 1;
+select @@global.tidb_enable_cached_table_invalidation_async_persist;
+@@global.tidb_enable_cached_table_invalidation_async_persist
+1
+set @@global.tidb_enable_cached_table_invalidation_async_persist = 0;
+select @@global.tidb_enable_cached_table_invalidation_async_persist;
+@@global.tidb_enable_cached_table_invalidation_async_persist
+0
