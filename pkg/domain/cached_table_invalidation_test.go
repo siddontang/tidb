@@ -64,3 +64,24 @@ func TestApplyCachedTableInvalidationEventSkipZeroEpoch(t *testing.T) {
 	require.Equal(t, 0, applied)
 	require.Equal(t, 0, t1.called)
 }
+
+func TestCoalesceCachedTableInvalidationEvents(t *testing.T) {
+	events := []tablecache.CachedTableInvalidationEvent{
+		{TableID: 11, PhysicalID: 11, CommitTS: 100, Epoch: 100},
+		{TableID: 11, PhysicalID: 11, CommitTS: 101, Epoch: 101},
+		{TableID: 12, PhysicalID: 1201, CommitTS: 90, Epoch: 0},
+		{TableID: 12, PhysicalID: 1201, CommitTS: 91, Epoch: 91},
+	}
+	coalesced := coalesceCachedTableInvalidationEvents(events)
+	require.Len(t, coalesced, 2)
+
+	got := make(map[cachedTableInvalidationEventKey]tablecache.CachedTableInvalidationEvent, len(coalesced))
+	for _, event := range coalesced {
+		got[cachedTableInvalidationEventKey{tableID: event.TableID, physicalID: event.PhysicalID}] = event
+	}
+
+	require.Equal(t, uint64(101), got[cachedTableInvalidationEventKey{tableID: 11, physicalID: 11}].Epoch)
+	require.Equal(t, uint64(101), got[cachedTableInvalidationEventKey{tableID: 11, physicalID: 11}].CommitTS)
+	require.Equal(t, uint64(91), got[cachedTableInvalidationEventKey{tableID: 12, physicalID: 1201}].Epoch)
+	require.Equal(t, uint64(91), got[cachedTableInvalidationEventKey{tableID: 12, physicalID: 1201}].CommitTS)
+}

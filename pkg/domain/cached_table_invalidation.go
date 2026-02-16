@@ -41,11 +41,39 @@ type cachedTableInvalidationTarget interface {
 	ApplyLocalInvalidation(epoch, commitTS uint64) int
 }
 
+type cachedTableInvalidationEventKey struct {
+	tableID    int64
+	physicalID int64
+}
+
 func normalizeCachedTableInvalidationEvent(event tablecache.CachedTableInvalidationEvent) tablecache.CachedTableInvalidationEvent {
 	if event.Epoch == 0 {
 		event.Epoch = event.CommitTS
 	}
 	return event
+}
+
+func coalesceCachedTableInvalidationEvents(events []tablecache.CachedTableInvalidationEvent) []tablecache.CachedTableInvalidationEvent {
+	if len(events) <= 1 {
+		return events
+	}
+	latest := make(map[cachedTableInvalidationEventKey]tablecache.CachedTableInvalidationEvent, len(events))
+	for _, event := range events {
+		event = normalizeCachedTableInvalidationEvent(event)
+		key := cachedTableInvalidationEventKey{
+			tableID:    event.TableID,
+			physicalID: event.PhysicalID,
+		}
+		prev, ok := latest[key]
+		if !ok || event.Epoch > prev.Epoch || (event.Epoch == prev.Epoch && event.CommitTS > prev.CommitTS) {
+			latest[key] = event
+		}
+	}
+	result := make([]tablecache.CachedTableInvalidationEvent, 0, len(latest))
+	for _, event := range latest {
+		result = append(result, event)
+	}
+	return result
 }
 
 func applyCachedTableInvalidationEventToTargets(event tablecache.CachedTableInvalidationEvent, targets []cachedTableInvalidationTarget) int {
@@ -148,17 +176,23 @@ func (do *Domain) pullCachedTableInvalidationEvents(afterID uint64, limit int) (
 	if err != nil {
 		return afterID, 0, err
 	}
+
+	events := make([]tablecache.CachedTableInvalidationEvent, 0, len(rows))
 	lastID := afterID
 	for _, row := range rows {
-		event := tablecache.CachedTableInvalidationEvent{
+		events = append(events, tablecache.CachedTableInvalidationEvent{
 			TableID:    row.GetInt64(1),
 			PhysicalID: row.GetInt64(2),
 			CommitTS:   row.GetUint64(3),
 			Epoch:      row.GetUint64(4),
-		}
-		do.applyCachedTableInvalidationEvent(event)
+		})
 		lastID = row.GetUint64(0)
 	}
+
+	for _, event := range coalesceCachedTableInvalidationEvents(events) {
+		do.applyCachedTableInvalidationEvent(event)
+	}
+
 	return lastID, len(rows), nil
 }
 

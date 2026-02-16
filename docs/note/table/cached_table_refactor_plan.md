@@ -288,6 +288,7 @@ Completed:
    - `tidb_cached_table_invalidation_pull_interval` (ms) to tune pull latency/overhead.
    - `tidb_cached_table_invalidation_batch_size` to tune catch-up throughput.
    - domain replay loop reloads these values dynamically.
+14. Optimized replay CPU path by coalescing duplicate events per `(table_id, physical_id)` within each pull batch before local invalidation.
 
 Notes:
 1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.
