@@ -16,18 +16,28 @@ package storage
 
 import (
 	"context"
+	"strings"
 	"sync"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/pkg/config"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/service"
+	kvstore "github.com/pingcap/tidb/pkg/store"
 	"github.com/pingcap/tidb/pkg/store/driver"
+	"github.com/pingcap/tidb/pkg/store/mockstore"
 )
 
 // Config contains configuration for the storage service.
 type Config struct {
 	// Path is the storage path (e.g., "tikv://pd:2379").
 	Path string `toml:"path" json:"path"`
+
+	// StoreType is the type of storage (tikv, unistore, mocktikv).
+	StoreType config.StoreType `toml:"store" json:"store"`
+
+	// KeyspaceName is the keyspace name for the storage.
+	KeyspaceName string `toml:"keyspace-name" json:"keyspace-name"`
 }
 
 // Service wraps kv.Storage as a service component.
@@ -67,13 +77,26 @@ func (s *Service) Init(ctx context.Context, opts service.Options) error {
 		s.config = cfg
 	}
 
+	// If storage is already set (e.g., for testing), skip initialization
+	s.mu.RLock()
+	if s.storage != nil {
+		s.mu.RUnlock()
+		s.SetHealth(service.HealthStatus{State: service.StateHealthy})
+		return nil
+	}
+	s.mu.RUnlock()
+
 	if s.config.Path == "" {
 		return errors.New("storage path is required")
 	}
 
-	// Open storage
-	d := &driver.TiKVDriver{}
-	store, err := d.Open(s.config.Path)
+	// Register store drivers
+	if err := s.registerStoreDrivers(); err != nil {
+		return errors.Wrap(err, "failed to register store drivers")
+	}
+
+	// Open storage using the kvstore package
+	store, err := s.openStorage()
 	if err != nil {
 		return errors.Wrap(err, "failed to open storage")
 	}
@@ -84,6 +107,61 @@ func (s *Service) Init(ctx context.Context, opts service.Options) error {
 
 	s.SetHealth(service.HealthStatus{State: service.StateHealthy})
 	return nil
+}
+
+// registerStoreDrivers registers all store drivers.
+// Ignores "already registered" errors since drivers may be registered by main.go
+// before the storage service initializes.
+func (s *Service) registerStoreDrivers() error {
+	// Register TiKV driver
+	if err := kvstore.Register(config.StoreTypeTiKV, &driver.TiKVDriver{}); err != nil {
+		// Ignore already registered error
+		if !isAlreadyRegisteredError(err) {
+			return err
+		}
+	}
+
+	// Register MockTiKV driver
+	if err := kvstore.Register(config.StoreTypeMockTiKV, mockstore.MockTiKVDriver{}); err != nil {
+		if !isAlreadyRegisteredError(err) {
+			return err
+		}
+	}
+
+	// Register UniStore driver
+	if err := kvstore.Register(config.StoreTypeUniStore, mockstore.EmbedUnistoreDriver{}); err != nil {
+		if !isAlreadyRegisteredError(err) {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// isAlreadyRegisteredError checks if the error is a "driver already registered" error.
+func isAlreadyRegisteredError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "already registered")
+}
+
+// openStorage opens the storage based on configuration.
+func (s *Service) openStorage() (kv.Storage, error) {
+	// If keyspace name is provided, use kvstore.MustInitStorage
+	if s.config.KeyspaceName != "" {
+		return kvstore.New(s.config.Path)
+	}
+
+	// Otherwise, use the direct path-based opening
+	storeType := s.config.StoreType
+	if storeType == "" {
+		// Default to TiKV if path looks like tikv:// or unistore otherwise
+		if len(s.config.Path) > 7 && s.config.Path[:7] == "tikv://" {
+			storeType = config.StoreTypeTiKV
+		} else {
+			storeType = config.StoreTypeUniStore
+		}
+	}
+
+	return kvstore.New(s.config.Path)
 }
 
 // Start starts the storage service.

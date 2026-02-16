@@ -27,17 +27,17 @@ import (
 // It handles service registration, dependency resolution, and coordinated
 // startup/shutdown.
 type Manager struct {
-	mu             sync.RWMutex
-	services       map[string]Service
-	startOrder     []string // Services in dependency-sorted start order
-	registry       Registry
-	config         *Config
-	ctx            context.Context
-	cancel         context.CancelFunc
-	healthAgg      *HealthAggregator
-	logger         *zap.Logger
-	started        bool
-	shutdownHooks  []func()
+	mu            sync.RWMutex
+	services      map[string]Service
+	startOrder    []string // Services in dependency-sorted start order
+	registry      Registry
+	config        *Config
+	ctx           context.Context
+	cancel        context.CancelFunc
+	healthAgg     *HealthAggregator
+	logger        *zap.Logger
+	started       bool
+	shutdownHooks []func()
 }
 
 // NewManager creates a new service manager.

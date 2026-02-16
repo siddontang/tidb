@@ -36,7 +36,7 @@ type Config struct {
 // DefaultConfig returns the default coprocessor service configuration.
 func DefaultConfig() Config {
 	return Config{
-		ConcurrencyLimit: 0,  // 0 means no limit
+		ConcurrencyLimit: 0, // 0 means no limit
 		MaxBatchSize:     128,
 	}
 }

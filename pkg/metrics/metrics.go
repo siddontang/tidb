@@ -101,6 +101,7 @@ func InitMetrics() {
 	InitGlobalSortMetrics()
 	InitInfoSchemaV2Metrics()
 	InitMemoryMetrics()
+	InitServiceMetrics()
 	timermetrics.InitTimerMetrics()
 
 	InitBRMetrics()
@@ -362,6 +363,17 @@ func RegisterMetrics() {
 	prometheus.MustRegister(IndexLookRowsCounter)
 	prometheus.MustRegister(IndexLookUpExecutorRowNumber)
 	prometheus.MustRegister(IndexLookUpCopTaskCount)
+
+	// Service framework metrics
+	prometheus.MustRegister(ServiceHealthGauge)
+	prometheus.MustRegister(ServiceStartTotal)
+	prometheus.MustRegister(ServiceStopTotal)
+	prometheus.MustRegister(ServiceInitDuration)
+	prometheus.MustRegister(ServiceOperationDuration)
+	prometheus.MustRegister(ServiceGRPCRequestTotal)
+	prometheus.MustRegister(ServiceGRPCRequestDuration)
+	prometheus.MustRegister(ServiceRegistryGauge)
+	prometheus.MustRegister(ServiceDependencyResolutionDuration)
 }
 
 // Register registers custom collectors.

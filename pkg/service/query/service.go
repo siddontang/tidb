@@ -33,7 +33,7 @@ type Config struct {
 // DefaultConfig returns the default query service configuration.
 func DefaultConfig() Config {
 	return Config{
-		MaxExecutionTime: 0, // 0 means no limit
+		MaxExecutionTime: 0,       // 0 means no limit
 		MemQuotaQuery:    1 << 30, // 1GB
 	}
 }

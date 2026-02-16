@@ -35,7 +35,7 @@ type Config struct {
 // DefaultConfig returns the default session service configuration.
 func DefaultConfig() Config {
 	return Config{
-		MaxConnections: 0,   // 0 means no limit
+		MaxConnections: 0, // 0 means no limit
 		PoolSize:       200,
 	}
 }
