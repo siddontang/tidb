@@ -814,6 +814,8 @@ func (do *Domain) Start(startMode ddl.StartMode) error {
 	do.wg.Run(do.runawayManager.RunawayWatchSyncLoop, "runawayWatchSyncLoop")
 	do.wg.Run(do.requestUnitsWriterLoop, "requestUnitsWriterLoop")
 	do.wg.Run(do.cachedTableInvalidationPullerLoop, "cachedTableInvalidationPullerLoop")
+	do.wg.Run(do.cachedTableInvalidationWatchLoop, "cachedTableInvalidationWatchLoop")
+	do.wg.Run(do.cachedTableInvalidationLogGCLoop, "cachedTableInvalidationLogGCLoop")
 	skipRegisterToDashboard := gCfg.SkipRegisterToDashboard
 	if !skipRegisterToDashboard {
 		do.wg.Run(func() {

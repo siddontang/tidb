@@ -16,8 +16,10 @@ package domain
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
+	ddlutil "github.com/pingcap/tidb/pkg/ddl/util"
 	"github.com/pingcap/tidb/pkg/infoschema"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/metrics"
@@ -29,12 +31,16 @@ import (
 	tablecache "github.com/pingcap/tidb/pkg/table/tables"
 	"github.com/pingcap/tidb/pkg/util"
 	"github.com/pingcap/tidb/pkg/util/chunk"
+	etcdutil "github.com/pingcap/tidb/pkg/util/etcd"
 	"github.com/pingcap/tidb/pkg/util/logutil"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 )
 
 const (
-	cachedTableInvalidationLogTable = "table_cache_invalidation_log"
+	cachedTableInvalidationLogTable      = "table_cache_invalidation_log"
+	cachedTableInvalidationNotifyKey     = "/tidb/cached-table/invalidation"
+	cachedTableInvalidationLogGCTickTime = 10 * time.Second
 )
 
 type cachedTableInvalidationTarget interface {
@@ -44,6 +50,11 @@ type cachedTableInvalidationTarget interface {
 type cachedTableInvalidationEventKey struct {
 	tableID    int64
 	physicalID int64
+}
+
+type cachedTableInvalidationNotifyEvent struct {
+	ServerID uint64                                    `json:"server_id"`
+	Events   []tablecache.CachedTableInvalidationEvent `json:"events"`
 }
 
 func normalizeCachedTableInvalidationEvent(event tablecache.CachedTableInvalidationEvent) tablecache.CachedTableInvalidationEvent {
@@ -86,6 +97,83 @@ func applyCachedTableInvalidationEventToTargets(event tablecache.CachedTableInva
 		applied += target.ApplyLocalInvalidation(event.Epoch, event.CommitTS)
 	}
 	return applied
+}
+
+func (do *Domain) applyCachedTableInvalidationEvents(events []tablecache.CachedTableInvalidationEvent) int {
+	applied := 0
+	for _, event := range coalesceCachedTableInvalidationEvents(events) {
+		applied += do.applyCachedTableInvalidationEvent(event)
+	}
+	return applied
+}
+
+// NotifyCachedTableInvalidation publishes fast-path invalidation events to other TiDB instances.
+// Polling from mysql.table_cache_invalidation_log remains the durability/recovery path.
+func (do *Domain) NotifyCachedTableInvalidation(events []tablecache.CachedTableInvalidationEvent) {
+	if do.etcdClient == nil || len(events) == 0 || !vardef.EnableCachedTableAsyncInvalidation.Load() {
+		return
+	}
+	payload := cachedTableInvalidationNotifyEvent{
+		ServerID: do.serverID,
+		Events:   coalesceCachedTableInvalidationEvents(events),
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		logutil.BgLogger().Warn("marshal cached-table invalidation notify payload failed", zap.Error(err))
+		return
+	}
+	err = ddlutil.PutKVToEtcd(context.Background(), do.etcdClient, etcdutil.KeyOpDefaultRetryCnt, cachedTableInvalidationNotifyKey, string(data))
+	if err != nil {
+		logutil.BgLogger().Warn("notify cached-table invalidation failed", zap.Error(err))
+	}
+}
+
+func (do *Domain) cachedTableInvalidationWatchLoop() {
+	defer util.Recover(metrics.LabelDomain, "cachedTableInvalidationWatchLoop", nil, false)
+	defer logutil.BgLogger().Info("cachedTableInvalidationWatchLoop exited")
+	if do.etcdClient == nil {
+		return
+	}
+	watchCh := do.etcdClient.Watch(context.Background(), cachedTableInvalidationNotifyKey)
+	var retry int
+	for {
+		select {
+		case <-do.exit:
+			return
+		case resp, ok := <-watchCh:
+			if !ok {
+				watchCh = do.etcdClient.Watch(context.Background(), cachedTableInvalidationNotifyKey)
+				retry++
+				if retry > 10 {
+					time.Sleep(time.Duration(retry) * time.Second)
+				}
+				continue
+			}
+			retry = 0
+			do.applyCachedTableInvalidationNotifyResponse(resp)
+		}
+	}
+}
+
+func (do *Domain) applyCachedTableInvalidationNotifyResponse(resp clientv3.WatchResponse) {
+	if err := resp.Err(); err != nil {
+		logutil.BgLogger().Warn("watch cached-table invalidation failed", zap.Error(err))
+		return
+	}
+	for _, raw := range resp.Events {
+		if raw == nil || raw.Kv == nil || len(raw.Kv.Value) == 0 {
+			continue
+		}
+		var payload cachedTableInvalidationNotifyEvent
+		if err := json.Unmarshal(raw.Kv.Value, &payload); err != nil {
+			logutil.BgLogger().Warn("decode cached-table invalidation event failed", zap.Error(err))
+			continue
+		}
+		if payload.ServerID == do.serverID || len(payload.Events) == 0 {
+			continue
+		}
+		do.applyCachedTableInvalidationEvents(payload.Events)
+	}
 }
 
 func (do *Domain) cachedTableInvalidationPullerLoop() {
@@ -137,6 +225,45 @@ func (do *Domain) cachedTableInvalidationPullerLoop() {
 	}
 }
 
+func (do *Domain) cachedTableInvalidationLogGCLoop() {
+	defer util.Recover(metrics.LabelDomain, "cachedTableInvalidationLogGCLoop", nil, false)
+	ticker := time.NewTicker(cachedTableInvalidationLogGCTickTime)
+	defer func() {
+		ticker.Stop()
+		logutil.BgLogger().Info("cachedTableInvalidationLogGCLoop exited")
+	}()
+
+	for {
+		select {
+		case <-do.exit:
+			return
+		case <-ticker.C:
+		}
+
+		if !vardef.EnableCachedTableAsyncInvalidation.Load() {
+			continue
+		}
+		keepCount := loadCachedTableInvalidationLogKeepCount()
+		if keepCount == 0 {
+			continue
+		}
+		maxID, err := do.getLatestCachedTableInvalidationLogID()
+		if err != nil {
+			if !terror.ErrorEqual(err, infoschema.ErrTableNotExists) {
+				logutil.BgLogger().Warn("read cached-table invalidation log max id failed", zap.Error(err))
+			}
+			continue
+		}
+		if maxID <= keepCount {
+			continue
+		}
+		cutoff := maxID - keepCount
+		if err := do.gcCachedTableInvalidationLogByID(cutoff, loadCachedTableInvalidationLogGCBatchSize()); err != nil && !terror.ErrorEqual(err, infoschema.ErrTableNotExists) {
+			logutil.BgLogger().Warn("cached-table invalidation log gc failed", zap.Error(err), zap.Uint64("cutoffID", cutoff))
+		}
+	}
+}
+
 func loadCachedTableInvalidationPullInterval() time.Duration {
 	ms := vardef.CachedTableInvalidationPullInterval.Load()
 	if ms <= 0 {
@@ -149,6 +276,22 @@ func loadCachedTableInvalidationBatchSize() int {
 	size := vardef.CachedTableInvalidationBatchSize.Load()
 	if size <= 0 {
 		size = vardef.DefTiDBCachedTableInvalidationBatchSize
+	}
+	return int(size)
+}
+
+func loadCachedTableInvalidationLogKeepCount() uint64 {
+	size := vardef.CachedTableInvalidationLogKeepCount.Load()
+	if size <= 0 {
+		return 0
+	}
+	return uint64(size)
+}
+
+func loadCachedTableInvalidationLogGCBatchSize() int {
+	size := vardef.CachedTableInvalidationLogGCBatchSize.Load()
+	if size <= 0 {
+		size = vardef.DefTiDBCachedTableInvalidationLogGCBatchSize
 	}
 	return int(size)
 }
@@ -194,6 +337,17 @@ func (do *Domain) pullCachedTableInvalidationEvents(afterID uint64, limit int) (
 	}
 
 	return lastID, len(rows), nil
+}
+
+func (do *Domain) gcCachedTableInvalidationLogByID(cutoffID uint64, limit int) error {
+	_, err := do.execCachedTableInvalidationRestrictedSQL(
+		"DELETE FROM %n.%n WHERE id <= %? ORDER BY id LIMIT %?",
+		mysql.SystemDB,
+		cachedTableInvalidationLogTable,
+		cutoffID,
+		limit,
+	)
+	return err
 }
 
 func (do *Domain) execCachedTableInvalidationRestrictedSQL(sql string, args ...any) ([]chunk.Row, error) {

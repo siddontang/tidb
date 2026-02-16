@@ -621,6 +621,7 @@ func applyCachedTableInvalidationEvents(s *session, tables map[int64]any, commit
 	}
 	if len(events) > 0 {
 		persistCachedTableInvalidationEvents(s, events)
+		domain.GetDomain(s).NotifyCachedTableInvalidation(events)
 		tablecache.PublishCachedTableInvalidationEvents(events)
 	}
 }

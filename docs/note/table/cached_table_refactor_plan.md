@@ -289,6 +289,13 @@ Completed:
    - `tidb_cached_table_invalidation_batch_size` to tune catch-up throughput.
    - domain replay loop reloads these values dynamically.
 14. Optimized replay CPU path by coalescing duplicate events per `(table_id, physical_id)` within each pull batch before local invalidation.
+15. Added low-latency cluster fanout fast path:
+   - writer now notifies cached-table invalidation events via etcd key watch (`/tidb/cached-table/invalidation`).
+   - each TiDB watches and applies remote invalidation events immediately.
+   - log polling remains as durability/recovery path.
+16. Added invalidation-log GC controls and background worker:
+   - `tidb_cached_table_invalidation_log_keep_count` (default `0`, disabled) keeps latest N rows.
+   - `tidb_cached_table_invalidation_log_gc_batch_size` controls delete batch size.
 
 Notes:
 1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.

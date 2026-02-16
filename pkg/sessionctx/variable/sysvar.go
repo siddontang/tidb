@@ -1106,6 +1106,18 @@ var defaultSysVars = []*SysVar{
 	}, GetGlobal: func(_ context.Context, _ *SessionVars) (string, error) {
 		return strconv.FormatInt(vardef.CachedTableInvalidationBatchSize.Load(), 10), nil
 	}},
+	{Scope: vardef.ScopeGlobal, Name: vardef.TiDBCachedTableInvalidationLogKeepCount, Value: strconv.Itoa(vardef.DefTiDBCachedTableInvalidationLogKeepCount), Type: vardef.TypeUnsigned, MinValue: 0, MaxValue: 1000000000, SetGlobal: func(_ context.Context, _ *SessionVars, s string) error {
+		vardef.CachedTableInvalidationLogKeepCount.Store(TidbOptInt64(s, vardef.DefTiDBCachedTableInvalidationLogKeepCount))
+		return nil
+	}, GetGlobal: func(_ context.Context, _ *SessionVars) (string, error) {
+		return strconv.FormatInt(vardef.CachedTableInvalidationLogKeepCount.Load(), 10), nil
+	}},
+	{Scope: vardef.ScopeGlobal, Name: vardef.TiDBCachedTableInvalidationLogGCBatchSize, Value: strconv.Itoa(vardef.DefTiDBCachedTableInvalidationLogGCBatchSize), Type: vardef.TypeUnsigned, MinValue: 1, MaxValue: 100000, SetGlobal: func(_ context.Context, _ *SessionVars, s string) error {
+		vardef.CachedTableInvalidationLogGCBatchSize.Store(TidbOptInt64(s, vardef.DefTiDBCachedTableInvalidationLogGCBatchSize))
+		return nil
+	}, GetGlobal: func(_ context.Context, _ *SessionVars) (string, error) {
+		return strconv.FormatInt(vardef.CachedTableInvalidationLogGCBatchSize.Load(), 10), nil
+	}},
 	{Scope: vardef.ScopeGlobal, Name: vardef.TiDBAutoAnalyzePartitionBatchSize,
 		Value: strconv.Itoa(vardef.DefTiDBAutoAnalyzePartitionBatchSize),
 		Type:  vardef.TypeUnsigned, MinValue: 1, MaxValue: mysql.PartitionCountLimit,
