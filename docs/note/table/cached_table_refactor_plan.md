@@ -282,6 +282,8 @@ Completed:
    - events now use cluster-orderable epochs for cross-instance replay correctness.
    - local monotonic fallback remains only when commit-ts is unavailable.
 11. Added focused unit tests for invalidation event normalization/application helpers in `pkg/domain/cached_table_invalidation_test.go`.
+12. Optimized write-path invalidation-log persistence:
+   - commit path now batches multiple table invalidation events into one `INSERT ... VALUES (...), ...` statement.
 
 Notes:
 1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.
