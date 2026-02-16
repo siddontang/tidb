@@ -49,6 +49,13 @@ func New() *Service {
 	}
 }
 
+// SetConfig sets the service configuration.
+func (s *Service) SetConfig(cfg Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.config = cfg
+}
+
 // Init initializes the storage service.
 func (s *Service) Init(ctx context.Context, opts service.Options) error {
 	s.InitBase(opts)

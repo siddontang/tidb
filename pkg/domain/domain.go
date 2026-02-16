@@ -233,6 +233,35 @@ type Domain struct {
 	// only used for nextgen
 	crossKSSessMgr           *crossks.Manager
 	crossKSSessFactoryGetter func(string, validatorapi.Validator) pools.Factory
+
+	// serviceProvider provides access to services when using the multi-service architecture.
+	// This is optional and nil in traditional monolithic mode.
+	serviceProvider ServiceProvider
+}
+
+// ServiceProvider provides access to services in the multi-service architecture.
+// This interface is implemented by the service framework's DomainServiceProvider.
+type ServiceProvider interface {
+	// GetService returns a service by name.
+	// The caller should type-assert to the expected service type.
+	GetService(name string) (any, error)
+
+	// GetStorage returns the kv.Storage from the storage service.
+	GetStorage() (kv.Storage, error)
+
+	// GetEtcdClient returns the etcd client from the metadata service.
+	GetEtcdClient() (*clientv3.Client, error)
+}
+
+// DomainOption is a function that configures a Domain.
+type DomainOption func(*Domain)
+
+// WithServiceProvider sets the service provider for the domain.
+// This enables the domain to access services through the multi-service architecture.
+func WithServiceProvider(sp ServiceProvider) DomainOption {
+	return func(do *Domain) {
+		do.serviceProvider = sp
+	}
 }
 
 var _ sqlsvrapi.Server = (*Domain)(nil)
@@ -240,6 +269,17 @@ var _ sqlsvrapi.Server = (*Domain)(nil)
 // InfoCache export for test.
 func (do *Domain) InfoCache() *infoschema.InfoCache {
 	return do.infoCache
+}
+
+// ServiceProvider returns the service provider if configured.
+// Returns nil in traditional monolithic mode without service framework.
+func (do *Domain) ServiceProvider() ServiceProvider {
+	return do.serviceProvider
+}
+
+// HasServiceProvider returns true if a service provider is configured.
+func (do *Domain) HasServiceProvider() bool {
+	return do.serviceProvider != nil
 }
 
 // UnprefixedEtcdCli export for test.
@@ -538,8 +578,8 @@ func (do *Domain) Close() {
 const resourceIdleTimeout = 3 * time.Minute // resources in the ResourcePool will be recycled after idleTimeout
 
 // NewDomain creates a new domain. Should not create multiple domains for the same store.
-func NewDomain(store kv.Storage, schemaLease time.Duration, statsLease time.Duration, dumpFileGcLease time.Duration, factory pools.Factory) *Domain {
-	return NewDomainWithEtcdClient(store, schemaLease, statsLease, dumpFileGcLease, factory, nil, nil, nil)
+func NewDomain(store kv.Storage, schemaLease time.Duration, statsLease time.Duration, dumpFileGcLease time.Duration, factory pools.Factory, opts ...DomainOption) *Domain {
+	return NewDomainWithEtcdClient(store, schemaLease, statsLease, dumpFileGcLease, factory, nil, nil, nil, opts...)
 }
 
 // NewDomainWithEtcdClient creates a new domain with etcd client. Should not create multiple domains for the same store.
@@ -552,6 +592,7 @@ func NewDomainWithEtcdClient(
 	crossKSSessFactoryGetter func(targetKS string, validator validatorapi.Validator) pools.Factory,
 	etcdClient *clientv3.Client,
 	schemaFilter issyncer.Filter,
+	opts ...DomainOption,
 ) *Domain {
 	intest.Assert(schemaLease > 0, "schema lease should be a positive duration")
 	do := &Domain{
@@ -565,6 +606,11 @@ func NewDomainWithEtcdClient(
 		dumpFileGcChecker: &dumpFileGcChecker{gcLease: dumpFileGcLease, paths: []string{replayer.GetPlanReplayerDirName(), GetOptimizerTraceDirName(), GetExtractTaskDirName()}},
 
 		crossKSSessFactoryGetter: crossKSSessFactoryGetter,
+	}
+
+	// Apply options
+	for _, opt := range opts {
+		opt(do)
 	}
 
 	do.advancedSysSessionPool = syssession.NewAdvancedSessionPool(systemSessionPoolSize, func() (syssession.SessionContext, error) {

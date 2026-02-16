@@ -51,6 +51,18 @@ import (
 	"github.com/pingcap/tidb/pkg/privilege/privileges"
 	"github.com/pingcap/tidb/pkg/resourcemanager"
 	"github.com/pingcap/tidb/pkg/server"
+	"github.com/pingcap/tidb/pkg/service"
+	adminsvc "github.com/pingcap/tidb/pkg/service/admin"
+	coprsvc "github.com/pingcap/tidb/pkg/service/copr"
+	ddlsvc "github.com/pingcap/tidb/pkg/service/ddl"
+	gatewaysvc "github.com/pingcap/tidb/pkg/service/gateway"
+	metadatasvc "github.com/pingcap/tidb/pkg/service/metadata"
+	querysvc "github.com/pingcap/tidb/pkg/service/query"
+	schemasvc "github.com/pingcap/tidb/pkg/service/schema"
+	sessionsvc "github.com/pingcap/tidb/pkg/service/session"
+	statssvc "github.com/pingcap/tidb/pkg/service/stats"
+	storagesvc "github.com/pingcap/tidb/pkg/service/storage"
+	txnsvc "github.com/pingcap/tidb/pkg/service/txn"
 	"github.com/pingcap/tidb/pkg/session"
 	"github.com/pingcap/tidb/pkg/session/txninfo"
 	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
@@ -391,8 +403,28 @@ func main() {
 	keyspaceName := keyspace.GetKeyspaceNameBySettings()
 	executor.Start()
 	resourcemanager.InstanceResourceManager.Start()
-	storage, dom, err := createStoreDDLOwnerMgrAndDomain(keyspaceName)
-	terror.MustNil(err)
+
+	cfg := config.GetGlobalConfig()
+
+	// Check if we should use the service framework
+	var svcMgr *service.Manager
+	var storage kv.Storage
+	var dom *domain.Domain
+
+	if shouldUseServiceManager(cfg) {
+		// Use the new multi-service architecture
+		log.Info("initializing TiDB with service framework",
+			zap.String("mode", cfg.Services.Mode))
+		var initErr error
+		svcMgr, storage, dom, initErr = initWithServiceManager(cfg, keyspaceName)
+		terror.MustNil(initErr)
+	} else {
+		// Use traditional monolithic initialization
+		var initErr error
+		storage, dom, initErr = createStoreDDLOwnerMgrAndDomain(keyspaceName)
+		terror.MustNil(initErr)
+	}
+
 	repository.SetupRepository(dom)
 	svr := createServer(storage, dom)
 	if standbyController != nil {
@@ -406,7 +438,7 @@ func main() {
 	signal.SetupSignalHandler(func() {
 		svr.Close()
 		resourcemanager.InstanceResourceManager.Stop()
-		cleanup(svr, storage, dom)
+		cleanupWithServiceManager(svr, storage, dom, svcMgr)
 		cpuprofile.StopCPUProfiler()
 		executor.Stop()
 		close(exited)
@@ -517,6 +549,163 @@ func createStoreDDLOwnerMgrAndDomain(keyspaceName string) (kv.Storage, *domain.D
 		return nil, nil, err
 	}
 	return storage, dom, nil
+}
+
+// initWithServiceManager initializes TiDB using the service framework.
+// This provides a modular architecture where services can run independently or combined.
+func initWithServiceManager(cfg *config.Config, keyspaceName string) (*service.Manager, kv.Storage, *domain.Domain, error) {
+	// Convert config.ServicesConfig to service.Config
+	svcConfig := &service.Config{
+		Mode:            service.Mode(cfg.Services.Mode),
+		EnabledServices: cfg.Services.Enabled,
+		Registry: service.RegistryConfig{
+			Type:      cfg.Services.Registry.Type,
+			Endpoints: cfg.Services.Registry.Endpoints,
+			Prefix:    cfg.Services.Registry.Prefix,
+		},
+		Remote: service.RemoteServicesConfig{
+			DDL:         cfg.Services.Remote.DDL,
+			Statistics:  cfg.Services.Remote.Statistics,
+			Schema:      cfg.Services.Remote.Schema,
+			Transaction: cfg.Services.Remote.Transaction,
+			Coprocessor: cfg.Services.Remote.Coprocessor,
+		},
+		ServiceConfigs: make(map[string]any),
+	}
+
+	// Validate config
+	if err := svcConfig.Validate(); err != nil {
+		return nil, nil, nil, errors.Wrap(err, "invalid service configuration")
+	}
+
+	// Create service manager
+	svcMgr, err := service.NewManager(svcConfig)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "failed to create service manager")
+	}
+
+	// Register all services in dependency order
+	// Note: The manager will handle actual ordering based on declared dependencies
+
+	// Storage service (base service, no dependencies)
+	storageSvc := storagesvc.New()
+	storageSvc.SetConfig(storagesvc.Config{
+		Path: cfg.Path,
+	})
+	if err := svcMgr.Register(storageSvc); err != nil {
+		return nil, nil, nil, errors.Wrap(err, "failed to register storage service")
+	}
+
+	// Metadata service (depends on storage)
+	metadataSvc := metadatasvc.New()
+	if err := svcMgr.Register(metadataSvc); err != nil {
+		return nil, nil, nil, errors.Wrap(err, "failed to register metadata service")
+	}
+
+	// Schema service (depends on storage, metadata)
+	schemaSvc := schemasvc.New()
+	if err := svcMgr.Register(schemaSvc); err != nil {
+		return nil, nil, nil, errors.Wrap(err, "failed to register schema service")
+	}
+
+	// DDL service (depends on storage, metadata, schema)
+	ddlSvc := ddlsvc.New()
+	if err := svcMgr.Register(ddlSvc); err != nil {
+		return nil, nil, nil, errors.Wrap(err, "failed to register ddl service")
+	}
+
+	// Statistics service (depends on storage, schema)
+	statsSvc := statssvc.New()
+	if err := svcMgr.Register(statsSvc); err != nil {
+		return nil, nil, nil, errors.Wrap(err, "failed to register statistics service")
+	}
+
+	// Transaction service (depends on storage, metadata)
+	txnSvc := txnsvc.New()
+	if err := svcMgr.Register(txnSvc); err != nil {
+		return nil, nil, nil, errors.Wrap(err, "failed to register transaction service")
+	}
+
+	// Coprocessor service (depends on storage, schema)
+	coprSvc := coprsvc.New()
+	if err := svcMgr.Register(coprSvc); err != nil {
+		return nil, nil, nil, errors.Wrap(err, "failed to register coprocessor service")
+	}
+
+	// Session service (depends on storage, schema, stats, txn)
+	sessionSvc := sessionsvc.New()
+	if err := svcMgr.Register(sessionSvc); err != nil {
+		return nil, nil, nil, errors.Wrap(err, "failed to register session service")
+	}
+
+	// Query service (depends on session, schema, copr)
+	querySvc := querysvc.New()
+	if err := svcMgr.Register(querySvc); err != nil {
+		return nil, nil, nil, errors.Wrap(err, "failed to register query service")
+	}
+
+	// Gateway service (depends on session, query)
+	gatewaySvc := gatewaysvc.New()
+	gatewaySvc.SetConfig(gatewaysvc.Config{
+		Host:           cfg.Host,
+		Port:           cfg.Port,
+		Socket:         cfg.Socket,
+		MaxConnections: cfg.Instance.MaxConnections,
+	})
+	if err := svcMgr.Register(gatewaySvc); err != nil {
+		return nil, nil, nil, errors.Wrap(err, "failed to register gateway service")
+	}
+
+	// Admin service (no dependencies)
+	adminSvc := adminsvc.New()
+	adminSvc.SetConfig(adminsvc.Config{
+		Host:         cfg.Status.StatusHost,
+		Port:         cfg.Status.StatusPort,
+		EnablePProf:  true,
+	})
+	if err := svcMgr.Register(adminSvc); err != nil {
+		return nil, nil, nil, errors.Wrap(err, "failed to register admin service")
+	}
+
+	// Start all services
+	ctx := context.Background()
+	if err := svcMgr.Start(ctx); err != nil {
+		return nil, nil, nil, errors.Wrap(err, "failed to start service manager")
+	}
+
+	// Get storage from the storage service
+	storage, err := getStorageFromService(svcMgr)
+	if err != nil {
+		svcMgr.Stop(ctx)
+		return nil, nil, nil, err
+	}
+
+	// Create domain with service provider
+	svcProvider := service.NewDomainServiceProvider(svcMgr)
+	schemaLease := parseDuration(cfg.Lease)
+	statsLease := parseDuration(cfg.Performance.StatsLease)
+
+	dom := domain.NewDomain(
+		storage,
+		schemaLease,
+		statsLease,
+		time.Minute, // dumpFileGcLease
+		nil,         // factory - will be set during Init
+		domain.WithServiceProvider(svcProvider),
+	)
+
+	return svcMgr, storage, dom, nil
+}
+
+// getStorageFromService retrieves the kv.Storage from the storage service.
+func getStorageFromService(svcMgr *service.Manager) (kv.Storage, error) {
+	svcProvider := service.NewDomainServiceProvider(svcMgr)
+	return svcProvider.GetStorage()
+}
+
+// shouldUseServiceManager checks if the service manager should be used based on config.
+func shouldUseServiceManager(cfg *config.Config) bool {
+	return cfg.Services.Mode != "" && cfg.Services.Mode != "monolithic"
 }
 
 // Prometheus push.
@@ -1073,6 +1262,22 @@ func cleanup(svr *server.Server, storage kv.Storage, dom *domain.Domain) {
 	closeStmtSummary()
 	topsql.Close()
 	cgmon.StopCgroupMonitor()
+}
+
+// cleanupWithServiceManager handles cleanup when using the service framework.
+// It calls the regular cleanup and then stops the service manager.
+func cleanupWithServiceManager(svr *server.Server, storage kv.Storage, dom *domain.Domain, svcMgr *service.Manager) {
+	// First perform standard cleanup
+	cleanup(svr, storage, dom)
+
+	// Then stop the service manager if present
+	if svcMgr != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := svcMgr.Stop(ctx); err != nil {
+			log.Error("failed to stop service manager", zap.Error(err))
+		}
+	}
 }
 
 func stringToList(repairString string) []string {

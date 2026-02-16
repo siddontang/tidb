@@ -118,6 +118,13 @@ func (s *Service) Config() Config {
 	return s.config
 }
 
+// SetConfig sets the service configuration.
+func (s *Service) SetConfig(cfg Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.config = cfg
+}
+
 // HealthHandler returns an HTTP handler for health checks.
 func (s *Service) HealthHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

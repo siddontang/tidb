@@ -113,6 +113,13 @@ func (s *Service) Config() Config {
 	return s.config
 }
 
+// SetConfig sets the service configuration.
+func (s *Service) SetConfig(cfg Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.config = cfg
+}
+
 // ConnectionCount returns the current connection count.
 func (s *Service) ConnectionCount() uint32 {
 	// In a full implementation, this would return the actual count.
