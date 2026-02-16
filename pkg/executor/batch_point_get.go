@@ -82,6 +82,10 @@ type BatchPointGetExec struct {
 
 	snapshot kv.Snapshot
 	stats    *runtimeStatsWithSnapshot
+
+	hotRangeCache   pointGetHotRangeCache
+	cacheSnapshotTS uint64
+	cacheLease      time.Duration
 }
 
 // buildVirtualColumnInfo saves virtual column indices and sort them in definition order
@@ -430,20 +434,40 @@ func (e *BatchPointGetExec) initialize(ctx context.Context) error {
 	e.handles = newHandles
 
 	var values map[string]kv.ValueEntry
-	// Lock keys (include exists and non-exists keys) before fetch all values for Repeatable Read Isolation.
-	if e.lock && !rc {
-		lockKeys := make([]kv.Key, len(keys)+len(indexKeys))
-		copy(lockKeys, keys)
-		copy(lockKeys[len(keys):], indexKeys)
-		err = LockKeys(ctx, e.Ctx(), e.waitTime, lockKeys...)
+	if !e.lock && e.hotRangeCache != nil && e.idxInfo == nil {
+		values = make(map[string]kv.ValueEntry, len(keys))
+		missKeys := make([]kv.Key, 0, len(keys))
+		for _, key := range keys {
+			if cachedVal, hit, _ := e.hotRangeCache.TryReadFromCacheByKey(e.cacheSnapshotTS, e.cacheLease, key); hit {
+				e.Ctx().GetSessionVars().StmtCtx.ReadFromTableCache = true
+				values[string(key)] = cachedVal
+				continue
+			}
+			missKeys = append(missKeys, key)
+		}
+		fetchedValues, fetchErr := batchGetter.BatchGet(ctx, missKeys)
+		if fetchErr != nil {
+			return fetchErr
+		}
+		for key, val := range fetchedValues {
+			values[key] = val
+		}
+	} else {
+		// Lock keys (include exists and non-exists keys) before fetch all values for Repeatable Read Isolation.
+		if e.lock && !rc {
+			lockKeys := make([]kv.Key, len(keys)+len(indexKeys))
+			copy(lockKeys, keys)
+			copy(lockKeys[len(keys):], indexKeys)
+			err = LockKeys(ctx, e.Ctx(), e.waitTime, lockKeys...)
+			if err != nil {
+				return err
+			}
+		}
+		// Fetch all values.
+		values, err = batchGetter.BatchGet(ctx, keys)
 		if err != nil {
 			return err
 		}
-	}
-	// Fetch all values.
-	values, err = batchGetter.BatchGet(ctx, keys)
-	if err != nil {
-		return err
 	}
 	handles := make([]kv.Handle, 0, len(values))
 	var existKeys []kv.Key
@@ -478,6 +502,9 @@ func (e *BatchPointGetExec) initialize(ctx context.Context) error {
 		}
 		e.values = append(e.values, val.Value)
 		handles = append(handles, e.handles[i])
+		if !e.lock && e.hotRangeCache != nil && e.idxInfo == nil {
+			e.hotRangeCache.StoreKeyInCache(e.Ctx().GetStore(), e.cacheSnapshotTS, e.cacheLease, key, val)
+		}
 		if e.lock && rc {
 			existKeys = append(existKeys, key)
 			// when e.handles is set in builder directly, index should be primary key and the plan is CommonHandleRead

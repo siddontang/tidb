@@ -5807,6 +5807,13 @@ func (b *executorBuilder) buildBatchPointGet(plan *physicalop.BatchPointGetPlan)
 		if cacheTable := b.getCacheTable(plan.TblInfo, snapshotTS, loadFullCache); cacheTable != nil {
 			e.snapshot = cacheTableSnapshot{e.snapshot, cacheTable}
 		}
+		if cachedTable, ok := b.is.TableByID(context.Background(), plan.TblInfo.ID); ok {
+			if hotReader, ok := cachedTable.(pointGetHotRangeCache); ok {
+				e.hotRangeCache = hotReader
+				e.cacheSnapshotTS = snapshotTS
+				e.cacheLease = time.Duration(vardef.TableCacheLease.Load()) * time.Second
+			}
+		}
 	}
 
 	if plan.TblInfo.TempTableType != model.TempTableNone {
