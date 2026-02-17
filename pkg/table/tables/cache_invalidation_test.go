@@ -23,7 +23,7 @@ import (
 
 func TestApplyInvalidationByTableID(t *testing.T) {
 	c := &cachedTable{
-		TableCommon: TableCommon{tableID: 42},
+		TableCommon: TableCommon{tableID: 42, physicalTableID: 42},
 		segments:    newSegmentIndex(),
 	}
 	c.setCacheData(&cacheData{
@@ -41,7 +41,7 @@ func TestApplyInvalidationByTableID(t *testing.T) {
 
 func TestApplyInvalidationClearsLocalCache(t *testing.T) {
 	c := &cachedTable{
-		TableCommon: TableCommon{tableID: 42},
+		TableCommon: TableCommon{tableID: 42, physicalTableID: 42},
 		segments:    newSegmentIndex(),
 	}
 	c.setCacheData(&cacheData{
@@ -65,7 +65,7 @@ func TestApplyInvalidationClearsLocalCache(t *testing.T) {
 
 func TestApplyInvalidationIgnoresOlderEpoch(t *testing.T) {
 	c := &cachedTable{
-		TableCommon: TableCommon{tableID: 42},
+		TableCommon: TableCommon{tableID: 42, physicalTableID: 42},
 		segments:    newSegmentIndex(),
 	}
 	c.updateInvalidationEpoch(5)
@@ -85,7 +85,7 @@ func TestApplyInvalidationIgnoresOlderEpoch(t *testing.T) {
 
 func TestTryReadFromCacheFallsBackOnStaleEpoch(t *testing.T) {
 	c := &cachedTable{
-		TableCommon: TableCommon{tableID: 42},
+		TableCommon: TableCommon{tableID: 42, physicalTableID: 42},
 		segments:    newSegmentIndex(),
 	}
 	c.setCacheData(&cacheData{
@@ -98,5 +98,43 @@ func TestTryReadFromCacheFallsBackOnStaleEpoch(t *testing.T) {
 	buf, loading := c.TryReadFromCache(150, time.Second)
 	require.Nil(t, buf)
 	require.False(t, loading)
+	require.Nil(t, c.cacheData.Load())
+}
+
+func TestApplyInvalidationByPhysicalID(t *testing.T) {
+	c := &cachedTable{
+		TableCommon: TableCommon{tableID: 42, physicalTableID: 4201},
+		segments:    newSegmentIndex(),
+	}
+	c.setCacheData(&cacheData{
+		Start: 100,
+		Lease: 200,
+	}, 64)
+
+	removed := c.applyInvalidation(cacheInvalidationEvent{
+		tableID:    42,
+		physicalID: 4202,
+		epoch:      2,
+	})
+	require.Equal(t, 0, removed)
+	require.NotNil(t, c.cacheData.Load())
+}
+
+func TestApplyInvalidationLegacyPhysicalTableIDFallback(t *testing.T) {
+	c := &cachedTable{
+		TableCommon: TableCommon{tableID: 42, physicalTableID: 4201},
+		segments:    newSegmentIndex(),
+	}
+	c.setCacheData(&cacheData{
+		Start: 100,
+		Lease: 200,
+	}, 64)
+
+	removed := c.applyInvalidation(cacheInvalidationEvent{
+		tableID:    42,
+		physicalID: 42,
+		epoch:      2,
+	})
+	require.GreaterOrEqual(t, removed, 1)
 	require.Nil(t, c.cacheData.Load())
 }

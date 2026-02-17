@@ -134,3 +134,47 @@ func TestTryEnqueueCachedTableInvalidationPersistQueueFull(t *testing.T) {
 	require.True(t, do.TryEnqueueCachedTableInvalidationPersist([]tablecache.CachedTableInvalidationEvent{{TableID: 1}}))
 	require.False(t, do.TryEnqueueCachedTableInvalidationPersist([]tablecache.CachedTableInvalidationEvent{{TableID: 2}}))
 }
+
+func BenchmarkCoalesceCachedTableInvalidationEvents(b *testing.B) {
+	const keyCount = 128
+	events := make([]tablecache.CachedTableInvalidationEvent, 0, keyCount*8)
+	for i := range keyCount * 8 {
+		key := int64(i % keyCount)
+		epoch := uint64(1000 + i)
+		events = append(events, tablecache.CachedTableInvalidationEvent{
+			TableID:    key,
+			PhysicalID: key,
+			Epoch:      epoch,
+			CommitTS:   epoch,
+		})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		coalesced := coalesceCachedTableInvalidationEvents(events)
+		if len(coalesced) != keyCount {
+			b.Fatalf("unexpected coalesced size: %d", len(coalesced))
+		}
+	}
+}
+
+func BenchmarkBuildCachedTableInvalidationInsertSQL(b *testing.B) {
+	const eventCount = 256
+	events := make([]tablecache.CachedTableInvalidationEvent, 0, eventCount)
+	for i := range eventCount {
+		events = append(events, tablecache.CachedTableInvalidationEvent{
+			TableID:    int64(1000 + i),
+			PhysicalID: int64(1000 + i),
+			Epoch:      uint64(2000 + i),
+			CommitTS:   uint64(2000 + i),
+		})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sql, args := buildCachedTableInvalidationInsertSQL(events)
+		if len(sql) == 0 || len(args) != 2+eventCount*4 {
+			b.Fatalf("unexpected sql build output: sqlLen=%d args=%d", len(sql), len(args))
+		}
+	}
+}

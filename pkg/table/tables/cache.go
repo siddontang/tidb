@@ -403,7 +403,7 @@ func (c *cachedTable) AddRecord(sctx table.MutateContext, txn kv.Transaction, r 
 	if atomic.LoadInt64(&c.totalSize) > cachedTableSizeLimit {
 		return nil, table.ErrOptOnCacheTable.GenWithStackByArgs("table too large")
 	}
-	txnCtxAddCachedTable(sctx, c.Meta().ID, c)
+	txnCtxAddCachedTable(sctx, c.GetPhysicalID(), c)
 	return c.TableCommon.AddRecord(sctx, txn, r, opts...)
 }
 
@@ -419,13 +419,13 @@ func (c *cachedTable) UpdateRecord(ctx table.MutateContext, txn kv.Transaction, 
 	if atomic.LoadInt64(&c.totalSize) > cachedTableSizeLimit {
 		return table.ErrOptOnCacheTable.GenWithStackByArgs("table too large")
 	}
-	txnCtxAddCachedTable(ctx, c.Meta().ID, c)
+	txnCtxAddCachedTable(ctx, c.GetPhysicalID(), c)
 	return c.TableCommon.UpdateRecord(ctx, txn, h, oldData, newData, touched, opts...)
 }
 
 // RemoveRecord implements table.Table RemoveRecord interface.
 func (c *cachedTable) RemoveRecord(sctx table.MutateContext, txn kv.Transaction, h kv.Handle, r []types.Datum, opts ...table.RemoveRecordOption) error {
-	txnCtxAddCachedTable(sctx, c.Meta().ID, c)
+	txnCtxAddCachedTable(sctx, c.GetPhysicalID(), c)
 	return c.TableCommon.RemoveRecord(sctx, txn, h, r, opts...)
 }
 

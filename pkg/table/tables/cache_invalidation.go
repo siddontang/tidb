@@ -42,6 +42,12 @@ func (c *cachedTable) applyInvalidation(event cacheInvalidationEvent) int {
 	if event.tableID != 0 && event.tableID != c.tableID {
 		return 0
 	}
+	if event.physicalID != 0 && event.physicalID != c.GetPhysicalID() {
+		// Backward compatibility: older events may store logical table ID in physical_id.
+		if event.physicalID != c.tableID {
+			return 0
+		}
+	}
 	currentEpoch := c.updateInvalidationEpoch(event.epoch)
 
 	removed := 0

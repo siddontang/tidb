@@ -337,3 +337,41 @@ set @@global.tidb_enable_cached_table_invalidation_async_persist = 0;
 select @@global.tidb_enable_cached_table_invalidation_async_persist;
 @@global.tidb_enable_cached_table_invalidation_async_persist
 0
+set @old_async_invalidation = @@global.tidb_enable_cached_table_async_invalidation;
+set @old_async_persist = @@global.tidb_enable_cached_table_invalidation_async_persist;
+set @@global.tidb_enable_cached_table_async_invalidation = 1;
+set @@global.tidb_enable_cached_table_invalidation_async_persist = 0;
+drop table if exists cache_inval_log1;
+drop table if exists cache_inval_log2;
+create table cache_inval_log1 (id int primary key, v int);
+create table cache_inval_log2 (id int primary key, v int);
+insert into cache_inval_log1 values (1, 10), (2, 20);
+insert into cache_inval_log2 values (1, 100), (2, 200);
+alter table cache_inval_log1 cache;
+alter table cache_inval_log2 cache;
+delete from mysql.table_cache_invalidation_log;
+begin;
+update cache_inval_log1 set v = v + 1 where id = 1;
+insert into cache_inval_log1 values (3, 30);
+delete from cache_inval_log1 where id = 2;
+commit;
+select count(*) from mysql.table_cache_invalidation_log;
+count(*)
+1
+select count(*) from mysql.table_cache_invalidation_log where invalidation_epoch = commit_ts and commit_ts > 0;
+count(*)
+1
+delete from mysql.table_cache_invalidation_log;
+begin;
+update cache_inval_log1 set v = v + 1 where id = 1;
+update cache_inval_log2 set v = v + 1 where id = 1;
+commit;
+select count(*) from mysql.table_cache_invalidation_log;
+count(*)
+2
+alter table cache_inval_log1 nocache;
+alter table cache_inval_log2 nocache;
+drop table cache_inval_log1;
+drop table cache_inval_log2;
+set @@global.tidb_enable_cached_table_invalidation_async_persist = @old_async_persist;
+set @@global.tidb_enable_cached_table_async_invalidation = @old_async_invalidation;

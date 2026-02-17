@@ -312,7 +312,16 @@ Completed:
 21. Reduced invalidation-log write amplification in async persist path:
    - queued/synchronous persistence now coalesces duplicate `(table_id, physical_id)` events by latest epoch before `INSERT`.
    - keeps invalidation correctness while reducing redundant log rows under burst writes.
+22. Improved partition-aware invalidation plumbing for future segmented/partition cache support:
+   - write path now tracks cached-table participants by physical table ID within one transaction.
+   - invalidation events now persist logical `table_id` and physical `physical_id` separately when available.
+   - local invalidation application now respects physical-ID targeting, with compatibility fallback for legacy events.
+23. Added broader test and benchmark coverage:
+   - integration test (`tests/integrationtest/t/table/cache.test`) now validates async invalidation-log coalescing behavior.
+   - unit tests in `pkg/table/tables/cache_invalidation_test.go` cover physical-ID targeting and legacy fallback semantics.
+   - new benchmarks in `pkg/domain/cached_table_invalidation_test.go` cover event coalescing and batched SQL-build overhead.
 
 Notes:
 1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.
 2. Invalidation notifier still keeps in-memory implementation for local tests; production fanout now has etcd watch/notify fast-path plus log-polling durability fallback.
+3. SQL layer still rejects `ALTER TABLE ... CACHE` on partitioned tables in current behavior; partition-aware invalidation changes are forward-compatible infrastructure.

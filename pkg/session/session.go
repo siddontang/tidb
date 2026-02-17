@@ -611,10 +611,14 @@ func applyCachedTableInvalidationEvents(s *session, tables map[int64]any, commit
 	epoch := nextCachedTableInvalidationEpoch(commitTS)
 	for _, raw := range tables {
 		tbl := raw.(table.CachedTable)
+		physicalID := tbl.Meta().ID
+		if physicalTbl, ok := tbl.(table.PhysicalTable); ok {
+			physicalID = physicalTbl.GetPhysicalID()
+		}
 		tbl.ApplyLocalInvalidation(epoch, commitTS)
 		events = append(events, tablecache.CachedTableInvalidationEvent{
 			TableID:    tbl.Meta().ID,
-			PhysicalID: tbl.Meta().ID,
+			PhysicalID: physicalID,
 			Epoch:      epoch,
 			CommitTS:   commitTS,
 		})
