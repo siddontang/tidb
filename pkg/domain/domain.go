@@ -231,6 +231,7 @@ type Domain struct {
 	statsOwner owner.Manager
 
 	cachedTableInvalidationPersistCh chan cachedTableInvalidationPersistTask
+	cachedTableInvalidationNotifyCh  chan cachedTableInvalidationNotifyTask
 
 	// only used for nextgen
 	crossKSSessMgr           *crossks.Manager
@@ -568,6 +569,7 @@ func NewDomainWithEtcdClient(
 
 		crossKSSessFactoryGetter:         crossKSSessFactoryGetter,
 		cachedTableInvalidationPersistCh: make(chan cachedTableInvalidationPersistTask, cachedTableInvalidationPersistQueueSize),
+		cachedTableInvalidationNotifyCh:  make(chan cachedTableInvalidationNotifyTask, cachedTableInvalidationNotifyQueueSize),
 	}
 
 	do.advancedSysSessionPool = syssession.NewAdvancedSessionPool(systemSessionPoolSize, func() (syssession.SessionContext, error) {
@@ -820,6 +822,7 @@ func (do *Domain) Start(startMode ddl.StartMode) error {
 	do.wg.Run(do.cachedTableInvalidationWatchLoop, "cachedTableInvalidationWatchLoop")
 	do.wg.Run(do.cachedTableInvalidationLogGCLoop, "cachedTableInvalidationLogGCLoop")
 	do.wg.Run(do.cachedTableInvalidationPersistLoop, "cachedTableInvalidationPersistLoop")
+	do.wg.Run(do.cachedTableInvalidationNotifyLoop, "cachedTableInvalidationNotifyLoop")
 	skipRegisterToDashboard := gCfg.SkipRegisterToDashboard
 	if !skipRegisterToDashboard {
 		do.wg.Run(func() {

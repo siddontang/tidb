@@ -625,14 +625,14 @@ func applyCachedTableInvalidationEvents(s *session, tables map[int64]any, commit
 	}
 	if len(events) > 0 {
 		do := domain.GetDomain(s)
-		if vardef.EnableCachedTableInvalidationAsyncPersist.Load() {
-			if do == nil || !do.TryEnqueueCachedTableInvalidationPersist(events) {
+		if do != nil {
+			if vardef.EnableCachedTableInvalidationAsyncPersist.Load() {
+				if !do.TryEnqueueCachedTableInvalidationPersist(events) {
+					do.PersistCachedTableInvalidation(events)
+				}
+			} else {
 				do.PersistCachedTableInvalidation(events)
 			}
-		} else {
-			do.PersistCachedTableInvalidation(events)
-		}
-		if do != nil {
 			do.NotifyCachedTableInvalidation(events)
 		}
 		tablecache.PublishCachedTableInvalidationEvents(events)

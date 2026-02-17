@@ -44,6 +44,8 @@ const (
 	cachedTableInvalidationLogGCTickTime    = 10 * time.Second
 	cachedTableInvalidationPersistBatch     = 256
 	cachedTableInvalidationPersistQueueSize = 4096
+	cachedTableInvalidationNotifyBatch      = 256
+	cachedTableInvalidationNotifyQueueSize  = 4096
 )
 
 type cachedTableInvalidationTarget interface {
@@ -61,6 +63,10 @@ type cachedTableInvalidationNotifyEvent struct {
 }
 
 type cachedTableInvalidationPersistTask struct {
+	events []tablecache.CachedTableInvalidationEvent
+}
+
+type cachedTableInvalidationNotifyTask struct {
 	events []tablecache.CachedTableInvalidationEvent
 }
 
@@ -117,21 +123,41 @@ func (do *Domain) applyCachedTableInvalidationEvents(events []tablecache.CachedT
 // NotifyCachedTableInvalidation publishes fast-path invalidation events to other TiDB instances.
 // Polling from mysql.table_cache_invalidation_log remains the durability/recovery path.
 func (do *Domain) NotifyCachedTableInvalidation(events []tablecache.CachedTableInvalidationEvent) {
-	if do.etcdClient == nil || len(events) == 0 || !vardef.EnableCachedTableAsyncInvalidation.Load() {
+	if do == nil || do.etcdClient == nil || len(events) == 0 || !vardef.EnableCachedTableAsyncInvalidation.Load() {
 		return
 	}
+	if do.enqueueCachedTableInvalidationNotify(events) {
+		return
+	}
+	logutil.BgLogger().Warn("enqueue cached-table invalidation notify failed, fallback to log-puller path", zap.Int("events", len(events)))
+}
+
+func (do *Domain) notifyCachedTableInvalidationEvents(events []tablecache.CachedTableInvalidationEvent) error {
 	payload := cachedTableInvalidationNotifyEvent{
 		ServerID: do.serverID,
-		Events:   coalesceCachedTableInvalidationEvents(events),
+		Events:   events,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
-		logutil.BgLogger().Warn("marshal cached-table invalidation notify payload failed", zap.Error(err))
-		return
+		return err
 	}
-	err = ddlutil.PutKVToEtcd(context.Background(), do.etcdClient, etcdutil.KeyOpDefaultRetryCnt, cachedTableInvalidationNotifyKey, string(data))
-	if err != nil {
-		logutil.BgLogger().Warn("notify cached-table invalidation failed", zap.Error(err))
+	return ddlutil.PutKVToEtcd(context.Background(), do.etcdClient, etcdutil.KeyOpDefaultRetryCnt, cachedTableInvalidationNotifyKey, string(data))
+}
+
+func (do *Domain) enqueueCachedTableInvalidationNotify(events []tablecache.CachedTableInvalidationEvent) bool {
+	if do == nil || len(events) == 0 || do.cachedTableInvalidationNotifyCh == nil {
+		return false
+	}
+	task := cachedTableInvalidationNotifyTask{
+		events: append([]tablecache.CachedTableInvalidationEvent(nil), coalesceCachedTableInvalidationEvents(events)...),
+	}
+	select {
+	case <-do.exit:
+		return false
+	case do.cachedTableInvalidationNotifyCh <- task:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -297,6 +323,37 @@ func (do *Domain) cachedTableInvalidationPersistLoop() {
 			batch = coalesceCachedTableInvalidationEvents(batch)
 			if err := do.persistCachedTableInvalidationEvents(batch); err != nil && !terror.ErrorEqual(err, infoschema.ErrTableNotExists) {
 				logutil.BgLogger().Warn("persist cached-table invalidation events failed", zap.Error(err), zap.Int("events", len(batch)))
+			}
+		}
+	}
+}
+
+func (do *Domain) cachedTableInvalidationNotifyLoop() {
+	defer util.Recover(metrics.LabelDomain, "cachedTableInvalidationNotifyLoop", nil, false)
+	defer logutil.BgLogger().Info("cachedTableInvalidationNotifyLoop exited")
+	if do.cachedTableInvalidationNotifyCh == nil || do.etcdClient == nil {
+		return
+	}
+
+	for {
+		select {
+		case <-do.exit:
+			return
+		case task := <-do.cachedTableInvalidationNotifyCh:
+			batch := make([]tablecache.CachedTableInvalidationEvent, 0, cachedTableInvalidationNotifyBatch)
+			batch = append(batch, task.events...)
+		drain:
+			for len(batch) < cachedTableInvalidationNotifyBatch {
+				select {
+				case next := <-do.cachedTableInvalidationNotifyCh:
+					batch = append(batch, next.events...)
+				default:
+					break drain
+				}
+			}
+			batch = coalesceCachedTableInvalidationEvents(batch)
+			if err := do.notifyCachedTableInvalidationEvents(batch); err != nil {
+				logutil.BgLogger().Warn("notify cached-table invalidation failed", zap.Error(err), zap.Int("events", len(batch)))
 			}
 		}
 	}

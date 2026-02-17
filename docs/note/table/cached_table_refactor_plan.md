@@ -320,6 +320,13 @@ Completed:
    - integration test (`tests/integrationtest/t/table/cache.test`) now validates async invalidation-log coalescing behavior.
    - unit tests in `pkg/table/tables/cache_invalidation_test.go` cover physical-ID targeting and legacy fallback semantics.
    - new benchmarks in `pkg/domain/cached_table_invalidation_test.go` cover event coalescing and batched SQL-build overhead.
+24. Reduced commit-path latency further by decoupling etcd fast-path notify:
+   - `NotifyCachedTableInvalidation` now enqueues notify tasks into a domain worker queue instead of doing synchronous etcd writes on commit path.
+   - notify worker batches/coalesces events before one etcd write.
+   - when notify queue is saturated, system falls back to durable log-puller propagation path (no correctness loss, only slower fanout).
+25. Hardened commit-path robustness:
+   - avoid nil-domain dereference in session commit invalidation flow.
+   - added unit tests for notify queue copy/coalesce/full semantics and enqueue benchmark (`BenchmarkEnqueueCachedTableInvalidationNotify`).
 
 Notes:
 1. Current behavior remains full-table cache for reads; segment path is internal scaffolding.

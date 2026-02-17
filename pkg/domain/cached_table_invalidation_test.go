@@ -135,6 +135,45 @@ func TestTryEnqueueCachedTableInvalidationPersistQueueFull(t *testing.T) {
 	require.False(t, do.TryEnqueueCachedTableInvalidationPersist([]tablecache.CachedTableInvalidationEvent{{TableID: 2}}))
 }
 
+func TestEnqueueCachedTableInvalidationNotifyCopiesEvents(t *testing.T) {
+	do := &Domain{
+		exit:                            make(chan struct{}),
+		cachedTableInvalidationNotifyCh: make(chan cachedTableInvalidationNotifyTask, 1),
+	}
+	events := []tablecache.CachedTableInvalidationEvent{
+		{TableID: 11, PhysicalID: 11, CommitTS: 101, Epoch: 101},
+	}
+	require.True(t, do.enqueueCachedTableInvalidationNotify(events))
+	events[0].TableID = 999
+
+	task := <-do.cachedTableInvalidationNotifyCh
+	require.Equal(t, int64(11), task.events[0].TableID)
+}
+
+func TestEnqueueCachedTableInvalidationNotifyCoalesces(t *testing.T) {
+	do := &Domain{
+		exit:                            make(chan struct{}),
+		cachedTableInvalidationNotifyCh: make(chan cachedTableInvalidationNotifyTask, 1),
+	}
+	events := []tablecache.CachedTableInvalidationEvent{
+		{TableID: 11, PhysicalID: 11, CommitTS: 100, Epoch: 100},
+		{TableID: 11, PhysicalID: 11, CommitTS: 101, Epoch: 101},
+	}
+	require.True(t, do.enqueueCachedTableInvalidationNotify(events))
+	task := <-do.cachedTableInvalidationNotifyCh
+	require.Len(t, task.events, 1)
+	require.Equal(t, uint64(101), task.events[0].Epoch)
+}
+
+func TestEnqueueCachedTableInvalidationNotifyQueueFull(t *testing.T) {
+	do := &Domain{
+		exit:                            make(chan struct{}),
+		cachedTableInvalidationNotifyCh: make(chan cachedTableInvalidationNotifyTask, 1),
+	}
+	require.True(t, do.enqueueCachedTableInvalidationNotify([]tablecache.CachedTableInvalidationEvent{{TableID: 1}}))
+	require.False(t, do.enqueueCachedTableInvalidationNotify([]tablecache.CachedTableInvalidationEvent{{TableID: 2}}))
+}
+
 func BenchmarkCoalesceCachedTableInvalidationEvents(b *testing.B) {
 	const keyCount = 128
 	events := make([]tablecache.CachedTableInvalidationEvent, 0, keyCount*8)
@@ -176,5 +215,24 @@ func BenchmarkBuildCachedTableInvalidationInsertSQL(b *testing.B) {
 		if len(sql) == 0 || len(args) != 2+eventCount*4 {
 			b.Fatalf("unexpected sql build output: sqlLen=%d args=%d", len(sql), len(args))
 		}
+	}
+}
+
+func BenchmarkEnqueueCachedTableInvalidationNotify(b *testing.B) {
+	do := &Domain{
+		exit:                            make(chan struct{}),
+		cachedTableInvalidationNotifyCh: make(chan cachedTableInvalidationNotifyTask, 1),
+	}
+	events := []tablecache.CachedTableInvalidationEvent{
+		{TableID: 11, PhysicalID: 11, CommitTS: 100, Epoch: 100},
+		{TableID: 11, PhysicalID: 11, CommitTS: 101, Epoch: 101},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !do.enqueueCachedTableInvalidationNotify(events) {
+			b.Fatal("enqueue failed")
+		}
+		<-do.cachedTableInvalidationNotifyCh
 	}
 }
