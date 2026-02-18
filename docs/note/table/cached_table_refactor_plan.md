@@ -265,6 +265,7 @@ Performance tests:
   - Fixed stale-read issue after partition writes by always applying local invalidation on commit (sync and async modes).
   - Refined invalidation target resolution to prefer physical partition targets and avoid broad parent-table invalidation when a physical target is resolved.
   - Added row-key range collection in transaction context for cached-table writes and propagated ranges through local fast-path invalidation events.
+  - Added overflow safety for write-range tracking: when per-table tracked ranges exceed limit in one txn, fallback to full-table invalidation instead of dropping ranges.
   - Updated segment invalidation to keep untouched hot segments valid across partial invalidation epochs (epoch promotion), reducing avoidable cache misses after unrelated writes.
   - Added coverage:
     - Unit/integration tests for partition cached-table hot-range freshness and partition DDL cache path.

@@ -197,6 +197,7 @@ type TxnCtxNeedToRestore struct {
 	CachedTables map[int64]any
 	// CachedTableInvalidationRanges collects row-key ranges touched by cached-table writes in this txn.
 	// It is keyed by physical table ID used in TxnCtx.CachedTables.
+	// A present key with an empty slice means the table has degraded to full-table invalidation.
 	CachedTableInvalidationRanges map[int64][]kv.KeyRange
 
 	// InsertTTLRowsCount counts how many rows are inserted in this statement

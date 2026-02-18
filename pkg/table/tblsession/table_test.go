@@ -130,6 +130,14 @@ func TestSessionMutateContextFields(t *testing.T) {
 	require.Len(t, ranges, 1)
 	require.Equal(t, []byte("k1"), []byte(ranges[0].StartKey))
 	require.Equal(t, []byte("k2"), []byte(ranges[0].EndKey))
+	for i := 0; i < 128; i++ {
+		cachedTableSupport.AddCachedTableInvalidationRangeToTxn(456, []byte("a"), []byte("b"))
+	}
+	overflowRanges := sctx.GetSessionVars().TxnCtx.CachedTableInvalidationRanges[456]
+	require.Len(t, overflowRanges, 0)
+	cachedTableSupport.AddCachedTableInvalidationRangeToTxn(456, []byte("c"), []byte("d"))
+	overflowRanges = sctx.GetSessionVars().TxnCtx.CachedTableInvalidationRanges[456]
+	require.Len(t, overflowRanges, 0)
 	// temporary table support
 	sctx.GetSessionVars().TxnCtx = nil
 	tempTableSupport, ok := ctx.GetTemporaryTableSupport()

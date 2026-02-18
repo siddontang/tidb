@@ -30,6 +30,8 @@ import (
 var _ tblctx.MutateContext = &MutateContext{}
 var _ tblctx.AllocatorContext = &MutateContext{}
 
+const maxCachedTableInvalidationRangesPerTxnTable = 64
+
 // MutateContext is used to provide context for table operations.
 type MutateContext struct {
 	sessionctx.Context
@@ -160,8 +162,15 @@ func (ctx *MutateContext) AddCachedTableInvalidationRangeToTxn(tableID int64, st
 	if txnCtx.CachedTableInvalidationRanges == nil {
 		txnCtx.CachedTableInvalidationRanges = make(map[int64][]kv.KeyRange)
 	}
-	ranges := txnCtx.CachedTableInvalidationRanges[tableID]
-	if len(ranges) >= 64 {
+	ranges, exists := txnCtx.CachedTableInvalidationRanges[tableID]
+	if exists && len(ranges) == 0 {
+		// Already degraded to full-table invalidation for this table.
+		return
+	}
+	if len(ranges) >= maxCachedTableInvalidationRangesPerTxnTable {
+		// Safety fallback: never silently lose invalidation coverage.
+		// Degrade to full-table invalidation for this table in this txn.
+		txnCtx.CachedTableInvalidationRanges[tableID] = []kv.KeyRange{}
 		return
 	}
 	txnCtx.CachedTableInvalidationRanges[tableID] = append(ranges, kv.KeyRange{
