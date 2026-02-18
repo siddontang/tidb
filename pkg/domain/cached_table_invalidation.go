@@ -40,22 +40,24 @@ import (
 )
 
 const (
-	cachedTableInvalidationLogTable         = "table_cache_invalidation_log"
-	cachedTableInvalidationNotifyKey        = "/tidb/cached-table/invalidation"
-	cachedTableInvalidationLogGCTickTime    = 10 * time.Second
-	cachedTableInvalidationPersistBatch     = 256
-	cachedTableInvalidationPersistQueueSize = 4096
-	cachedTableInvalidationNotifyBatch      = 256
-	cachedTableInvalidationNotifyQueueSize  = 4096
-	cachedTableInvalidationCoalesceRangeCap = 1024
-	cachedTableInvalidationTypeFull         = "full"
-	cachedTableInvalidationTypeRange        = "range"
-	cachedTableInvalidationQueueTypeNotify  = "notify"
-	cachedTableInvalidationQueueTypePersist = "persist"
-	cachedTableInvalidationLagSourceNotify  = "notify"
-	cachedTableInvalidationLagSourcePull    = "pull"
-	cachedTableInvalidationPersistTypeInput = "input"
-	cachedTableInvalidationPersistTypeFinal = "coalesced"
+	cachedTableInvalidationLogTable                    = "table_cache_invalidation_log"
+	cachedTableInvalidationNotifyKey                   = "/tidb/cached-table/invalidation"
+	cachedTableInvalidationLogGCTickTime               = 10 * time.Second
+	cachedTableInvalidationPersistBatch                = 256
+	cachedTableInvalidationPersistQueueSize            = 4096
+	cachedTableInvalidationNotifyBatch                 = 256
+	cachedTableInvalidationNotifyQueueSize             = 4096
+	cachedTableInvalidationCoalesceRangeCap            = 1024
+	cachedTableInvalidationTypeFull                    = "full"
+	cachedTableInvalidationTypeRange                   = "range"
+	cachedTableInvalidationQueueTypeNotify             = "notify"
+	cachedTableInvalidationQueueTypePersist            = "persist"
+	cachedTableInvalidationLagSourceNotify             = "notify"
+	cachedTableInvalidationLagSourcePull               = "pull"
+	cachedTableInvalidationPersistTypeInput            = "input"
+	cachedTableInvalidationPersistTypeFinal            = "coalesced"
+	cachedTableInvalidationEnqueueFailNotifyQueueFull  = "notify_queue_full"
+	cachedTableInvalidationEnqueueFailPersistQueueFull = "persist_queue_full"
 )
 
 type cachedTableInvalidationTarget interface {
@@ -150,6 +152,10 @@ func observeCachedTableInvalidationPersistEventCount(inputCount, finalCount int)
 	if finalCount > 0 {
 		metrics.CachedTableInvalidationPersistEvent.WithLabelValues(cachedTableInvalidationPersistTypeFinal).Add(float64(finalCount))
 	}
+}
+
+func observeCachedTableInvalidationEnqueueFallback(fallbackType string) {
+	metrics.CachedTableInvalidationEnqueueFail.WithLabelValues(fallbackType).Inc()
 }
 
 func mergeCachedTableInvalidationRanges(left, right []kv.KeyRange) []kv.KeyRange {
@@ -300,6 +306,7 @@ func (do *Domain) enqueueCachedTableInvalidationNotify(events []tablecache.Cache
 		return true
 	default:
 		observeCachedTableInvalidationQueueSize(cachedTableInvalidationQueueTypeNotify, len(do.cachedTableInvalidationNotifyCh))
+		observeCachedTableInvalidationEnqueueFallback(cachedTableInvalidationEnqueueFailNotifyQueueFull)
 		return false
 	}
 }
@@ -524,6 +531,7 @@ func (do *Domain) enqueueCachedTableInvalidationPersist(events []tablecache.Cach
 		return true
 	default:
 		observeCachedTableInvalidationQueueSize(cachedTableInvalidationQueueTypePersist, len(do.cachedTableInvalidationPersistCh))
+		observeCachedTableInvalidationEnqueueFallback(cachedTableInvalidationEnqueueFailPersistQueueFull)
 		return false
 	}
 }

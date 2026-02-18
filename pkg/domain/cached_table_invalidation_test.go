@@ -313,10 +313,13 @@ func TestTryEnqueueCachedTableInvalidationPersistQueueFull(t *testing.T) {
 		cachedTableInvalidationPersistCh: make(chan cachedTableInvalidationPersistTask, 1),
 	}
 	queueGauge := metrics.CachedTableInvalidationQueueSize.WithLabelValues(cachedTableInvalidationQueueTypePersist)
+	fallbackCounter := metrics.CachedTableInvalidationEnqueueFail.WithLabelValues(cachedTableInvalidationEnqueueFailPersistQueueFull)
+	fallbackBefore := readCounterValue(fallbackCounter)
 	require.True(t, do.TryEnqueueCachedTableInvalidationPersist([]tablecache.CachedTableInvalidationEvent{{TableID: 1}}))
 	require.InDelta(t, 1.0, readGaugeValue(queueGauge), 0.001)
 	require.False(t, do.TryEnqueueCachedTableInvalidationPersist([]tablecache.CachedTableInvalidationEvent{{TableID: 2}}))
 	require.InDelta(t, 1.0, readGaugeValue(queueGauge), 0.001)
+	require.InDelta(t, fallbackBefore+1, readCounterValue(fallbackCounter), 0.001)
 }
 
 func TestEnqueueCachedTableInvalidationNotifyCopiesEvents(t *testing.T) {
@@ -366,10 +369,13 @@ func TestEnqueueCachedTableInvalidationNotifyQueueFull(t *testing.T) {
 		cachedTableInvalidationNotifyCh: make(chan cachedTableInvalidationNotifyTask, 1),
 	}
 	queueGauge := metrics.CachedTableInvalidationQueueSize.WithLabelValues(cachedTableInvalidationQueueTypeNotify)
+	fallbackCounter := metrics.CachedTableInvalidationEnqueueFail.WithLabelValues(cachedTableInvalidationEnqueueFailNotifyQueueFull)
+	fallbackBefore := readCounterValue(fallbackCounter)
 	require.True(t, do.enqueueCachedTableInvalidationNotify([]tablecache.CachedTableInvalidationEvent{{TableID: 1}}))
 	require.InDelta(t, 1.0, readGaugeValue(queueGauge), 0.001)
 	require.False(t, do.enqueueCachedTableInvalidationNotify([]tablecache.CachedTableInvalidationEvent{{TableID: 2}}))
 	require.InDelta(t, 1.0, readGaugeValue(queueGauge), 0.001)
+	require.InDelta(t, fallbackBefore+1, readCounterValue(fallbackCounter), 0.001)
 }
 
 func TestObserveCachedTableInvalidationLag(t *testing.T) {

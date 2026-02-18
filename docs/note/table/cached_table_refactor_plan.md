@@ -275,6 +275,7 @@ Performance tests:
     - propagation lag gauge by source (`notify` / `pull`) based on commit-ts
   - Added invalidation persistence amplification counters:
     - persist input event count vs post-coalesce persisted event count
+  - Added enqueue fallback counters for queue saturation (`persist_queue_full` / `notify_queue_full`) to quantify async fallback pressure.
   - Reduced commit-path enqueue overhead for async persist/notify by removing enqueue-time coalescing and deferring coalescing to worker batches, while keeping deep-copy safety for range payloads.
   - Added coverage:
     - Unit/integration tests for partition cached-table hot-range freshness and partition DDL cache path.
