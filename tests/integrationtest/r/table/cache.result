@@ -361,6 +361,12 @@ count(*)
 select count(*) from mysql.table_cache_invalidation_log where invalidation_epoch = commit_ts and commit_ts > 0;
 count(*)
 1
+select count(*) from mysql.table_cache_invalidation_log where invalidation_ranges is not null and length(invalidation_ranges) > 0;
+count(*)
+1
+select count(*) from mysql.table_cache_invalidation_log where invalidation_ranges is null;
+count(*)
+0
 delete from mysql.table_cache_invalidation_log;
 begin;
 update cache_inval_log1 set v = v + 1 where id = 1;
@@ -369,6 +375,12 @@ commit;
 select count(*) from mysql.table_cache_invalidation_log;
 count(*)
 2
+select count(*) from mysql.table_cache_invalidation_log where invalidation_ranges is not null and length(invalidation_ranges) > 0;
+count(*)
+2
+select count(*) from mysql.table_cache_invalidation_log where invalidation_ranges is null;
+count(*)
+0
 alter table cache_inval_log1 nocache;
 alter table cache_inval_log2 nocache;
 drop table cache_inval_log1;
