@@ -267,6 +267,8 @@ Performance tests:
   - Added row-key range collection in transaction context for cached-table writes and propagated ranges through local fast-path invalidation events.
   - Added overflow safety for write-range tracking: when per-table tracked ranges exceed limit in one txn, fallback to full-table invalidation instead of dropping ranges.
   - Updated segment invalidation to keep untouched hot segments valid across partial invalidation epochs (epoch promotion), reducing avoidable cache misses after unrelated writes.
+  - Extended `mysql.table_cache_invalidation_log` with persisted range payload (`invalidation_ranges`) and wired range encode/decode in persist + pull paths.
+  - Fixed event coalescing for range invalidation to merge ranges across multiple events for the same table/physical ID (with bounded fallback to full invalidation), preventing stale segment retention.
   - Added coverage:
     - Unit/integration tests for partition cached-table hot-range freshness and partition DDL cache path.
     - Integration test case in `tests/integrationtest/t/table/cache.test`.

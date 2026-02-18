@@ -371,6 +371,7 @@ const (
 		physical_id BIGINT(64) NOT NULL DEFAULT 0,
 		commit_ts BIGINT(64) UNSIGNED NOT NULL,
 		invalidation_epoch BIGINT(64) UNSIGNED NOT NULL,
+		invalidation_ranges MEDIUMBLOB NULL,
 		processed TINYINT(1) NOT NULL DEFAULT 0,
 		created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
 		PRIMARY KEY (id),

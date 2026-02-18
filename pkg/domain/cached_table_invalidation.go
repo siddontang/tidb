@@ -46,6 +46,7 @@ const (
 	cachedTableInvalidationPersistQueueSize = 4096
 	cachedTableInvalidationNotifyBatch      = 256
 	cachedTableInvalidationNotifyQueueSize  = 4096
+	cachedTableInvalidationCoalesceRangeCap = 1024
 )
 
 type cachedTableInvalidationTarget interface {
@@ -81,6 +82,36 @@ func normalizeCachedTableInvalidationEvent(event tablecache.CachedTableInvalidat
 	return event
 }
 
+func cloneCachedTableInvalidationRanges(ranges []kv.KeyRange) []kv.KeyRange {
+	if len(ranges) == 0 {
+		return nil
+	}
+	out := make([]kv.KeyRange, 0, len(ranges))
+	for _, keyRange := range ranges {
+		out = append(out, kv.KeyRange{
+			StartKey: keyRange.StartKey.Clone(),
+			EndKey:   keyRange.EndKey.Clone(),
+		})
+	}
+	return out
+}
+
+func mergeCachedTableInvalidationRanges(left, right []kv.KeyRange) []kv.KeyRange {
+	if len(left) == 0 || len(right) == 0 {
+		// Empty means full-table invalidation.
+		return nil
+	}
+	total := len(left) + len(right)
+	if total > cachedTableInvalidationCoalesceRangeCap {
+		// Degrade to full invalidation when merged ranges are too many.
+		return nil
+	}
+	merged := make([]kv.KeyRange, 0, total)
+	merged = append(merged, cloneCachedTableInvalidationRanges(left)...)
+	merged = append(merged, cloneCachedTableInvalidationRanges(right)...)
+	return merged
+}
+
 func coalesceCachedTableInvalidationEvents(events []tablecache.CachedTableInvalidationEvent) []tablecache.CachedTableInvalidationEvent {
 	if len(events) <= 1 {
 		return events
@@ -93,15 +124,43 @@ func coalesceCachedTableInvalidationEvents(events []tablecache.CachedTableInvali
 			physicalID: event.PhysicalID,
 		}
 		prev, ok := latest[key]
-		if !ok || event.Epoch > prev.Epoch || (event.Epoch == prev.Epoch && event.CommitTS > prev.CommitTS) {
+		if !ok {
+			event.Ranges = cloneCachedTableInvalidationRanges(event.Ranges)
 			latest[key] = event
+			continue
 		}
+		mergedRanges := mergeCachedTableInvalidationRanges(prev.Ranges, event.Ranges)
+		if event.Epoch > prev.Epoch || (event.Epoch == prev.Epoch && event.CommitTS > prev.CommitTS) {
+			event.Ranges = mergedRanges
+			latest[key] = event
+			continue
+		}
+		prev.Ranges = mergedRanges
+		latest[key] = prev
 	}
 	result := make([]tablecache.CachedTableInvalidationEvent, 0, len(latest))
 	for _, event := range latest {
 		result = append(result, event)
 	}
 	return result
+}
+
+func encodeCachedTableInvalidationRanges(ranges []kv.KeyRange) ([]byte, error) {
+	if len(ranges) == 0 {
+		return nil, nil
+	}
+	return json.Marshal(ranges)
+}
+
+func decodeCachedTableInvalidationRanges(raw []byte) ([]kv.KeyRange, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var ranges []kv.KeyRange
+	if err := json.Unmarshal(raw, &ranges); err != nil {
+		return nil, err
+	}
+	return ranges, nil
 }
 
 func applyCachedTableInvalidationEventToTargets(event tablecache.CachedTableInvalidationEvent, targets []cachedTableInvalidationTarget) int {
@@ -424,16 +483,20 @@ func (do *Domain) persistCachedTableInvalidationEvents(events []tablecache.Cache
 func buildCachedTableInvalidationInsertSQL(events []tablecache.CachedTableInvalidationEvent) (string, []any) {
 	var sqlBuilder strings.Builder
 	sqlBuilder.Grow(128 + len(events)*24)
-	sqlBuilder.WriteString("INSERT HIGH_PRIORITY INTO %n.%n (table_id, physical_id, commit_ts, invalidation_epoch) VALUES ")
+	sqlBuilder.WriteString("INSERT HIGH_PRIORITY INTO %n.%n (table_id, physical_id, commit_ts, invalidation_epoch, invalidation_ranges) VALUES ")
 
-	args := make([]any, 0, 2+len(events)*4)
+	args := make([]any, 0, 2+len(events)*5)
 	args = append(args, mysql.SystemDB, cachedTableInvalidationLogTable)
 	for i, event := range events {
 		if i > 0 {
 			sqlBuilder.WriteString(", ")
 		}
-		sqlBuilder.WriteString("(%?, %?, %?, %?)")
-		args = append(args, event.TableID, event.PhysicalID, event.CommitTS, event.Epoch)
+		sqlBuilder.WriteString("(%?, %?, %?, %?, %?)")
+		encodedRanges, err := encodeCachedTableInvalidationRanges(event.Ranges)
+		if err != nil {
+			encodedRanges = nil
+		}
+		args = append(args, event.TableID, event.PhysicalID, event.CommitTS, event.Epoch, encodedRanges)
 	}
 	return sqlBuilder.String(), args
 }
@@ -484,7 +547,7 @@ func (do *Domain) getLatestCachedTableInvalidationLogID() (uint64, error) {
 
 func (do *Domain) pullCachedTableInvalidationEvents(afterID uint64, limit int) (uint64, int, error) {
 	rows, err := do.execCachedTableInvalidationRestrictedSQL(
-		"SELECT id, table_id, physical_id, commit_ts, invalidation_epoch FROM %n.%n WHERE id > %? ORDER BY id LIMIT %?",
+		"SELECT id, table_id, physical_id, commit_ts, invalidation_epoch, invalidation_ranges FROM %n.%n WHERE id > %? ORDER BY id LIMIT %?",
 		mysql.SystemDB,
 		cachedTableInvalidationLogTable,
 		afterID,
@@ -497,11 +560,21 @@ func (do *Domain) pullCachedTableInvalidationEvents(afterID uint64, limit int) (
 	events := make([]tablecache.CachedTableInvalidationEvent, 0, len(rows))
 	lastID := afterID
 	for _, row := range rows {
+		var ranges []kv.KeyRange
+		if !row.IsNull(5) {
+			decoded, decodeErr := decodeCachedTableInvalidationRanges(row.GetBytes(5))
+			if decodeErr != nil {
+				logutil.BgLogger().Warn("decode cached-table invalidation ranges failed, fallback to full invalidation", zap.Error(decodeErr))
+			} else {
+				ranges = decoded
+			}
+		}
 		events = append(events, tablecache.CachedTableInvalidationEvent{
 			TableID:    row.GetInt64(1),
 			PhysicalID: row.GetInt64(2),
 			CommitTS:   row.GetUint64(3),
 			Epoch:      row.GetUint64(4),
+			Ranges:     ranges,
 		})
 		lastID = row.GetUint64(0)
 	}

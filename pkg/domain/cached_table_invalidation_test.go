@@ -15,6 +15,7 @@
 package domain
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/pingcap/tidb/pkg/kv"
@@ -113,14 +114,97 @@ func TestCoalesceCachedTableInvalidationEvents(t *testing.T) {
 	require.Equal(t, uint64(91), got[cachedTableInvalidationEventKey{tableID: 12, physicalID: 1201}].CommitTS)
 }
 
+func TestCoalesceCachedTableInvalidationEventsMergeRanges(t *testing.T) {
+	events := []tablecache.CachedTableInvalidationEvent{
+		{
+			TableID:    11,
+			PhysicalID: 11,
+			CommitTS:   100,
+			Epoch:      100,
+			Ranges: []kv.KeyRange{
+				{StartKey: kv.Key("k1"), EndKey: kv.Key("k2")},
+			},
+		},
+		{
+			TableID:    11,
+			PhysicalID: 11,
+			CommitTS:   101,
+			Epoch:      101,
+			Ranges: []kv.KeyRange{
+				{StartKey: kv.Key("k3"), EndKey: kv.Key("k4")},
+			},
+		},
+	}
+	coalesced := coalesceCachedTableInvalidationEvents(events)
+	require.Len(t, coalesced, 1)
+	require.Equal(t, uint64(101), coalesced[0].Epoch)
+	require.Len(t, coalesced[0].Ranges, 2)
+}
+
+func TestCoalesceCachedTableInvalidationEventsFullInvalidationWins(t *testing.T) {
+	events := []tablecache.CachedTableInvalidationEvent{
+		{
+			TableID:    11,
+			PhysicalID: 11,
+			CommitTS:   100,
+			Epoch:      100,
+			Ranges: []kv.KeyRange{
+				{StartKey: kv.Key("k1"), EndKey: kv.Key("k2")},
+			},
+		},
+		{
+			TableID:    11,
+			PhysicalID: 11,
+			CommitTS:   101,
+			Epoch:      101,
+		},
+	}
+	coalesced := coalesceCachedTableInvalidationEvents(events)
+	require.Len(t, coalesced, 1)
+	require.Len(t, coalesced[0].Ranges, 0)
+}
+
+func TestEncodeDecodeCachedTableInvalidationRanges(t *testing.T) {
+	encoded, err := encodeCachedTableInvalidationRanges([]kv.KeyRange{
+		{StartKey: kv.Key("k1"), EndKey: kv.Key("k2")},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, encoded)
+
+	var raw []map[string]string
+	require.NoError(t, json.Unmarshal(encoded, &raw))
+
+	decoded, decodeErr := decodeCachedTableInvalidationRanges(encoded)
+	require.NoError(t, decodeErr)
+	require.Len(t, decoded, 1)
+	require.Equal(t, kv.Key("k1"), decoded[0].StartKey)
+	require.Equal(t, kv.Key("k2"), decoded[0].EndKey)
+}
+
 func TestBuildCachedTableInvalidationInsertSQL(t *testing.T) {
 	events := []tablecache.CachedTableInvalidationEvent{
 		{TableID: 11, PhysicalID: 11, CommitTS: 101, Epoch: 101},
-		{TableID: 12, PhysicalID: 1201, CommitTS: 102, Epoch: 102},
+		{
+			TableID:    12,
+			PhysicalID: 1201,
+			CommitTS:   102,
+			Epoch:      102,
+			Ranges: []kv.KeyRange{
+				{StartKey: kv.Key("k1"), EndKey: kv.Key("k2")},
+			},
+		},
 	}
 	sql, args := buildCachedTableInvalidationInsertSQL(events)
-	require.Equal(t, "INSERT HIGH_PRIORITY INTO %n.%n (table_id, physical_id, commit_ts, invalidation_epoch) VALUES (%?, %?, %?, %?), (%?, %?, %?, %?)", sql)
-	require.Equal(t, []any{"mysql", cachedTableInvalidationLogTable, int64(11), int64(11), uint64(101), uint64(101), int64(12), int64(1201), uint64(102), uint64(102)}, args)
+	require.Equal(t, "INSERT HIGH_PRIORITY INTO %n.%n (table_id, physical_id, commit_ts, invalidation_epoch, invalidation_ranges) VALUES (%?, %?, %?, %?, %?), (%?, %?, %?, %?, %?)", sql)
+	require.Len(t, args, 12)
+	require.Equal(t, []any{"mysql", cachedTableInvalidationLogTable, int64(11), int64(11), uint64(101), uint64(101), []byte(nil), int64(12), int64(1201), uint64(102), uint64(102)}, args[:11])
+	encoded, ok := args[11].([]byte)
+	require.True(t, ok)
+	decoded, decodeErr := decodeCachedTableInvalidationRanges(encoded)
+	require.NoError(t, decodeErr)
+	require.Len(t, decoded, 1)
+	require.Equal(t, kv.Key("k1"), decoded[0].StartKey)
+	require.Equal(t, kv.Key("k2"), decoded[0].EndKey)
 }
 
 func TestTryEnqueueCachedTableInvalidationPersistCopiesEvents(t *testing.T) {
@@ -239,7 +323,7 @@ func BenchmarkBuildCachedTableInvalidationInsertSQL(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		sql, args := buildCachedTableInvalidationInsertSQL(events)
-		if len(sql) == 0 || len(args) != 2+eventCount*4 {
+		if len(sql) == 0 || len(args) != 2+eventCount*5 {
 			b.Fatalf("unexpected sql build output: sqlLen=%d args=%d", len(sql), len(args))
 		}
 	}
