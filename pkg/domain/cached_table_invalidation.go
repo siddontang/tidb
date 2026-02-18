@@ -34,6 +34,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/chunk"
 	etcdutil "github.com/pingcap/tidb/pkg/util/etcd"
 	"github.com/pingcap/tidb/pkg/util/logutil"
+	"github.com/tikv/client-go/v2/oracle"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 )
@@ -49,6 +50,10 @@ const (
 	cachedTableInvalidationCoalesceRangeCap = 1024
 	cachedTableInvalidationTypeFull         = "full"
 	cachedTableInvalidationTypeRange        = "range"
+	cachedTableInvalidationQueueTypeNotify  = "notify"
+	cachedTableInvalidationQueueTypePersist = "persist"
+	cachedTableInvalidationLagSourceNotify  = "notify"
+	cachedTableInvalidationLagSourcePull    = "pull"
 )
 
 type cachedTableInvalidationTarget interface {
@@ -109,6 +114,31 @@ func cloneCachedTableInvalidationEvents(events []tablecache.CachedTableInvalidat
 		out = append(out, event)
 	}
 	return out
+}
+
+func observeCachedTableInvalidationQueueSize(queueType string, queueLen int) {
+	metrics.CachedTableInvalidationQueueSize.WithLabelValues(queueType).Set(float64(queueLen))
+}
+
+func observeCachedTableInvalidationLag(events []tablecache.CachedTableInvalidationEvent, source string) {
+	if len(events) == 0 {
+		return
+	}
+	now := time.Now()
+	maxLagSeconds := 0.0
+	for _, event := range events {
+		if event.CommitTS == 0 {
+			continue
+		}
+		lagSeconds := now.Sub(oracle.GetTimeFromTS(event.CommitTS)).Seconds()
+		if lagSeconds < 0 {
+			lagSeconds = 0
+		}
+		if lagSeconds > maxLagSeconds {
+			maxLagSeconds = lagSeconds
+		}
+	}
+	metrics.CachedTableInvalidationLagGauge.WithLabelValues(source).Set(maxLagSeconds)
 }
 
 func mergeCachedTableInvalidationRanges(left, right []kv.KeyRange) []kv.KeyRange {
@@ -255,8 +285,10 @@ func (do *Domain) enqueueCachedTableInvalidationNotify(events []tablecache.Cache
 	case <-do.exit:
 		return false
 	case do.cachedTableInvalidationNotifyCh <- task:
+		observeCachedTableInvalidationQueueSize(cachedTableInvalidationQueueTypeNotify, len(do.cachedTableInvalidationNotifyCh))
 		return true
 	default:
+		observeCachedTableInvalidationQueueSize(cachedTableInvalidationQueueTypeNotify, len(do.cachedTableInvalidationNotifyCh))
 		return false
 	}
 }
@@ -305,6 +337,7 @@ func (do *Domain) applyCachedTableInvalidationNotifyResponse(resp clientv3.Watch
 		if payload.ServerID == do.serverID || len(payload.Events) == 0 {
 			continue
 		}
+		observeCachedTableInvalidationLag(payload.Events, cachedTableInvalidationLagSourceNotify)
 		do.applyCachedTableInvalidationEvents(payload.Events)
 	}
 }
@@ -409,6 +442,7 @@ func (do *Domain) cachedTableInvalidationPersistLoop() {
 		case <-do.exit:
 			return
 		case task := <-do.cachedTableInvalidationPersistCh:
+			observeCachedTableInvalidationQueueSize(cachedTableInvalidationQueueTypePersist, len(do.cachedTableInvalidationPersistCh))
 			batch := make([]tablecache.CachedTableInvalidationEvent, 0, cachedTableInvalidationPersistBatch)
 			batch = append(batch, task.events...)
 		drain:
@@ -420,6 +454,7 @@ func (do *Domain) cachedTableInvalidationPersistLoop() {
 					break drain
 				}
 			}
+			observeCachedTableInvalidationQueueSize(cachedTableInvalidationQueueTypePersist, len(do.cachedTableInvalidationPersistCh))
 			batch = coalesceCachedTableInvalidationEvents(batch)
 			if err := do.persistCachedTableInvalidationEvents(batch); err != nil && !terror.ErrorEqual(err, infoschema.ErrTableNotExists) {
 				logutil.BgLogger().Warn("persist cached-table invalidation events failed", zap.Error(err), zap.Int("events", len(batch)))
@@ -440,6 +475,7 @@ func (do *Domain) cachedTableInvalidationNotifyLoop() {
 		case <-do.exit:
 			return
 		case task := <-do.cachedTableInvalidationNotifyCh:
+			observeCachedTableInvalidationQueueSize(cachedTableInvalidationQueueTypeNotify, len(do.cachedTableInvalidationNotifyCh))
 			batch := make([]tablecache.CachedTableInvalidationEvent, 0, cachedTableInvalidationNotifyBatch)
 			batch = append(batch, task.events...)
 		drain:
@@ -451,6 +487,7 @@ func (do *Domain) cachedTableInvalidationNotifyLoop() {
 					break drain
 				}
 			}
+			observeCachedTableInvalidationQueueSize(cachedTableInvalidationQueueTypeNotify, len(do.cachedTableInvalidationNotifyCh))
 			batch = coalesceCachedTableInvalidationEvents(batch)
 			if err := do.notifyCachedTableInvalidationEvents(batch); err != nil {
 				logutil.BgLogger().Warn("notify cached-table invalidation failed", zap.Error(err), zap.Int("events", len(batch)))
@@ -470,8 +507,10 @@ func (do *Domain) enqueueCachedTableInvalidationPersist(events []tablecache.Cach
 	case <-do.exit:
 		return false
 	case do.cachedTableInvalidationPersistCh <- task:
+		observeCachedTableInvalidationQueueSize(cachedTableInvalidationQueueTypePersist, len(do.cachedTableInvalidationPersistCh))
 		return true
 	default:
+		observeCachedTableInvalidationQueueSize(cachedTableInvalidationQueueTypePersist, len(do.cachedTableInvalidationPersistCh))
 		return false
 	}
 }
@@ -605,6 +644,7 @@ func (do *Domain) pullCachedTableInvalidationEvents(afterID uint64, limit int) (
 	for _, event := range coalesceCachedTableInvalidationEvents(events) {
 		do.applyCachedTableInvalidationEvent(event)
 	}
+	observeCachedTableInvalidationLag(events, cachedTableInvalidationLagSourcePull)
 
 	return lastID, len(rows), nil
 }

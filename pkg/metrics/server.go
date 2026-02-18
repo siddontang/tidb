@@ -55,6 +55,8 @@ var (
 	ReadFromTableCacheCounter           prometheus.Counter
 	CachedTableInvalidationEventCounter *prometheus.CounterVec
 	CachedTableInvalidationApplyCounter *prometheus.CounterVec
+	CachedTableInvalidationQueueSize    *prometheus.GaugeVec
+	CachedTableInvalidationLagGauge     *prometheus.GaugeVec
 	HandShakeErrorCounter               prometheus.Counter
 	GetTokenDurationHistogram           prometheus.Histogram
 	NumOfMultiQueryHistogram            prometheus.Histogram
@@ -246,6 +248,20 @@ func InitServerMetrics() {
 			Subsystem: "server",
 			Name:      "cached_table_invalidation_apply_total",
 			Help:      "Counter of applied cached-table invalidations.",
+		}, []string{LblType})
+	CachedTableInvalidationQueueSize = metricscommon.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "tidb",
+			Subsystem: "server",
+			Name:      "cached_table_invalidation_queue_size",
+			Help:      "Current queue size of cached-table invalidation workers.",
+		}, []string{LblType})
+	CachedTableInvalidationLagGauge = metricscommon.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "tidb",
+			Subsystem: "server",
+			Name:      "cached_table_invalidation_lag_seconds",
+			Help:      "Observed cached-table invalidation lag in seconds.",
 		}, []string{LblType})
 
 	HandShakeErrorCounter = metricscommon.NewCounter(

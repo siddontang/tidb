@@ -17,12 +17,14 @@ package domain
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/metrics"
 	tablecache "github.com/pingcap/tidb/pkg/table/tables"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
+	"github.com/tikv/client-go/v2/oracle"
 )
 
 type mockCachedTableInvalidationTarget struct {
@@ -41,6 +43,12 @@ func readCounterValue(writer metricWriter) float64 {
 	out := &dto.Metric{}
 	_ = writer.Write(out)
 	return out.GetCounter().GetValue()
+}
+
+func readGaugeValue(writer metricWriter) float64 {
+	out := &dto.Metric{}
+	_ = writer.Write(out)
+	return out.GetGauge().GetValue()
 }
 
 func (m *mockCachedTableInvalidationTarget) ApplyLocalInvalidation(epoch, commitTS uint64) int {
@@ -304,8 +312,11 @@ func TestTryEnqueueCachedTableInvalidationPersistQueueFull(t *testing.T) {
 		exit:                             make(chan struct{}),
 		cachedTableInvalidationPersistCh: make(chan cachedTableInvalidationPersistTask, 1),
 	}
+	queueGauge := metrics.CachedTableInvalidationQueueSize.WithLabelValues(cachedTableInvalidationQueueTypePersist)
 	require.True(t, do.TryEnqueueCachedTableInvalidationPersist([]tablecache.CachedTableInvalidationEvent{{TableID: 1}}))
+	require.InDelta(t, 1.0, readGaugeValue(queueGauge), 0.001)
 	require.False(t, do.TryEnqueueCachedTableInvalidationPersist([]tablecache.CachedTableInvalidationEvent{{TableID: 2}}))
+	require.InDelta(t, 1.0, readGaugeValue(queueGauge), 0.001)
 }
 
 func TestEnqueueCachedTableInvalidationNotifyCopiesEvents(t *testing.T) {
@@ -354,8 +365,27 @@ func TestEnqueueCachedTableInvalidationNotifyQueueFull(t *testing.T) {
 		exit:                            make(chan struct{}),
 		cachedTableInvalidationNotifyCh: make(chan cachedTableInvalidationNotifyTask, 1),
 	}
+	queueGauge := metrics.CachedTableInvalidationQueueSize.WithLabelValues(cachedTableInvalidationQueueTypeNotify)
 	require.True(t, do.enqueueCachedTableInvalidationNotify([]tablecache.CachedTableInvalidationEvent{{TableID: 1}}))
+	require.InDelta(t, 1.0, readGaugeValue(queueGauge), 0.001)
 	require.False(t, do.enqueueCachedTableInvalidationNotify([]tablecache.CachedTableInvalidationEvent{{TableID: 2}}))
+	require.InDelta(t, 1.0, readGaugeValue(queueGauge), 0.001)
+}
+
+func TestObserveCachedTableInvalidationLag(t *testing.T) {
+	lagGauge := metrics.CachedTableInvalidationLagGauge.WithLabelValues(cachedTableInvalidationLagSourceNotify)
+
+	pastCommitTS := oracle.GoTimeToTS(time.Now().Add(-2 * time.Second))
+	observeCachedTableInvalidationLag([]tablecache.CachedTableInvalidationEvent{
+		{CommitTS: pastCommitTS},
+	}, cachedTableInvalidationLagSourceNotify)
+	require.Greater(t, readGaugeValue(lagGauge), 1.0)
+
+	futureCommitTS := oracle.GoTimeToTS(time.Now().Add(2 * time.Second))
+	observeCachedTableInvalidationLag([]tablecache.CachedTableInvalidationEvent{
+		{CommitTS: futureCommitTS},
+	}, cachedTableInvalidationLagSourceNotify)
+	require.InDelta(t, 0.0, readGaugeValue(lagGauge), 0.001)
 }
 
 func BenchmarkCoalesceCachedTableInvalidationEvents(b *testing.B) {

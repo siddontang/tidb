@@ -241,6 +241,8 @@ func RegisterMetrics() {
 	prometheus.MustRegister(ReadFromTableCacheCounter)
 	prometheus.MustRegister(CachedTableInvalidationEventCounter)
 	prometheus.MustRegister(CachedTableInvalidationApplyCounter)
+	prometheus.MustRegister(CachedTableInvalidationQueueSize)
+	prometheus.MustRegister(CachedTableInvalidationLagGauge)
 	prometheus.MustRegister(LoadTableCacheDurationHistogram)
 	prometheus.MustRegister(NonTransactionalDMLCount)
 	prometheus.MustRegister(PessimisticDMLDurationByAttempt)
@@ -395,6 +397,8 @@ func ToggleSimplifiedMode(simplified bool) {
 		ReadFromTableCacheCounter,
 		CachedTableInvalidationEventCounter,
 		CachedTableInvalidationApplyCounter,
+		CachedTableInvalidationQueueSize,
+		CachedTableInvalidationLagGauge,
 		TiFlashQueryTotalCounter,
 		TiFlashFailedMPPStoreState,
 		CampaignOwnerCounter,

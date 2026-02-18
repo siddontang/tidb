@@ -270,6 +270,9 @@ Performance tests:
   - Extended `mysql.table_cache_invalidation_log` with persisted range payload (`invalidation_ranges`) and wired range encode/decode in persist + pull paths.
   - Fixed event coalescing for range invalidation to merge ranges across multiple events for the same table/physical ID (with bounded fallback to full invalidation), preventing stale segment retention.
   - Added cached-table invalidation observability metrics to distinguish `full` vs `range` invalidation events and applied-target counts.
+  - Added async invalidation queue/liveness observability:
+    - queue size gauge by worker type (`persist` / `notify`)
+    - propagation lag gauge by source (`notify` / `pull`) based on commit-ts
   - Reduced commit-path enqueue overhead for async persist/notify by removing enqueue-time coalescing and deferring coalescing to worker batches, while keeping deep-copy safety for range payloads.
   - Added coverage:
     - Unit/integration tests for partition cached-table hot-range freshness and partition DDL cache path.
