@@ -259,6 +259,16 @@ Performance tests:
 
 ## Implementation Progress
 
+- 2026-02-18:
+  - Enabled `ALTER TABLE ... CACHE` for partitioned tables and initialize cache metadata by physical partition ID.
+  - Added partition-aware cached-table interfaces for point-get / hot-range cache and write-path invalidation hooks.
+  - Fixed stale-read issue after partition writes by always applying local invalidation on commit (sync and async modes).
+  - Refined invalidation target resolution to prefer physical partition targets and avoid broad parent-table invalidation when a physical target is resolved.
+  - Added coverage:
+    - Unit/integration tests for partition cached-table hot-range freshness and partition DDL cache path.
+    - Integration test case in `tests/integrationtest/t/table/cache.test`.
+    - Benchmarks for cached-table invalidation path and partitioned invalidation path.
+
 ### 2026-02-16 (initial refactor slices)
 
 Completed:

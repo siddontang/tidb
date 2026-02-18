@@ -104,7 +104,8 @@ func (b *executorBuilder) buildPointGet(p *physicalop.PointGetPlan) exec.Executo
 	}
 	if p.TblInfo.TableCacheStatusType == model.TableCacheStatusEnable {
 		loadFullCache := !vardef.EnableCachedTableHotRangePointGet.Load()
-		if cacheTable := b.getCacheTable(p.TblInfo, snapshotTS, loadFullCache); cacheTable != nil {
+		cachePhysicalID := GetPhysID(p.TblInfo, p.PartitionIdx)
+		if cacheTable := b.getCacheTable(p.TblInfo, snapshotTS, loadFullCache, cachePhysicalID); cacheTable != nil {
 			e.snapshot = cacheTableSnapshot{e.snapshot, cacheTable}
 		}
 		if cachedTable, ok := b.is.TableByID(context.Background(), p.TblInfo.ID); ok {

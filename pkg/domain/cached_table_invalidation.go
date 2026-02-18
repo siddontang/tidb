@@ -120,6 +120,14 @@ func (do *Domain) applyCachedTableInvalidationEvents(events []tablecache.CachedT
 	return applied
 }
 
+// ApplyCachedTableInvalidationEvents applies invalidation events to local cached-table targets.
+func (do *Domain) ApplyCachedTableInvalidationEvents(events []tablecache.CachedTableInvalidationEvent) int {
+	if do == nil || len(events) == 0 {
+		return 0
+	}
+	return do.applyCachedTableInvalidationEvents(events)
+}
+
 // NotifyCachedTableInvalidation publishes fast-path invalidation events to other TiDB instances.
 // Polling from mysql.table_cache_invalidation_log remains the durability/recovery path.
 func (do *Domain) NotifyCachedTableInvalidation(events []tablecache.CachedTableInvalidationEvent) {
@@ -528,29 +536,43 @@ func (do *Domain) resolveCachedTableInvalidationTargets(event tablecache.CachedT
 
 	seen := make(map[table.CachedTable]struct{}, 2)
 	targets := make([]cachedTableInvalidationTarget, 0, 2)
-	addTarget := func(tbl table.Table) {
+	addTarget := func(tbl table.Table) bool {
 		cached, ok := tbl.(table.CachedTable)
 		if !ok {
-			return
+			return false
 		}
 		if _, ok = seen[cached]; ok {
-			return
+			return false
 		}
 		seen[cached] = struct{}{}
 		targets = append(targets, cached)
+		return true
 	}
 
 	ctx := context.Background()
+	resolvedPhysicalTarget := false
 	if event.PhysicalID > 0 {
 		if tbl, ok := is.TableByID(ctx, event.PhysicalID); ok {
-			addTarget(tbl)
+			resolvedPhysicalTarget = addTarget(tbl) || resolvedPhysicalTarget
 		} else if tbl, _, _ := is.FindTableByPartitionID(event.PhysicalID); tbl != nil {
-			addTarget(tbl)
+			addedPartition := false
+			if pt := tbl.GetPartitionedTable(); pt != nil {
+				if part := pt.GetPartition(event.PhysicalID); part != nil {
+					addedPartition = addTarget(part)
+				}
+			}
+			if !addedPartition {
+				addedPartition = addTarget(tbl)
+			}
+			resolvedPhysicalTarget = addedPartition || resolvedPhysicalTarget
 		}
 	}
 	if event.TableID > 0 {
-		if tbl, ok := is.TableByID(ctx, event.TableID); ok {
-			addTarget(tbl)
+		shouldResolveTableID := event.PhysicalID == 0 || event.PhysicalID == event.TableID || !resolvedPhysicalTarget
+		if shouldResolveTableID {
+			if tbl, ok := is.TableByID(ctx, event.TableID); ok {
+				addTarget(tbl)
+			}
 		}
 	}
 	return targets

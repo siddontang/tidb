@@ -1,7 +1,6 @@
 # TestAlterPartitionCache
 drop table if exists cache_partition_table;
 create table cache_partition_table (a int, b int) partition by hash(a) partitions 3;
--- error 8242
 alter table cache_partition_table cache;
 drop table if exists cache_partition_range_table;
 create table cache_partition_range_table (c1 smallint(6) not null, c2 char(5) default null) partition by range ( c1 ) (
@@ -10,7 +9,6 @@ create table cache_partition_range_table (c1 smallint(6) not null, c2 char(5) de
 	partition p2 values less than (30),
 	partition p3 values less than (MAXVALUE)
 );
--- error 8242
 alter table cache_partition_range_table cache;
 drop table if exists partition_list_table;
 create table cache_partition_list_table (id int) partition by list  (id) (
@@ -18,8 +16,10 @@ create table cache_partition_list_table (id int) partition by list  (id) (
     partition p1 values in (3,4),
     partition p3 values in (5,null)
 );
--- error 8242
 alter table cache_partition_list_table cache;
+alter table cache_partition_list_table nocache;
+alter table cache_partition_range_table nocache;
+alter table cache_partition_table nocache;
 drop table if exists cache_partition_list_table;
 drop table if exists cache_partition_range_table;
 drop table if exists cache_partition_table;
@@ -77,4 +77,3 @@ alter table cache_t2 cache;
 alter table cache_t2 nocache;
 alter table cache_t2 cache;
 show warnings;
-

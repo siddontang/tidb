@@ -15,6 +15,7 @@
 package ddl_test
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -109,6 +110,25 @@ func TestAlterTableCache(t *testing.T) {
 	tk.MustExec("create table t3 like t")
 	checkTableCacheStatus(t, tk, "test", "t", model.TableCacheStatusEnable)
 	checkTableCacheStatus(t, tk, "test", "t3", model.TableCacheStatusDisable)
+}
+
+func TestAlterPartitionTableCache(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists cache_partition_enable")
+	tk.MustExec("create table cache_partition_enable (a int primary key, b int) partition by hash(a) partitions 3")
+	tk.MustExec("insert into cache_partition_enable values (1, 10), (2, 20), (3, 30)")
+	tk.MustExec("alter table cache_partition_enable cache")
+	checkTableCacheStatus(t, tk, "test", "cache_partition_enable", model.TableCacheStatusEnable)
+
+	tb := external.GetTableByName(t, tk, "test", "cache_partition_enable")
+	for _, def := range tb.Meta().GetPartitionInfo().Definitions {
+		tk.MustQuery("select tid from mysql.table_cache_meta where tid = ?", def.ID).Check(testkit.Rows(strconv.FormatInt(def.ID, 10)))
+	}
+
+	tk.MustExec("alter table cache_partition_enable nocache")
+	tk.MustExec("drop table if exists cache_partition_enable")
 }
 
 func TestCacheTableSizeLimit(t *testing.T) {

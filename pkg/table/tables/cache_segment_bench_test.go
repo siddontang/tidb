@@ -46,6 +46,46 @@ func buildBenchSegmentIndex(segmentCount int) *segmentIndex {
 	return idx
 }
 
+func buildBenchCachedTable(tableID, physicalID int64, segmentCount int) *cachedTable {
+	c := &cachedTable{
+		TableCommon: TableCommon{tableID: tableID, physicalTableID: physicalID},
+		segments:    newSegmentIndex(),
+	}
+	c.setCacheData(&cacheData{
+		Start: 100,
+		Lease: 200,
+		Epoch: 1,
+	}, int64(segmentCount))
+	for i := range segmentCount {
+		start := benchKey(i * 2)
+		end := benchKey(i*2 + 1).Next()
+		err := c.segments.upsert(cacheSegment{
+			span:      keySpan{start: start, end: end},
+			epoch:     1,
+			startTS:   100,
+			leaseTS:   200,
+			sizeBytes: int64(len(start)),
+		})
+		if err != nil {
+			panic(err)
+		}
+	}
+	return c
+}
+
+func buildBenchPartitionedCachedTable(partitionCount, segmentPerPartition int) *partitionedTable {
+	pt := &partitionedTable{
+		partitions: make(map[int64]*partition, partitionCount),
+	}
+	for i := range partitionCount {
+		physicalID := int64(10000 + i)
+		pt.partitions[physicalID] = &partition{
+			cached: buildBenchCachedTable(42, physicalID, segmentPerPartition),
+		}
+	}
+	return pt
+}
+
 func BenchmarkSegmentIndexFindByKey(b *testing.B) {
 	const segmentCount = 4096
 	idx := buildBenchSegmentIndex(segmentCount)
@@ -109,4 +149,33 @@ func BenchmarkCachedTableHotRangeAdmissionThreshold(b *testing.B) {
 		}
 		b.ReportMetric(float64(admitted)/float64(b.N), "admit/op")
 	})
+}
+
+func BenchmarkCachedTableApplyLocalInvalidationHotRange(b *testing.B) {
+	const segmentCount = 4096
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		c := buildBenchCachedTable(42, 4201, segmentCount)
+		b.StartTimer()
+		removed := c.ApplyLocalInvalidation(uint64(i+2), uint64(i+2))
+		if removed == 0 {
+			b.Fatal("invalidation removed nothing")
+		}
+	}
+}
+
+func BenchmarkPartitionedTableApplyLocalInvalidation(b *testing.B) {
+	const partitionCount = 64
+	const segmentPerPartition = 256
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		pt := buildBenchPartitionedCachedTable(partitionCount, segmentPerPartition)
+		b.StartTimer()
+		removed := pt.ApplyLocalInvalidation(uint64(i+2), uint64(i+2))
+		if removed == 0 {
+			b.Fatal("partition invalidation removed nothing")
+		}
+	}
 }

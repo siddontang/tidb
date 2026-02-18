@@ -1630,7 +1630,10 @@ type bypassDataSourceExecutor interface {
 func (us *UnionScanExec) handleCachedTable(b *executorBuilder, x bypassDataSourceExecutor, vars *variable.SessionVars, startTS uint64) {
 	tbl := x.Table()
 	if tbl.Meta().TableCacheStatusType == model.TableCacheStatusEnable {
-		cachedTable := tbl.(table.CachedTable)
+		cachedTable, ok := tbl.(table.CachedTable)
+		if !ok {
+			return
+		}
 		// Determine whether the cache can be used.
 		leaseDuration := time.Duration(vardef.TableCacheLease.Load()) * time.Second
 		cacheData, loading := cachedTable.TryReadFromCache(startTS, leaseDuration)
@@ -5804,7 +5807,11 @@ func (b *executorBuilder) buildBatchPointGet(plan *physicalop.BatchPointGetPlan)
 	}
 	if plan.TblInfo.TableCacheStatusType == model.TableCacheStatusEnable {
 		loadFullCache := !vardef.EnableCachedTableHotRangePointGet.Load()
-		if cacheTable := b.getCacheTable(plan.TblInfo, snapshotTS, loadFullCache); cacheTable != nil {
+		cachePhysicalID := int64(0)
+		if pi := plan.TblInfo.GetPartitionInfo(); pi != nil && plan.SinglePartition && len(plan.PartitionIdxs) == 1 {
+			cachePhysicalID = pi.Definitions[plan.PartitionIdxs[0]].ID
+		}
+		if cacheTable := b.getCacheTable(plan.TblInfo, snapshotTS, loadFullCache, cachePhysicalID); cacheTable != nil {
 			e.snapshot = cacheTableSnapshot{e.snapshot, cacheTable}
 		}
 		if cachedTable, ok := b.is.TableByID(context.Background(), plan.TblInfo.ID); ok {
@@ -6142,15 +6149,26 @@ func (b *executorBuilder) validCanReadTemporaryTable(tbl *model.TableInfo) error
 	return nil
 }
 
-func (b *executorBuilder) getCacheTable(tblInfo *model.TableInfo, startTS uint64, triggerLoad bool) kv.MemBuffer {
+func (b *executorBuilder) getCacheTable(tblInfo *model.TableInfo, startTS uint64, triggerLoad bool, physicalTableID int64) kv.MemBuffer {
 	tbl, ok := b.is.TableByID(context.Background(), tblInfo.ID)
 	if !ok {
 		b.err = errors.Trace(infoschema.ErrTableNotExists.GenWithStackByArgs(b.ctx.GetSessionVars().CurrentDB, tblInfo.Name))
 		return nil
 	}
+	cachedTable, ok := tbl.(table.CachedTable)
+	if !ok && physicalTableID > 0 {
+		if pt := tbl.GetPartitionedTable(); pt != nil {
+			if part := pt.GetPartition(physicalTableID); part != nil {
+				cachedTable, ok = part.(table.CachedTable)
+			}
+		}
+	}
+	if !ok {
+		return nil
+	}
 	sessVars := b.ctx.GetSessionVars()
 	leaseDuration := time.Duration(vardef.TableCacheLease.Load()) * time.Second
-	cacheData, loading := tbl.(table.CachedTable).TryReadFromCache(startTS, leaseDuration)
+	cacheData, loading := cachedTable.TryReadFromCache(startTS, leaseDuration)
 	if cacheData != nil {
 		sessVars.StmtCtx.ReadFromTableCache = true
 		return cacheData
@@ -6158,7 +6176,7 @@ func (b *executorBuilder) getCacheTable(tblInfo *model.TableInfo, startTS uint64
 		return nil
 	}
 	if triggerLoad && !b.ctx.GetSessionVars().StmtCtx.InExplainStmt && !b.inDeleteStmt && !b.inUpdateStmt {
-		tbl.(table.CachedTable).UpdateLockForRead(context.Background(), b.ctx.GetStore(), startTS, leaseDuration)
+		cachedTable.UpdateLockForRead(context.Background(), b.ctx.GetStore(), startTS, leaseDuration)
 	}
 	return nil
 }

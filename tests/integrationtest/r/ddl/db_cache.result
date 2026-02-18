@@ -1,7 +1,6 @@
 drop table if exists cache_partition_table;
 create table cache_partition_table (a int, b int) partition by hash(a) partitions 3;
 alter table cache_partition_table cache;
-Error 8242 (HY000): 'partition mode' is unsupported on cache tables.
 drop table if exists cache_partition_range_table;
 create table cache_partition_range_table (c1 smallint(6) not null, c2 char(5) default null) partition by range ( c1 ) (
 partition p0 values less than (10),
@@ -10,7 +9,6 @@ partition p2 values less than (30),
 partition p3 values less than (MAXVALUE)
 );
 alter table cache_partition_range_table cache;
-Error 8242 (HY000): 'partition mode' is unsupported on cache tables.
 drop table if exists partition_list_table;
 create table cache_partition_list_table (id int) partition by list  (id) (
 partition p0 values in (1,2),
@@ -18,7 +16,9 @@ partition p1 values in (3,4),
 partition p3 values in (5,null)
 );
 alter table cache_partition_list_table cache;
-Error 8242 (HY000): 'partition mode' is unsupported on cache tables.
+alter table cache_partition_list_table nocache;
+alter table cache_partition_range_table nocache;
+alter table cache_partition_table nocache;
 drop table if exists cache_partition_list_table;
 drop table if exists cache_partition_range_table;
 drop table if exists cache_partition_table;

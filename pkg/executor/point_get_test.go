@@ -336,6 +336,37 @@ func TestCachedTableHotRangeBatchPointGetByUniqueIndex(t *testing.T) {
 	tk.MustExec("alter table hot_idx nocache")
 }
 
+func TestCachedPartitionTableHotRangePointGet(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set global tidb_enable_cached_table_hot_range_point_get = 1")
+	defer tk.MustExec("set global tidb_enable_cached_table_hot_range_point_get = 0")
+
+	tk.MustExec("drop table if exists hot_part_point")
+	tk.MustExec("create table hot_part_point(id int primary key, v int) partition by hash(id) partitions 2")
+	tk.MustExec("insert into hot_part_point values (1, 10), (2, 20)")
+	tk.MustExec("alter table hot_part_point cache")
+
+	tk.MustQuery("select * from hot_part_point where id = 1").Check(testkit.Rows("1 10"))
+	require.False(t, tk.Session().GetSessionVars().StmtCtx.ReadFromTableCache)
+	tk.MustQuery("select * from hot_part_point where id = 1").Check(testkit.Rows("1 10"))
+	require.True(t, tk.Session().GetSessionVars().StmtCtx.ReadFromTableCache)
+	tk.MustQuery("select * from hot_part_point where id = 2").Check(testkit.Rows("2 20"))
+	require.False(t, tk.Session().GetSessionVars().StmtCtx.ReadFromTableCache)
+	tk.MustQuery("select * from hot_part_point where id = 2").Check(testkit.Rows("2 20"))
+	require.True(t, tk.Session().GetSessionVars().StmtCtx.ReadFromTableCache)
+
+	tk.MustExec("begin")
+	tk.MustExec("update hot_part_point set v = 11 where id = 1")
+	tk.MustExec("commit")
+	tk.MustQuery("select * from hot_part_point where id = 1").Check(testkit.Rows("1 11"))
+	require.False(t, tk.Session().GetSessionVars().StmtCtx.ReadFromTableCache)
+	tk.MustQuery("select * from hot_part_point where id = 2").Check(testkit.Rows("2 20"))
+	require.True(t, tk.Session().GetSessionVars().StmtCtx.ReadFromTableCache)
+	tk.MustExec("alter table hot_part_point nocache")
+}
+
 func TestCachedTableHotRangeBatchPointGetDirtyTxnFallback(t *testing.T) {
 	store := testkit.CreateMockStore(t)
 	tk := testkit.NewTestKit(t, store)

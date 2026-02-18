@@ -1669,10 +1669,6 @@ func onAlterCacheTable(jobCtx *jobContext, job *model.Job) (ver int64, err error
 		return ver, errors.Trace(dbterror.ErrOptOnTemporaryTable.GenWithStackByArgs("alter temporary table cache"))
 	}
 
-	if tbInfo.Partition != nil {
-		return ver, errors.Trace(dbterror.ErrOptOnCacheTable.GenWithStackByArgs("partition mode"))
-	}
-
 	switch tbInfo.TableCacheStatusType {
 	case model.TableCacheStatusDisable:
 		// disable -> switching

@@ -375,3 +375,49 @@ drop table cache_inval_log1;
 drop table cache_inval_log2;
 set @@global.tidb_enable_cached_table_invalidation_async_persist = @old_async_persist;
 set @@global.tidb_enable_cached_table_async_invalidation = @old_async_invalidation;
+set @old_hot_range = @@global.tidb_enable_cached_table_hot_range_point_get;
+set @@global.tidb_enable_cached_table_hot_range_point_get = 1;
+drop table if exists cache_part_hot;
+create table cache_part_hot(id int primary key, v int) partition by hash(id) partitions 2;
+insert into cache_part_hot values (1, 10), (2, 20);
+alter table cache_part_hot cache;
+select v from cache_part_hot where id = 1;
+v
+10
+select v from cache_part_hot where id = 1;
+v
+10
+select v from cache_part_hot where id = 2;
+v
+20
+select v from cache_part_hot where id = 2;
+v
+20
+begin;
+update cache_part_hot set v = 11 where id = 1;
+commit;
+select v from cache_part_hot where id = 1;
+v
+11
+select v from cache_part_hot where id = 2;
+v
+20
+select v from cache_part_hot where id = 2;
+v
+20
+begin;
+select v from cache_part_hot where id = 3;
+v
+select v from cache_part_hot where id = 3;
+v
+insert into cache_part_hot values (3, 30);
+commit;
+select v from cache_part_hot where id = 3;
+v
+30
+select v from cache_part_hot where id = 3;
+v
+30
+alter table cache_part_hot nocache;
+drop table cache_part_hot;
+set @@global.tidb_enable_cached_table_hot_range_point_get = @old_hot_range;

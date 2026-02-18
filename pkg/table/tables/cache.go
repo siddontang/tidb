@@ -358,7 +358,7 @@ func (c *cachedTable) updateLockForRead(ctx context.Context, handle StateRemote,
 	}()
 
 	// Load data from original table and the update lock information.
-	tid := c.Meta().ID
+	tid := c.GetPhysicalID()
 	lease := leaseFromTS(ts, leaseDuration)
 	succ, err := handle.LockForRead(ctx, tid, lease)
 	if err != nil {
@@ -407,7 +407,7 @@ func (c *cachedTable) AddRecord(sctx table.MutateContext, txn kv.Transaction, r 
 	return c.TableCommon.AddRecord(sctx, txn, r, opts...)
 }
 
-func txnCtxAddCachedTable(sctx table.MutateContext, tid int64, handle *cachedTable) {
+func txnCtxAddCachedTable(sctx table.MutateContext, tid int64, handle table.CachedTable) {
 	if s, ok := sctx.GetCachedTableSupport(); ok {
 		s.AddCachedTableHandleToTxn(tid, handle)
 	}
@@ -441,7 +441,7 @@ func (c *cachedTable) renewLease(handle StateRemote, ts uint64, data *cacheData,
 
 	defer c.PutStateRemoteHandle(handle)
 
-	tid := c.Meta().ID
+	tid := c.GetPhysicalID()
 	lease := leaseFromTS(ts, leaseDuration)
 	newLease, err := handle.RenewReadLease(context.Background(), tid, data.Lease, lease)
 	if err != nil {
@@ -492,9 +492,10 @@ func (c *cachedTable) WriteLockAndKeepAlive(ctx context.Context, exit chan struc
 // ApplyLocalInvalidation implements table.CachedTable.
 func (c *cachedTable) ApplyLocalInvalidation(epoch, commitTS uint64) int {
 	return c.applyInvalidation(cacheInvalidationEvent{
-		tableID:  c.tableID,
-		epoch:    epoch,
-		commitTS: commitTS,
+		tableID:    c.tableID,
+		physicalID: c.GetPhysicalID(),
+		epoch:      epoch,
+		commitTS:   commitTS,
 	})
 }
 
@@ -506,7 +507,7 @@ func (c *cachedTable) renew(ctx context.Context, leasePtr *uint64) error {
 	h := c.TakeStateRemoteHandle()
 	defer c.PutStateRemoteHandle(h)
 
-	succ, err := h.RenewWriteLease(ctx, c.Meta().ID, newLease)
+	succ, err := h.RenewWriteLease(ctx, c.GetPhysicalID(), newLease)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -520,5 +521,5 @@ func (c *cachedTable) lockForWrite(ctx context.Context) (uint64, error) {
 	handle := c.TakeStateRemoteHandle()
 	defer c.PutStateRemoteHandle(handle)
 
-	return handle.LockForWrite(ctx, c.Meta().ID, cacheTableWriteLease)
+	return handle.LockForWrite(ctx, c.GetPhysicalID(), cacheTableWriteLease)
 }

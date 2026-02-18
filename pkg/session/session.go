@@ -567,11 +567,10 @@ func (s *session) doCommit(ctx context.Context) error {
 	sessVars := s.GetSessionVars()
 
 	var commitTSChecker func(uint64) bool
-	var cachedTablesForAsyncInvalidation map[int64]any
+	var cachedTables map[int64]any
 	if tables := sessVars.TxnCtx.CachedTables; len(tables) > 0 {
-		if vardef.EnableCachedTableAsyncInvalidation.Load() {
-			cachedTablesForAsyncInvalidation = tables
-		} else {
+		cachedTables = tables
+		if !vardef.EnableCachedTableAsyncInvalidation.Load() {
 			c := cachedTableRenewLease{tables: tables}
 			now := time.Now()
 			err := c.start(ctx)
@@ -590,8 +589,8 @@ func (s *session) doCommit(ctx context.Context) error {
 	err = s.commitTxnWithTemporaryData(tikvutil.SetSessionID(ctx, sessVars.ConnectionID), &s.txn)
 	if err != nil {
 		err = s.handleAssertionFailure(ctx, err)
-	} else if len(cachedTablesForAsyncInvalidation) > 0 {
-		applyCachedTableInvalidationEvents(s, cachedTablesForAsyncInvalidation, s.txn.lastCommitTS)
+	} else if len(cachedTables) > 0 {
+		applyCachedTableInvalidationEvents(s, cachedTables, s.txn.lastCommitTS)
 	}
 	return err
 }
@@ -624,18 +623,24 @@ func applyCachedTableInvalidationEvents(s *session, tables map[int64]any, commit
 		})
 	}
 	if len(events) > 0 {
-		do := domain.GetDomain(s)
-		if do != nil {
-			if vardef.EnableCachedTableInvalidationAsyncPersist.Load() {
-				if !do.TryEnqueueCachedTableInvalidationPersist(events) {
+		if do := domain.GetDomain(s); do != nil {
+			// Apply to current infoschema targets synchronously to avoid stale reads
+			// when write-path handles differ from read-path table objects.
+			do.ApplyCachedTableInvalidationEvents(events)
+			if vardef.EnableCachedTableAsyncInvalidation.Load() {
+				if vardef.EnableCachedTableInvalidationAsyncPersist.Load() {
+					if !do.TryEnqueueCachedTableInvalidationPersist(events) {
+						do.PersistCachedTableInvalidation(events)
+					}
+				} else {
 					do.PersistCachedTableInvalidation(events)
 				}
-			} else {
-				do.PersistCachedTableInvalidation(events)
+				do.NotifyCachedTableInvalidation(events)
 			}
-			do.NotifyCachedTableInvalidation(events)
 		}
-		tablecache.PublishCachedTableInvalidationEvents(events)
+		if vardef.EnableCachedTableAsyncInvalidation.Load() {
+			tablecache.PublishCachedTableInvalidationEvents(events)
+		}
 	}
 }
 

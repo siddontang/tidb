@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/btree"
@@ -49,6 +50,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/hack"
 	"github.com/pingcap/tidb/pkg/util/logutil"
 	"github.com/pingcap/tidb/pkg/util/ranger"
+	"github.com/pingcap/tidb/pkg/util/sqlexec"
 	"github.com/pingcap/tidb/pkg/util/stringutil"
 	"go.uber.org/zap"
 )
@@ -60,6 +62,8 @@ const (
 // Both partition and partitionedTable implement the table.Table interface.
 var _ table.PhysicalTable = &partition{}
 var _ table.Table = &partitionedTable{}
+var _ table.CachedTable = &partitionedTable{}
+var _ table.CachedTable = &partition{}
 
 // partitionedTable implements the table.PartitionedTable interface.
 var _ table.PartitionedTable = &partitionedTable{}
@@ -72,7 +76,8 @@ var _ table.PartitionedTable = &partitionedTable{}
 // partition also implements the table.Table interface.
 type partition struct {
 	TableCommon
-	table *partitionedTable
+	table  *partitionedTable
+	cached *cachedTable
 }
 
 // GetPhysicalID implements table.Table GetPhysicalID interface.
@@ -85,9 +90,107 @@ func (p *partition) GetPartitionedTable() table.PartitionedTable {
 	return p.table
 }
 
+func (p *partition) Init(exec sqlexec.SQLExecutor) error {
+	if p.cached == nil {
+		return nil
+	}
+	return p.cached.Init(exec)
+}
+
+func (p *partition) TryReadFromCache(ts uint64, leaseDuration time.Duration) (kv.MemBuffer, bool) {
+	if p.cached == nil {
+		return nil, false
+	}
+	return p.cached.TryReadFromCache(ts, leaseDuration)
+}
+
+func (p *partition) UpdateLockForRead(ctx context.Context, store kv.Storage, ts uint64, leaseDuration time.Duration) {
+	if p.cached == nil {
+		return
+	}
+	p.cached.UpdateLockForRead(ctx, store, ts, leaseDuration)
+}
+
+func (p *partition) WriteLockAndKeepAlive(ctx context.Context, exit chan struct{}, leasePtr *uint64, wg chan error) {
+	if p.cached == nil {
+		wg <- nil
+		return
+	}
+	p.cached.WriteLockAndKeepAlive(ctx, exit, leasePtr, wg)
+}
+
+func (p *partition) ApplyLocalInvalidation(epoch, commitTS uint64) int {
+	if p.cached == nil {
+		return 0
+	}
+	return p.cached.ApplyLocalInvalidation(epoch, commitTS)
+}
+
+func (p *partition) TryReadFromCacheByKey(ts uint64, leaseDuration time.Duration, key kv.Key) (kv.ValueEntry, bool, bool) {
+	if p.cached == nil {
+		return kv.ValueEntry{}, false, false
+	}
+	return p.cached.TryReadFromCacheByKey(ts, leaseDuration, key)
+}
+
+func (p *partition) StoreKeyInCache(store kv.Storage, ts uint64, leaseDuration time.Duration, key kv.Key, value kv.ValueEntry) {
+	if p.cached == nil {
+		return
+	}
+	p.cached.StoreKeyInCache(store, ts, leaseDuration, key, value)
+}
+
 // GetPartitionedTable implements table.Table GetPartitionedTable interface.
 func (t *partitionedTable) GetPartitionedTable() table.PartitionedTable {
 	return t
+}
+
+func (t *partitionedTable) Init(exec sqlexec.SQLExecutor) error {
+	if t.Meta().TableCacheStatusType == model.TableCacheStatusDisable {
+		return nil
+	}
+	for _, p := range t.partitions {
+		if err := p.Init(exec); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *partitionedTable) TryReadFromCache(_ uint64, _ time.Duration) (kv.MemBuffer, bool) {
+	// Full-table cache on partitioned tables is not enabled in this step.
+	return nil, false
+}
+
+func (t *partitionedTable) UpdateLockForRead(_ context.Context, _ kv.Storage, _ uint64, _ time.Duration) {
+}
+
+func (t *partitionedTable) WriteLockAndKeepAlive(_ context.Context, _ chan struct{}, _ *uint64, wg chan error) {
+	wg <- nil
+}
+
+func (t *partitionedTable) ApplyLocalInvalidation(epoch, commitTS uint64) int {
+	applied := 0
+	for _, p := range t.partitions {
+		applied += p.ApplyLocalInvalidation(epoch, commitTS)
+	}
+	return applied
+}
+
+func (t *partitionedTable) TryReadFromCacheByKey(ts uint64, leaseDuration time.Duration, key kv.Key) (kv.ValueEntry, bool, bool) {
+	part := t.getPartition(tablecodec.DecodeTableID(key))
+	if part == nil {
+		return kv.ValueEntry{}, false, false
+	}
+	return part.TryReadFromCacheByKey(ts, leaseDuration, key)
+}
+
+func (t *partitionedTable) StoreKeyInCache(store kv.Storage, ts uint64, leaseDuration time.Duration, key kv.Key, value kv.ValueEntry) {
+	part := t.getPartition(tablecodec.DecodeTableID(key))
+	if part == nil {
+		return
+	}
+	part.StoreKeyInCache(store, ts, leaseDuration, key, value)
 }
 
 // partitionedTable implements the table.PartitionedTable interface.
@@ -184,6 +287,13 @@ func newPartitionedTable(tbl *TableCommon, tblInfo *model.TableInfo) (table.Part
 		err := initTableCommonWithIndices(&t.TableCommon, tblInfo, p.ID, tbl.Columns, tbl.allocs, tbl.Constraints)
 		if err != nil {
 			return nil, errors.Trace(err)
+		}
+		if tblInfo.TableCacheStatusType != model.TableCacheStatusDisable {
+			cached, cacheErr := newCachedTable(&t.TableCommon)
+			if cacheErr != nil {
+				return nil, errors.Trace(cacheErr)
+			}
+			t.cached = cached.(*cachedTable)
 		}
 		t.table = ret
 		partitions[p.ID] = &t
@@ -1739,6 +1849,48 @@ func checkConstraintForExchangePartition(ctx table.MutateContext, row []types.Da
 		return err
 	}
 	return nil
+}
+
+func (p *partition) addRecord(ctx table.MutateContext, txn kv.Transaction, r []types.Datum, opt *table.AddRecordOpt) (kv.Handle, error) {
+	if p.cached == nil {
+		return p.TableCommon.addRecord(ctx, txn, r, opt)
+	}
+	if atomic.LoadInt64(&p.cached.totalSize) > cachedTableSizeLimit {
+		return nil, table.ErrOptOnCacheTable.GenWithStackByArgs("table too large")
+	}
+	txnCtxAddCachedTable(ctx, p.GetPhysicalID(), p)
+	return p.cached.TableCommon.addRecord(ctx, txn, r, opt)
+}
+
+func (p *partition) removeRecord(ctx table.MutateContext, txn kv.Transaction, h kv.Handle, r []types.Datum, opt *table.RemoveRecordOpt) error {
+	if p.cached == nil {
+		return p.TableCommon.removeRecord(ctx, txn, h, r, opt)
+	}
+	txnCtxAddCachedTable(ctx, p.GetPhysicalID(), p)
+	return p.cached.TableCommon.removeRecord(ctx, txn, h, r, opt)
+}
+
+func (p *partition) updateRecord(ctx table.MutateContext, txn kv.Transaction, h kv.Handle, oldData, newData []types.Datum, touched []bool, opt *table.UpdateRecordOpt) error {
+	if p.cached == nil {
+		return p.TableCommon.updateRecord(ctx, txn, h, oldData, newData, touched, opt)
+	}
+	if atomic.LoadInt64(&p.cached.totalSize) > cachedTableSizeLimit {
+		return table.ErrOptOnCacheTable.GenWithStackByArgs("table too large")
+	}
+	txnCtxAddCachedTable(ctx, p.GetPhysicalID(), p)
+	return p.cached.TableCommon.updateRecord(ctx, txn, h, oldData, newData, touched, opt)
+}
+
+func (p *partition) AddRecord(ctx table.MutateContext, txn kv.Transaction, r []types.Datum, opts ...table.AddRecordOption) (kv.Handle, error) {
+	return p.addRecord(ctx, txn, r, table.NewAddRecordOpt(opts...))
+}
+
+func (p *partition) RemoveRecord(ctx table.MutateContext, txn kv.Transaction, h kv.Handle, r []types.Datum, opts ...table.RemoveRecordOption) error {
+	return p.removeRecord(ctx, txn, h, r, table.NewRemoveRecordOpt(opts...))
+}
+
+func (p *partition) UpdateRecord(ctx table.MutateContext, txn kv.Transaction, h kv.Handle, oldData, newData []types.Datum, touched []bool, opts ...table.UpdateRecordOption) error {
+	return p.updateRecord(ctx, txn, h, oldData, newData, touched, table.NewUpdateRecordOpt(opts...))
 }
 
 // AddRecord implements the AddRecord method for the table.Table interface.

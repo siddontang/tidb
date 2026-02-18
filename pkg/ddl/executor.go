@@ -6533,16 +6533,24 @@ func (e *executor) AlterTableCache(sctx sessionctx.Context, ti ast.Ident) (err e
 		return dbterror.ErrOptOnTemporaryTable.GenWithStackByArgs("alter temporary table cache")
 	}
 
-	if t.Meta().Partition != nil {
-		return dbterror.ErrOptOnCacheTable.GenWithStackByArgs("partition mode")
-	}
-
-	succ, err := checkCacheTableSize(e.store, t.Meta().ID)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	if !succ {
-		return dbterror.ErrOptOnCacheTable.GenWithStackByArgs("table too large")
+	if pi := t.Meta().GetPartitionInfo(); pi != nil {
+		for _, def := range pi.Definitions {
+			succ, sizeErr := checkCacheTableSize(e.store, def.ID)
+			if sizeErr != nil {
+				return errors.Trace(sizeErr)
+			}
+			if !succ {
+				return dbterror.ErrOptOnCacheTable.GenWithStackByArgs("table too large")
+			}
+		}
+	} else {
+		succ, sizeErr := checkCacheTableSize(e.store, t.Meta().ID)
+		if sizeErr != nil {
+			return errors.Trace(sizeErr)
+		}
+		if !succ {
+			return dbterror.ErrOptOnCacheTable.GenWithStackByArgs("table too large")
+		}
 	}
 
 	ctx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnDDL)
@@ -6550,10 +6558,20 @@ func (e *executor) AlterTableCache(sctx sessionctx.Context, ti ast.Ident) (err e
 	// Initialize the cached table meta lock info in `mysql.table_cache_meta`.
 	// The operation shouldn't fail in most cases, and if it does, return the error directly.
 	// This DML and the following DDL is not atomic, that's not a problem.
-	_, _, err = sctx.GetRestrictedSQLExecutor().ExecRestrictedSQL(ctx, nil,
-		"replace into mysql.table_cache_meta values (%?, 'NONE', 0, 0)", t.Meta().ID)
-	if err != nil {
-		return errors.Trace(err)
+	if pi := t.Meta().GetPartitionInfo(); pi != nil {
+		for _, def := range pi.Definitions {
+			_, _, err = sctx.GetRestrictedSQLExecutor().ExecRestrictedSQL(ctx, nil,
+				"replace into mysql.table_cache_meta values (%?, 'NONE', 0, 0)", def.ID)
+			if err != nil {
+				return errors.Trace(err)
+			}
+		}
+	} else {
+		_, _, err = sctx.GetRestrictedSQLExecutor().ExecRestrictedSQL(ctx, nil,
+			"replace into mysql.table_cache_meta values (%?, 'NONE', 0, 0)", t.Meta().ID)
+		if err != nil {
+			return errors.Trace(err)
+		}
 	}
 
 	sctx.SetValue(sessionctx.QueryString, ddlQuery)
