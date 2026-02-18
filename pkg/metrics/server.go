@@ -45,37 +45,39 @@ var (
 	// Eventkill occurs when the server.Kill() function is called.
 	EventKill = "kill"
 
-	ServerEventCounter              *prometheus.CounterVec
-	TimeJumpBackCounter             prometheus.Counter
-	PlanCacheCounter                *prometheus.CounterVec
-	PlanCacheMissCounter            *prometheus.CounterVec
-	PlanCacheInstanceMemoryUsage    *prometheus.GaugeVec
-	PlanCacheInstancePlanNumCounter *prometheus.GaugeVec
-	PlanCacheProcessDuration        *prometheus.HistogramVec
-	ReadFromTableCacheCounter       prometheus.Counter
-	HandShakeErrorCounter           prometheus.Counter
-	GetTokenDurationHistogram       prometheus.Histogram
-	NumOfMultiQueryHistogram        prometheus.Histogram
-	TotalQueryProcHistogram         *prometheus.HistogramVec
-	TotalCopProcHistogram           *prometheus.HistogramVec
-	TotalCopWaitHistogram           *prometheus.HistogramVec
-	CopMVCCRatioHistogram           *prometheus.HistogramVec
-	MaxProcs                        prometheus.Gauge
-	GOGC                            prometheus.Gauge
-	ConnIdleDurationHistogram       *prometheus.HistogramVec
-	ServerInfo                      *prometheus.GaugeVec
-	TokenGauge                      prometheus.Gauge
-	ConfigStatus                    *prometheus.GaugeVec
-	TiFlashQueryTotalCounter        *prometheus.CounterVec
-	TiFlashFailedMPPStoreState      *prometheus.GaugeVec
-	PDAPIExecutionHistogram         *prometheus.HistogramVec
-	PDAPIRequestCounter             *prometheus.CounterVec
-	CPUProfileCounter               prometheus.Counter
-	LoadTableCacheDurationHistogram prometheus.Histogram
-	RCCheckTSWriteConfilictCounter  *prometheus.CounterVec
-	MemoryLimit                     prometheus.Gauge
-	InternalSessions                prometheus.Gauge
-	ActiveUser                      prometheus.Gauge
+	ServerEventCounter                  *prometheus.CounterVec
+	TimeJumpBackCounter                 prometheus.Counter
+	PlanCacheCounter                    *prometheus.CounterVec
+	PlanCacheMissCounter                *prometheus.CounterVec
+	PlanCacheInstanceMemoryUsage        *prometheus.GaugeVec
+	PlanCacheInstancePlanNumCounter     *prometheus.GaugeVec
+	PlanCacheProcessDuration            *prometheus.HistogramVec
+	ReadFromTableCacheCounter           prometheus.Counter
+	CachedTableInvalidationEventCounter *prometheus.CounterVec
+	CachedTableInvalidationApplyCounter *prometheus.CounterVec
+	HandShakeErrorCounter               prometheus.Counter
+	GetTokenDurationHistogram           prometheus.Histogram
+	NumOfMultiQueryHistogram            prometheus.Histogram
+	TotalQueryProcHistogram             *prometheus.HistogramVec
+	TotalCopProcHistogram               *prometheus.HistogramVec
+	TotalCopWaitHistogram               *prometheus.HistogramVec
+	CopMVCCRatioHistogram               *prometheus.HistogramVec
+	MaxProcs                            prometheus.Gauge
+	GOGC                                prometheus.Gauge
+	ConnIdleDurationHistogram           *prometheus.HistogramVec
+	ServerInfo                          *prometheus.GaugeVec
+	TokenGauge                          prometheus.Gauge
+	ConfigStatus                        *prometheus.GaugeVec
+	TiFlashQueryTotalCounter            *prometheus.CounterVec
+	TiFlashFailedMPPStoreState          *prometheus.GaugeVec
+	PDAPIExecutionHistogram             *prometheus.HistogramVec
+	PDAPIRequestCounter                 *prometheus.CounterVec
+	CPUProfileCounter                   prometheus.Counter
+	LoadTableCacheDurationHistogram     prometheus.Histogram
+	RCCheckTSWriteConfilictCounter      *prometheus.CounterVec
+	MemoryLimit                         prometheus.Gauge
+	InternalSessions                    prometheus.Gauge
+	ActiveUser                          prometheus.Gauge
 
 	// TLS
 	TLSVersion *prometheus.CounterVec
@@ -231,6 +233,20 @@ func InitServerMetrics() {
 			Help:      "Counter of query read from table cache.",
 		},
 	)
+	CachedTableInvalidationEventCounter = metricscommon.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "tidb",
+			Subsystem: "server",
+			Name:      "cached_table_invalidation_event_total",
+			Help:      "Counter of cached-table invalidation events.",
+		}, []string{LblType})
+	CachedTableInvalidationApplyCounter = metricscommon.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "tidb",
+			Subsystem: "server",
+			Name:      "cached_table_invalidation_apply_total",
+			Help:      "Counter of applied cached-table invalidations.",
+		}, []string{LblType})
 
 	HandShakeErrorCounter = metricscommon.NewCounter(
 		prometheus.CounterOpts{

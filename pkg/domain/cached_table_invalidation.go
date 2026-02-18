@@ -47,6 +47,8 @@ const (
 	cachedTableInvalidationNotifyBatch      = 256
 	cachedTableInvalidationNotifyQueueSize  = 4096
 	cachedTableInvalidationCoalesceRangeCap = 1024
+	cachedTableInvalidationTypeFull         = "full"
+	cachedTableInvalidationTypeRange        = "range"
 )
 
 type cachedTableInvalidationTarget interface {
@@ -168,6 +170,10 @@ func applyCachedTableInvalidationEventToTargets(event tablecache.CachedTableInva
 	if event.Epoch == 0 {
 		return 0
 	}
+	eventType := cachedTableInvalidationTypeFull
+	if len(event.Ranges) > 0 {
+		eventType = cachedTableInvalidationTypeRange
+	}
 	applied := 0
 	for _, target := range targets {
 		if len(event.Ranges) > 0 {
@@ -177,6 +183,10 @@ func applyCachedTableInvalidationEventToTargets(event tablecache.CachedTableInva
 			}
 		}
 		applied += target.ApplyLocalInvalidation(event.Epoch, event.CommitTS)
+	}
+	metrics.CachedTableInvalidationEventCounter.WithLabelValues(eventType).Inc()
+	if applied > 0 {
+		metrics.CachedTableInvalidationApplyCounter.WithLabelValues(eventType).Add(float64(applied))
 	}
 	return applied
 }

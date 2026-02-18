@@ -19,7 +19,9 @@ import (
 	"testing"
 
 	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/metrics"
 	tablecache "github.com/pingcap/tidb/pkg/table/tables"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,6 +31,16 @@ type mockCachedTableInvalidationTarget struct {
 	called   int
 	ret      int
 	ranges   []kv.KeyRange
+}
+
+type metricWriter interface {
+	Write(*dto.Metric) error
+}
+
+func readCounterValue(writer metricWriter) float64 {
+	out := &dto.Metric{}
+	_ = writer.Write(out)
+	return out.GetCounter().GetValue()
 }
 
 func (m *mockCachedTableInvalidationTarget) ApplyLocalInvalidation(epoch, commitTS uint64) int {
@@ -91,6 +103,45 @@ func TestApplyCachedTableInvalidationEventSkipZeroEpoch(t *testing.T) {
 	applied := applyCachedTableInvalidationEventToTargets(event, []cachedTableInvalidationTarget{t1})
 	require.Equal(t, 0, applied)
 	require.Equal(t, 0, t1.called)
+}
+
+func TestApplyCachedTableInvalidationEventMetrics(t *testing.T) {
+	fullEventCounter := metrics.CachedTableInvalidationEventCounter.WithLabelValues(cachedTableInvalidationTypeFull)
+	rangeEventCounter := metrics.CachedTableInvalidationEventCounter.WithLabelValues(cachedTableInvalidationTypeRange)
+	fullApplyCounter := metrics.CachedTableInvalidationApplyCounter.WithLabelValues(cachedTableInvalidationTypeFull)
+	rangeApplyCounter := metrics.CachedTableInvalidationApplyCounter.WithLabelValues(cachedTableInvalidationTypeRange)
+
+	fullEventBefore := readCounterValue(fullEventCounter)
+	rangeEventBefore := readCounterValue(rangeEventCounter)
+	fullApplyBefore := readCounterValue(fullApplyCounter)
+	rangeApplyBefore := readCounterValue(rangeApplyCounter)
+
+	fullApplied := applyCachedTableInvalidationEventToTargets(
+		tablecache.CachedTableInvalidationEvent{CommitTS: 101},
+		[]cachedTableInvalidationTarget{
+			&mockCachedTableInvalidationTarget{ret: 1},
+			&mockCachedTableInvalidationTarget{ret: 2},
+		},
+	)
+	require.Equal(t, 3, fullApplied)
+
+	rangeApplied := applyCachedTableInvalidationEventToTargets(
+		tablecache.CachedTableInvalidationEvent{
+			CommitTS: 102,
+			Ranges: []kv.KeyRange{
+				{StartKey: kv.Key("a"), EndKey: kv.Key("b")},
+			},
+		},
+		[]cachedTableInvalidationTarget{
+			&mockCachedTableInvalidationTarget{ret: 4},
+		},
+	)
+	require.Equal(t, 4, rangeApplied)
+
+	require.InDelta(t, fullEventBefore+1, readCounterValue(fullEventCounter), 0.001)
+	require.InDelta(t, rangeEventBefore+1, readCounterValue(rangeEventCounter), 0.001)
+	require.InDelta(t, fullApplyBefore+3, readCounterValue(fullApplyCounter), 0.001)
+	require.InDelta(t, rangeApplyBefore+4, readCounterValue(rangeApplyCounter), 0.001)
 }
 
 func TestCoalesceCachedTableInvalidationEvents(t *testing.T) {
