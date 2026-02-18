@@ -204,7 +204,8 @@ func (i *segmentIndex) invalidate(spans []keySpan, newEpoch uint64) int {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	if len(spans) == 0 {
+	fullInvalidation := len(spans) == 0
+	if fullInvalidation {
 		spans = []keySpan{{}}
 	}
 
@@ -214,6 +215,12 @@ func (i *segmentIndex) invalidate(spans []keySpan, newEpoch uint64) int {
 		if seg.epoch < newEpoch && overlapsAny(seg.span, spans) {
 			removed++
 			continue
+		}
+		// For partial invalidation, unaffected segments remain valid for subsequent reads.
+		// Promote their epoch to the latest observed epoch so TryReadFromCacheByKey does not
+		// treat them as stale due to table-level epoch advancement.
+		if !fullInvalidation && seg.epoch < newEpoch {
+			seg.epoch = newEpoch
 		}
 		keep = append(keep, seg)
 	}

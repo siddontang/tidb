@@ -47,6 +47,8 @@ type CachedTableSupport interface {
 	// to handle cached table when committing txn.
 	// The handle argument should implement `table.CachedTable` interface, but here is `any` to avoid import cycle.
 	AddCachedTableHandleToTxn(tableID int64, handle any)
+	// AddCachedTableInvalidationRangeToTxn appends one invalidation key range for the cached table.
+	AddCachedTableInvalidationRangeToTxn(tableID int64, startKey, endKey []byte)
 }
 
 // TemporaryTableHandler is used by `table.Table` to handle temporary table.

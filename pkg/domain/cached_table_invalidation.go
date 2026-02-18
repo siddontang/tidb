@@ -52,6 +52,10 @@ type cachedTableInvalidationTarget interface {
 	ApplyLocalInvalidation(epoch, commitTS uint64) int
 }
 
+type cachedTableRangeInvalidationTarget interface {
+	ApplyLocalInvalidationByRanges(epoch, commitTS uint64, ranges []kv.KeyRange) int
+}
+
 type cachedTableInvalidationEventKey struct {
 	tableID    int64
 	physicalID int64
@@ -107,6 +111,12 @@ func applyCachedTableInvalidationEventToTargets(event tablecache.CachedTableInva
 	}
 	applied := 0
 	for _, target := range targets {
+		if len(event.Ranges) > 0 {
+			if rangeTarget, ok := target.(cachedTableRangeInvalidationTarget); ok {
+				applied += rangeTarget.ApplyLocalInvalidationByRanges(event.Epoch, event.CommitTS, event.Ranges)
+				continue
+			}
+		}
 		applied += target.ApplyLocalInvalidation(event.Epoch, event.CommitTS)
 	}
 	return applied

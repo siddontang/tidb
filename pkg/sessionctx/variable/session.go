@@ -195,6 +195,9 @@ type TxnCtxNeedToRestore struct {
 
 	// CachedTables is not nil if the transaction write on cached table.
 	CachedTables map[int64]any
+	// CachedTableInvalidationRanges collects row-key ranges touched by cached-table writes in this txn.
+	// It is keyed by physical table ID used in TxnCtx.CachedTables.
+	CachedTableInvalidationRanges map[int64][]kv.KeyRange
 
 	// InsertTTLRowsCount counts how many rows are inserted in this statement
 	InsertTTLRowsCount int
@@ -424,6 +427,7 @@ func (tc *TransactionContext) Cleanup() {
 	tc.pessimisticLockCache = nil
 	tc.CurrentStmtPessimisticLockCache = nil
 	tc.IsStaleness = false
+	tc.CachedTableInvalidationRanges = nil
 	tc.Savepoints = nil
 	tc.EnableMDL = false
 }
@@ -456,11 +460,23 @@ func (tc *TransactionContext) GetCurrentSavepoint() TxnCtxNeedToRestore {
 	for k, v := range tc.TableDeltaMap {
 		tableDeltaMap[k] = v.Clone()
 	}
+	cachedTableInvalidationRanges := make(map[int64][]kv.KeyRange, len(tc.CachedTableInvalidationRanges))
+	for tid, ranges := range tc.CachedTableInvalidationRanges {
+		cloned := make([]kv.KeyRange, 0, len(ranges))
+		for _, keyRange := range ranges {
+			cloned = append(cloned, kv.KeyRange{
+				StartKey: keyRange.StartKey.Clone(),
+				EndKey:   keyRange.EndKey.Clone(),
+			})
+		}
+		cachedTableInvalidationRanges[tid] = cloned
+	}
 	return TxnCtxNeedToRestore{
-		TableDeltaMap:        tableDeltaMap,
-		pessimisticLockCache: maps.Clone(tc.pessimisticLockCache),
-		CachedTables:         maps.Clone(tc.CachedTables),
-		InsertTTLRowsCount:   tc.InsertTTLRowsCount,
+		TableDeltaMap:                 tableDeltaMap,
+		pessimisticLockCache:          maps.Clone(tc.pessimisticLockCache),
+		CachedTables:                  maps.Clone(tc.CachedTables),
+		CachedTableInvalidationRanges: cachedTableInvalidationRanges,
+		InsertTTLRowsCount:            tc.InsertTTLRowsCount,
 	}
 }
 
@@ -469,6 +485,7 @@ func (tc *TransactionContext) RestoreBySavepoint(savepoint TxnCtxNeedToRestore) 
 	tc.TableDeltaMap = savepoint.TableDeltaMap
 	tc.pessimisticLockCache = savepoint.pessimisticLockCache
 	tc.CachedTables = savepoint.CachedTables
+	tc.CachedTableInvalidationRanges = savepoint.CachedTableInvalidationRanges
 	tc.InsertTTLRowsCount = savepoint.InsertTTLRowsCount
 }
 

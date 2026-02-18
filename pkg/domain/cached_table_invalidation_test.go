@@ -17,6 +17,7 @@ package domain
 import (
 	"testing"
 
+	"github.com/pingcap/tidb/pkg/kv"
 	tablecache "github.com/pingcap/tidb/pkg/table/tables"
 	"github.com/stretchr/testify/require"
 )
@@ -26,12 +27,21 @@ type mockCachedTableInvalidationTarget struct {
 	commitTS uint64
 	called   int
 	ret      int
+	ranges   []kv.KeyRange
 }
 
 func (m *mockCachedTableInvalidationTarget) ApplyLocalInvalidation(epoch, commitTS uint64) int {
 	m.epoch = epoch
 	m.commitTS = commitTS
 	m.called++
+	return m.ret
+}
+
+func (m *mockCachedTableInvalidationTarget) ApplyLocalInvalidationByRanges(epoch, commitTS uint64, ranges []kv.KeyRange) int {
+	m.epoch = epoch
+	m.commitTS = commitTS
+	m.called++
+	m.ranges = ranges
 	return m.ret
 }
 
@@ -54,6 +64,23 @@ func TestApplyCachedTableInvalidationEvent(t *testing.T) {
 	require.Equal(t, 1, t2.called)
 	require.Equal(t, uint64(99), t1.epoch)
 	require.Equal(t, uint64(99), t2.epoch)
+}
+
+func TestApplyCachedTableInvalidationEventWithRanges(t *testing.T) {
+	t1 := &mockCachedTableInvalidationTarget{ret: 1}
+	event := tablecache.CachedTableInvalidationEvent{
+		CommitTS: 99,
+		Ranges: []kv.KeyRange{
+			{StartKey: kv.Key("k1"), EndKey: kv.Key("k2")},
+		},
+	}
+
+	applied := applyCachedTableInvalidationEventToTargets(event, []cachedTableInvalidationTarget{t1})
+	require.Equal(t, 1, applied)
+	require.Equal(t, 1, t1.called)
+	require.Len(t, t1.ranges, 1)
+	require.Equal(t, kv.Key("k1"), t1.ranges[0].StartKey)
+	require.Equal(t, kv.Key("k2"), t1.ranges[0].EndKey)
 }
 
 func TestApplyCachedTableInvalidationEventSkipZeroEpoch(t *testing.T) {

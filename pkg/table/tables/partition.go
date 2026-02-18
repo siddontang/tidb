@@ -120,10 +120,14 @@ func (p *partition) WriteLockAndKeepAlive(ctx context.Context, exit chan struct{
 }
 
 func (p *partition) ApplyLocalInvalidation(epoch, commitTS uint64) int {
+	return p.ApplyLocalInvalidationByRanges(epoch, commitTS, nil)
+}
+
+func (p *partition) ApplyLocalInvalidationByRanges(epoch, commitTS uint64, ranges []kv.KeyRange) int {
 	if p.cached == nil {
 		return 0
 	}
-	return p.cached.ApplyLocalInvalidation(epoch, commitTS)
+	return p.cached.ApplyLocalInvalidationByRanges(epoch, commitTS, ranges)
 }
 
 func (p *partition) TryReadFromCacheByKey(ts uint64, leaseDuration time.Duration, key kv.Key) (kv.ValueEntry, bool, bool) {
@@ -170,9 +174,13 @@ func (t *partitionedTable) WriteLockAndKeepAlive(_ context.Context, _ chan struc
 }
 
 func (t *partitionedTable) ApplyLocalInvalidation(epoch, commitTS uint64) int {
+	return t.ApplyLocalInvalidationByRanges(epoch, commitTS, nil)
+}
+
+func (t *partitionedTable) ApplyLocalInvalidationByRanges(epoch, commitTS uint64, ranges []kv.KeyRange) int {
 	applied := 0
 	for _, p := range t.partitions {
-		applied += p.ApplyLocalInvalidation(epoch, commitTS)
+		applied += p.ApplyLocalInvalidationByRanges(epoch, commitTS, ranges)
 	}
 	return applied
 }
@@ -1859,7 +1867,11 @@ func (p *partition) addRecord(ctx table.MutateContext, txn kv.Transaction, r []t
 		return nil, table.ErrOptOnCacheTable.GenWithStackByArgs("table too large")
 	}
 	txnCtxAddCachedTable(ctx, p.GetPhysicalID(), p)
-	return p.cached.TableCommon.addRecord(ctx, txn, r, opt)
+	recordID, err := p.cached.TableCommon.addRecord(ctx, txn, r, opt)
+	if err == nil && recordID != nil {
+		txnCtxAddCachedTableHandleRange(ctx, p.GetPhysicalID(), recordID)
+	}
+	return recordID, err
 }
 
 func (p *partition) removeRecord(ctx table.MutateContext, txn kv.Transaction, h kv.Handle, r []types.Datum, opt *table.RemoveRecordOpt) error {
@@ -1867,7 +1879,11 @@ func (p *partition) removeRecord(ctx table.MutateContext, txn kv.Transaction, h 
 		return p.TableCommon.removeRecord(ctx, txn, h, r, opt)
 	}
 	txnCtxAddCachedTable(ctx, p.GetPhysicalID(), p)
-	return p.cached.TableCommon.removeRecord(ctx, txn, h, r, opt)
+	err := p.cached.TableCommon.removeRecord(ctx, txn, h, r, opt)
+	if err == nil {
+		txnCtxAddCachedTableHandleRange(ctx, p.GetPhysicalID(), h)
+	}
+	return err
 }
 
 func (p *partition) updateRecord(ctx table.MutateContext, txn kv.Transaction, h kv.Handle, oldData, newData []types.Datum, touched []bool, opt *table.UpdateRecordOpt) error {
@@ -1878,7 +1894,11 @@ func (p *partition) updateRecord(ctx table.MutateContext, txn kv.Transaction, h 
 		return table.ErrOptOnCacheTable.GenWithStackByArgs("table too large")
 	}
 	txnCtxAddCachedTable(ctx, p.GetPhysicalID(), p)
-	return p.cached.TableCommon.updateRecord(ctx, txn, h, oldData, newData, touched, opt)
+	err := p.cached.TableCommon.updateRecord(ctx, txn, h, oldData, newData, touched, opt)
+	if err == nil {
+		txnCtxAddCachedTableHandleRange(ctx, p.GetPhysicalID(), h)
+	}
+	return err
 }
 
 func (p *partition) AddRecord(ctx table.MutateContext, txn kv.Transaction, r []types.Datum, opts ...table.AddRecordOption) (kv.Handle, error) {

@@ -17,6 +17,7 @@ package tblsession
 import (
 	"github.com/pingcap/tidb/pkg/expression/exprctx"
 	infoschema "github.com/pingcap/tidb/pkg/infoschema/context"
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/autoid"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/sessionctx"
@@ -151,6 +152,22 @@ func (ctx *MutateContext) AddCachedTableHandleToTxn(tableID int64, handle any) {
 	if _, ok := txnCtx.CachedTables[tableID]; !ok {
 		txnCtx.CachedTables[tableID] = handle
 	}
+}
+
+// AddCachedTableInvalidationRangeToTxn implements `CachedTableSupport` interface.
+func (ctx *MutateContext) AddCachedTableInvalidationRangeToTxn(tableID int64, startKey, endKey []byte) {
+	txnCtx := ctx.vars().TxnCtx
+	if txnCtx.CachedTableInvalidationRanges == nil {
+		txnCtx.CachedTableInvalidationRanges = make(map[int64][]kv.KeyRange)
+	}
+	ranges := txnCtx.CachedTableInvalidationRanges[tableID]
+	if len(ranges) >= 64 {
+		return
+	}
+	txnCtx.CachedTableInvalidationRanges[tableID] = append(ranges, kv.KeyRange{
+		StartKey: kv.Key(startKey).Clone(),
+		EndKey:   kv.Key(endKey).Clone(),
+	})
 }
 
 // GetTemporaryTableSupport implements the MutateContext interface.

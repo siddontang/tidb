@@ -264,10 +264,13 @@ Performance tests:
   - Added partition-aware cached-table interfaces for point-get / hot-range cache and write-path invalidation hooks.
   - Fixed stale-read issue after partition writes by always applying local invalidation on commit (sync and async modes).
   - Refined invalidation target resolution to prefer physical partition targets and avoid broad parent-table invalidation when a physical target is resolved.
+  - Added row-key range collection in transaction context for cached-table writes and propagated ranges through local fast-path invalidation events.
+  - Updated segment invalidation to keep untouched hot segments valid across partial invalidation epochs (epoch promotion), reducing avoidable cache misses after unrelated writes.
   - Added coverage:
     - Unit/integration tests for partition cached-table hot-range freshness and partition DDL cache path.
     - Integration test case in `tests/integrationtest/t/table/cache.test`.
     - Benchmarks for cached-table invalidation path and partitioned invalidation path.
+    - Unit tests for range-scoped invalidation and segment epoch promotion behavior.
 
 ### 2026-02-16 (initial refactor slices)
 

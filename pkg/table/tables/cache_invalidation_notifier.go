@@ -18,6 +18,8 @@ import (
 	"context"
 	"slices"
 	"sync"
+
+	"github.com/pingcap/tidb/pkg/kv"
 )
 
 // CachedTableInvalidationEvent is the public invalidation event payload.
@@ -27,6 +29,7 @@ type CachedTableInvalidationEvent struct {
 	PhysicalID int64
 	Epoch      uint64
 	CommitTS   uint64
+	Ranges     []kv.KeyRange
 }
 
 type cachedTableInvalidationNotifier interface {

@@ -255,6 +255,14 @@ func TestCachedTableHotRangePointGet(t *testing.T) {
 	tk.MustQuery("select * from hot_point where id in (1, 2) order by id").Check(testkit.Rows("1 10", "2 20"))
 	require.True(t, tk.Session().GetSessionVars().StmtCtx.ReadFromTableCache)
 
+	tk.MustExec("begin")
+	tk.MustExec("update hot_point set v = 11 where id = 1")
+	tk.MustExec("commit")
+	tk.MustQuery("select * from hot_point where id = 1").Check(testkit.Rows("1 11"))
+	require.False(t, tk.Session().GetSessionVars().StmtCtx.ReadFromTableCache)
+	tk.MustQuery("select * from hot_point where id = 2").Check(testkit.Rows("2 20"))
+	require.True(t, tk.Session().GetSessionVars().StmtCtx.ReadFromTableCache)
+
 	tk.MustExec("alter table hot_point nocache")
 }
 

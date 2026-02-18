@@ -404,13 +404,31 @@ func (c *cachedTable) AddRecord(sctx table.MutateContext, txn kv.Transaction, r 
 		return nil, table.ErrOptOnCacheTable.GenWithStackByArgs("table too large")
 	}
 	txnCtxAddCachedTable(sctx, c.GetPhysicalID(), c)
-	return c.TableCommon.AddRecord(sctx, txn, r, opts...)
+	recordID, err = c.TableCommon.AddRecord(sctx, txn, r, opts...)
+	if err == nil && recordID != nil {
+		txnCtxAddCachedTableHandleRange(sctx, c.GetPhysicalID(), recordID)
+	}
+	return recordID, err
 }
 
 func txnCtxAddCachedTable(sctx table.MutateContext, tid int64, handle table.CachedTable) {
 	if s, ok := sctx.GetCachedTableSupport(); ok {
 		s.AddCachedTableHandleToTxn(tid, handle)
 	}
+}
+
+func txnCtxAddCachedTableInvalidationRange(sctx table.MutateContext, tid int64, startKey, endKey kv.Key) {
+	if s, ok := sctx.GetCachedTableSupport(); ok {
+		s.AddCachedTableInvalidationRangeToTxn(tid, startKey, endKey)
+	}
+}
+
+func txnCtxAddCachedTableHandleRange(sctx table.MutateContext, tid int64, h kv.Handle) {
+	if h == nil {
+		return
+	}
+	startKey := tablecodec.EncodeRowKeyWithHandle(tid, h)
+	txnCtxAddCachedTableInvalidationRange(sctx, tid, startKey, startKey.Next())
 }
 
 // UpdateRecord implements table.Table
@@ -420,13 +438,21 @@ func (c *cachedTable) UpdateRecord(ctx table.MutateContext, txn kv.Transaction, 
 		return table.ErrOptOnCacheTable.GenWithStackByArgs("table too large")
 	}
 	txnCtxAddCachedTable(ctx, c.GetPhysicalID(), c)
-	return c.TableCommon.UpdateRecord(ctx, txn, h, oldData, newData, touched, opts...)
+	err := c.TableCommon.UpdateRecord(ctx, txn, h, oldData, newData, touched, opts...)
+	if err == nil {
+		txnCtxAddCachedTableHandleRange(ctx, c.GetPhysicalID(), h)
+	}
+	return err
 }
 
 // RemoveRecord implements table.Table RemoveRecord interface.
 func (c *cachedTable) RemoveRecord(sctx table.MutateContext, txn kv.Transaction, h kv.Handle, r []types.Datum, opts ...table.RemoveRecordOption) error {
 	txnCtxAddCachedTable(sctx, c.GetPhysicalID(), c)
-	return c.TableCommon.RemoveRecord(sctx, txn, h, r, opts...)
+	err := c.TableCommon.RemoveRecord(sctx, txn, h, r, opts...)
+	if err == nil {
+		txnCtxAddCachedTableHandleRange(sctx, c.GetPhysicalID(), h)
+	}
+	return err
 }
 
 // TestMockRenewLeaseABA2 is used by test function TestRenewLeaseABAFailPoint.
@@ -491,11 +517,28 @@ func (c *cachedTable) WriteLockAndKeepAlive(ctx context.Context, exit chan struc
 
 // ApplyLocalInvalidation implements table.CachedTable.
 func (c *cachedTable) ApplyLocalInvalidation(epoch, commitTS uint64) int {
+	return c.ApplyLocalInvalidationByRanges(epoch, commitTS, nil)
+}
+
+// ApplyLocalInvalidationByRanges applies local invalidation with optional row-key ranges.
+func (c *cachedTable) ApplyLocalInvalidationByRanges(epoch, commitTS uint64, ranges []kv.KeyRange) int {
+	spans := make([]keySpan, 0, len(ranges))
+	for _, keyRange := range ranges {
+		if len(keyRange.StartKey) == 0 || len(keyRange.EndKey) == 0 {
+			spans = nil
+			break
+		}
+		spans = append(spans, keySpan{
+			start: keyRange.StartKey.Clone(),
+			end:   keyRange.EndKey.Clone(),
+		})
+	}
 	return c.applyInvalidation(cacheInvalidationEvent{
 		tableID:    c.tableID,
 		physicalID: c.GetPhysicalID(),
 		epoch:      epoch,
 		commitTS:   commitTS,
+		spans:      spans,
 	})
 }
 

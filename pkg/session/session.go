@@ -590,7 +590,7 @@ func (s *session) doCommit(ctx context.Context) error {
 	if err != nil {
 		err = s.handleAssertionFailure(ctx, err)
 	} else if len(cachedTables) > 0 {
-		applyCachedTableInvalidationEvents(s, cachedTables, s.txn.lastCommitTS)
+		applyCachedTableInvalidationEvents(s, cachedTables, sessVars.TxnCtx.CachedTableInvalidationRanges, s.txn.lastCommitTS)
 	}
 	return err
 }
@@ -605,21 +605,35 @@ func nextCachedTableInvalidationEpoch(commitTS uint64) uint64 {
 	return atomic.AddUint64(&cachedTableInvalidationEpoch, 1)
 }
 
-func applyCachedTableInvalidationEvents(s *session, tables map[int64]any, commitTS uint64) {
+type cachedTableRangeInvalidationTarget interface {
+	ApplyLocalInvalidationByRanges(epoch, commitTS uint64, ranges []kv.KeyRange) int
+}
+
+func applyCachedTableInvalidationEvents(s *session, tables map[int64]any, invalidationRanges map[int64][]kv.KeyRange, commitTS uint64) {
 	events := make([]tablecache.CachedTableInvalidationEvent, 0, len(tables))
 	epoch := nextCachedTableInvalidationEpoch(commitTS)
-	for _, raw := range tables {
+	for tid, raw := range tables {
 		tbl := raw.(table.CachedTable)
 		physicalID := tbl.Meta().ID
 		if physicalTbl, ok := tbl.(table.PhysicalTable); ok {
 			physicalID = physicalTbl.GetPhysicalID()
 		}
-		tbl.ApplyLocalInvalidation(epoch, commitTS)
+		ranges := invalidationRanges[tid]
+		if len(ranges) > 0 {
+			if rangeTarget, ok := tbl.(cachedTableRangeInvalidationTarget); ok {
+				rangeTarget.ApplyLocalInvalidationByRanges(epoch, commitTS, ranges)
+			} else {
+				tbl.ApplyLocalInvalidation(epoch, commitTS)
+			}
+		} else {
+			tbl.ApplyLocalInvalidation(epoch, commitTS)
+		}
 		events = append(events, tablecache.CachedTableInvalidationEvent{
 			TableID:    tbl.Meta().ID,
 			PhysicalID: physicalID,
 			Epoch:      epoch,
 			CommitTS:   commitTS,
+			Ranges:     ranges,
 		})
 	}
 	if len(events) > 0 {

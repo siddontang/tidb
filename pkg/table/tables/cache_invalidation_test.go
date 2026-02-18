@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -137,4 +138,33 @@ func TestApplyInvalidationLegacyPhysicalTableIDFallback(t *testing.T) {
 	})
 	require.GreaterOrEqual(t, removed, 1)
 	require.Nil(t, c.cacheData.Load())
+}
+
+func TestApplyInvalidationByRanges(t *testing.T) {
+	c := &cachedTable{
+		TableCommon: TableCommon{tableID: 42, physicalTableID: 42},
+		segments:    newSegmentIndex(),
+	}
+	err := c.segments.upsert(cacheSegment{
+		span:  keySpan{start: key("a"), end: key("b")},
+		epoch: 1,
+	})
+	require.NoError(t, err)
+	err = c.segments.upsert(cacheSegment{
+		span:  keySpan{start: key("c"), end: key("d")},
+		epoch: 1,
+	})
+	require.NoError(t, err)
+
+	removed := c.ApplyLocalInvalidationByRanges(2, 2, []kv.KeyRange{
+		{StartKey: key("a"), EndKey: key("b")},
+	})
+	require.Equal(t, 1, removed)
+
+	_, ok, getErr := c.segments.get(keySpan{start: key("a"), end: key("b")})
+	require.NoError(t, getErr)
+	require.False(t, ok)
+	_, ok, getErr = c.segments.get(keySpan{start: key("c"), end: key("d")})
+	require.NoError(t, getErr)
+	require.True(t, ok)
 }

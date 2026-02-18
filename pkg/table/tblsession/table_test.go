@@ -125,6 +125,11 @@ func TestSessionMutateContextFields(t *testing.T) {
 	cachedTableSupport.AddCachedTableHandleToTxn(123, handle)
 	cached := sctx.GetSessionVars().TxnCtx.CachedTables[123]
 	require.Same(t, handle, cached)
+	cachedTableSupport.AddCachedTableInvalidationRangeToTxn(123, []byte("k1"), []byte("k2"))
+	ranges := sctx.GetSessionVars().TxnCtx.CachedTableInvalidationRanges[123]
+	require.Len(t, ranges, 1)
+	require.Equal(t, []byte("k1"), []byte(ranges[0].StartKey))
+	require.Equal(t, []byte("k2"), []byte(ranges[0].EndKey))
 	// temporary table support
 	sctx.GetSessionVars().TxnCtx = nil
 	tempTableSupport, ok := ctx.GetTemporaryTableSupport()
