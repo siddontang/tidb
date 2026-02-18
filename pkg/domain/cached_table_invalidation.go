@@ -54,6 +54,8 @@ const (
 	cachedTableInvalidationQueueTypePersist = "persist"
 	cachedTableInvalidationLagSourceNotify  = "notify"
 	cachedTableInvalidationLagSourcePull    = "pull"
+	cachedTableInvalidationPersistTypeInput = "input"
+	cachedTableInvalidationPersistTypeFinal = "coalesced"
 )
 
 type cachedTableInvalidationTarget interface {
@@ -139,6 +141,15 @@ func observeCachedTableInvalidationLag(events []tablecache.CachedTableInvalidati
 		}
 	}
 	metrics.CachedTableInvalidationLagGauge.WithLabelValues(source).Set(maxLagSeconds)
+}
+
+func observeCachedTableInvalidationPersistEventCount(inputCount, finalCount int) {
+	if inputCount > 0 {
+		metrics.CachedTableInvalidationPersistEvent.WithLabelValues(cachedTableInvalidationPersistTypeInput).Add(float64(inputCount))
+	}
+	if finalCount > 0 {
+		metrics.CachedTableInvalidationPersistEvent.WithLabelValues(cachedTableInvalidationPersistTypeFinal).Add(float64(finalCount))
+	}
 }
 
 func mergeCachedTableInvalidationRanges(left, right []kv.KeyRange) []kv.KeyRange {
@@ -455,7 +466,9 @@ func (do *Domain) cachedTableInvalidationPersistLoop() {
 				}
 			}
 			observeCachedTableInvalidationQueueSize(cachedTableInvalidationQueueTypePersist, len(do.cachedTableInvalidationPersistCh))
+			inputCount := len(batch)
 			batch = coalesceCachedTableInvalidationEvents(batch)
+			observeCachedTableInvalidationPersistEventCount(inputCount, len(batch))
 			if err := do.persistCachedTableInvalidationEvents(batch); err != nil && !terror.ErrorEqual(err, infoschema.ErrTableNotExists) {
 				logutil.BgLogger().Warn("persist cached-table invalidation events failed", zap.Error(err), zap.Int("events", len(batch)))
 			}
@@ -526,7 +539,9 @@ func (do *Domain) PersistCachedTableInvalidation(events []tablecache.CachedTable
 	if do == nil || len(events) == 0 {
 		return
 	}
-	err := do.persistCachedTableInvalidationEvents(coalesceCachedTableInvalidationEvents(events))
+	coalesced := coalesceCachedTableInvalidationEvents(events)
+	observeCachedTableInvalidationPersistEventCount(len(events), len(coalesced))
+	err := do.persistCachedTableInvalidationEvents(coalesced)
 	if err == nil || terror.ErrorEqual(err, infoschema.ErrTableNotExists) {
 		return
 	}

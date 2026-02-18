@@ -273,6 +273,8 @@ Performance tests:
   - Added async invalidation queue/liveness observability:
     - queue size gauge by worker type (`persist` / `notify`)
     - propagation lag gauge by source (`notify` / `pull`) based on commit-ts
+  - Added invalidation persistence amplification counters:
+    - persist input event count vs post-coalesce persisted event count
   - Reduced commit-path enqueue overhead for async persist/notify by removing enqueue-time coalescing and deferring coalescing to worker batches, while keeping deep-copy safety for range payloads.
   - Added coverage:
     - Unit/integration tests for partition cached-table hot-range freshness and partition DDL cache path.

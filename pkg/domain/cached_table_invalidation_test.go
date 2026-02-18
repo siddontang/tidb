@@ -388,6 +388,19 @@ func TestObserveCachedTableInvalidationLag(t *testing.T) {
 	require.InDelta(t, 0.0, readGaugeValue(lagGauge), 0.001)
 }
 
+func TestObserveCachedTableInvalidationPersistEventCount(t *testing.T) {
+	inputCounter := metrics.CachedTableInvalidationPersistEvent.WithLabelValues(cachedTableInvalidationPersistTypeInput)
+	finalCounter := metrics.CachedTableInvalidationPersistEvent.WithLabelValues(cachedTableInvalidationPersistTypeFinal)
+
+	inputBefore := readCounterValue(inputCounter)
+	finalBefore := readCounterValue(finalCounter)
+
+	observeCachedTableInvalidationPersistEventCount(3, 1)
+
+	require.InDelta(t, inputBefore+3, readCounterValue(inputCounter), 0.001)
+	require.InDelta(t, finalBefore+1, readCounterValue(finalCounter), 0.001)
+}
+
 func BenchmarkCoalesceCachedTableInvalidationEvents(b *testing.B) {
 	const keyCount = 128
 	events := make([]tablecache.CachedTableInvalidationEvent, 0, keyCount*8)
