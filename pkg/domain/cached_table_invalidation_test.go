@@ -264,16 +264,26 @@ func TestTryEnqueueCachedTableInvalidationPersistCopiesEvents(t *testing.T) {
 		cachedTableInvalidationPersistCh: make(chan cachedTableInvalidationPersistTask, 1),
 	}
 	events := []tablecache.CachedTableInvalidationEvent{
-		{TableID: 11, PhysicalID: 11, CommitTS: 101, Epoch: 101},
+		{
+			TableID:    11,
+			PhysicalID: 11,
+			CommitTS:   101,
+			Epoch:      101,
+			Ranges: []kv.KeyRange{
+				{StartKey: kv.Key("k1"), EndKey: kv.Key("k2")},
+			},
+		},
 	}
 	require.True(t, do.TryEnqueueCachedTableInvalidationPersist(events))
 	events[0].TableID = 999
+	events[0].Ranges[0].StartKey = kv.Key("changed")
 
 	task := <-do.cachedTableInvalidationPersistCh
 	require.Equal(t, int64(11), task.events[0].TableID)
+	require.Equal(t, kv.Key("k1"), task.events[0].Ranges[0].StartKey)
 }
 
-func TestTryEnqueueCachedTableInvalidationPersistCoalesces(t *testing.T) {
+func TestTryEnqueueCachedTableInvalidationPersistPreservesEvents(t *testing.T) {
 	do := &Domain{
 		exit:                             make(chan struct{}),
 		cachedTableInvalidationPersistCh: make(chan cachedTableInvalidationPersistTask, 1),
@@ -284,8 +294,9 @@ func TestTryEnqueueCachedTableInvalidationPersistCoalesces(t *testing.T) {
 	}
 	require.True(t, do.TryEnqueueCachedTableInvalidationPersist(events))
 	task := <-do.cachedTableInvalidationPersistCh
-	require.Len(t, task.events, 1)
-	require.Equal(t, uint64(101), task.events[0].Epoch)
+	require.Len(t, task.events, 2)
+	require.Equal(t, uint64(100), task.events[0].Epoch)
+	require.Equal(t, uint64(101), task.events[1].Epoch)
 }
 
 func TestTryEnqueueCachedTableInvalidationPersistQueueFull(t *testing.T) {
@@ -303,16 +314,26 @@ func TestEnqueueCachedTableInvalidationNotifyCopiesEvents(t *testing.T) {
 		cachedTableInvalidationNotifyCh: make(chan cachedTableInvalidationNotifyTask, 1),
 	}
 	events := []tablecache.CachedTableInvalidationEvent{
-		{TableID: 11, PhysicalID: 11, CommitTS: 101, Epoch: 101},
+		{
+			TableID:    11,
+			PhysicalID: 11,
+			CommitTS:   101,
+			Epoch:      101,
+			Ranges: []kv.KeyRange{
+				{StartKey: kv.Key("k1"), EndKey: kv.Key("k2")},
+			},
+		},
 	}
 	require.True(t, do.enqueueCachedTableInvalidationNotify(events))
 	events[0].TableID = 999
+	events[0].Ranges[0].StartKey = kv.Key("changed")
 
 	task := <-do.cachedTableInvalidationNotifyCh
 	require.Equal(t, int64(11), task.events[0].TableID)
+	require.Equal(t, kv.Key("k1"), task.events[0].Ranges[0].StartKey)
 }
 
-func TestEnqueueCachedTableInvalidationNotifyCoalesces(t *testing.T) {
+func TestEnqueueCachedTableInvalidationNotifyPreservesEvents(t *testing.T) {
 	do := &Domain{
 		exit:                            make(chan struct{}),
 		cachedTableInvalidationNotifyCh: make(chan cachedTableInvalidationNotifyTask, 1),
@@ -323,8 +344,9 @@ func TestEnqueueCachedTableInvalidationNotifyCoalesces(t *testing.T) {
 	}
 	require.True(t, do.enqueueCachedTableInvalidationNotify(events))
 	task := <-do.cachedTableInvalidationNotifyCh
-	require.Len(t, task.events, 1)
-	require.Equal(t, uint64(101), task.events[0].Epoch)
+	require.Len(t, task.events, 2)
+	require.Equal(t, uint64(100), task.events[0].Epoch)
+	require.Equal(t, uint64(101), task.events[1].Epoch)
 }
 
 func TestEnqueueCachedTableInvalidationNotifyQueueFull(t *testing.T) {
@@ -396,5 +418,24 @@ func BenchmarkEnqueueCachedTableInvalidationNotify(b *testing.B) {
 			b.Fatal("enqueue failed")
 		}
 		<-do.cachedTableInvalidationNotifyCh
+	}
+}
+
+func BenchmarkEnqueueCachedTableInvalidationPersist(b *testing.B) {
+	do := &Domain{
+		exit:                             make(chan struct{}),
+		cachedTableInvalidationPersistCh: make(chan cachedTableInvalidationPersistTask, 1),
+	}
+	events := []tablecache.CachedTableInvalidationEvent{
+		{TableID: 11, PhysicalID: 11, CommitTS: 100, Epoch: 100},
+		{TableID: 11, PhysicalID: 11, CommitTS: 101, Epoch: 101},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !do.enqueueCachedTableInvalidationPersist(events) {
+			b.Fatal("enqueue failed")
+		}
+		<-do.cachedTableInvalidationPersistCh
 	}
 }

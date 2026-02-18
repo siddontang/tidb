@@ -98,6 +98,19 @@ func cloneCachedTableInvalidationRanges(ranges []kv.KeyRange) []kv.KeyRange {
 	return out
 }
 
+func cloneCachedTableInvalidationEvents(events []tablecache.CachedTableInvalidationEvent) []tablecache.CachedTableInvalidationEvent {
+	if len(events) == 0 {
+		return nil
+	}
+	out := make([]tablecache.CachedTableInvalidationEvent, 0, len(events))
+	for _, event := range events {
+		event = normalizeCachedTableInvalidationEvent(event)
+		event.Ranges = cloneCachedTableInvalidationRanges(event.Ranges)
+		out = append(out, event)
+	}
+	return out
+}
+
 func mergeCachedTableInvalidationRanges(left, right []kv.KeyRange) []kv.KeyRange {
 	if len(left) == 0 || len(right) == 0 {
 		// Empty means full-table invalidation.
@@ -236,7 +249,7 @@ func (do *Domain) enqueueCachedTableInvalidationNotify(events []tablecache.Cache
 		return false
 	}
 	task := cachedTableInvalidationNotifyTask{
-		events: append([]tablecache.CachedTableInvalidationEvent(nil), coalesceCachedTableInvalidationEvents(events)...),
+		events: cloneCachedTableInvalidationEvents(events),
 	}
 	select {
 	case <-do.exit:
@@ -451,7 +464,7 @@ func (do *Domain) enqueueCachedTableInvalidationPersist(events []tablecache.Cach
 		return false
 	}
 	task := cachedTableInvalidationPersistTask{
-		events: append([]tablecache.CachedTableInvalidationEvent(nil), coalesceCachedTableInvalidationEvents(events)...),
+		events: cloneCachedTableInvalidationEvents(events),
 	}
 	select {
 	case <-do.exit:
