@@ -200,6 +200,45 @@ func TestCoalesceCachedTableInvalidationEventsMergeRanges(t *testing.T) {
 	require.Len(t, coalesced[0].Ranges, 2)
 }
 
+func TestCoalesceCachedTableInvalidationEventsDeduplicateRanges(t *testing.T) {
+	events := []tablecache.CachedTableInvalidationEvent{
+		{
+			TableID:    11,
+			PhysicalID: 11,
+			CommitTS:   100,
+			Epoch:      100,
+			Ranges: []kv.KeyRange{
+				{StartKey: kv.Key("k1"), EndKey: kv.Key("k2")},
+			},
+		},
+		{
+			TableID:    11,
+			PhysicalID: 11,
+			CommitTS:   101,
+			Epoch:      101,
+			Ranges: []kv.KeyRange{
+				{StartKey: kv.Key("k1"), EndKey: kv.Key("k2")},
+			},
+		},
+	}
+	coalesced := coalesceCachedTableInvalidationEvents(events)
+	require.Len(t, coalesced, 1)
+	require.Equal(t, uint64(101), coalesced[0].Epoch)
+	require.Len(t, coalesced[0].Ranges, 1)
+}
+
+func TestMergeCachedTableInvalidationRangesDuplicateDoesNotOverflow(t *testing.T) {
+	left := make([]kv.KeyRange, 0, cachedTableInvalidationCoalesceRangeCap)
+	for i := 0; i < cachedTableInvalidationCoalesceRangeCap; i++ {
+		start := kv.Key{byte(i >> 8), byte(i)}
+		end := kv.Key{byte(i >> 8), byte(i), 0xff}
+		left = append(left, kv.KeyRange{StartKey: start, EndKey: end})
+	}
+	right := cloneCachedTableInvalidationRanges(left)
+	merged := mergeCachedTableInvalidationRanges(left, right)
+	require.Len(t, merged, cachedTableInvalidationCoalesceRangeCap)
+}
+
 func TestCoalesceCachedTableInvalidationEventsFullInvalidationWins(t *testing.T) {
 	events := []tablecache.CachedTableInvalidationEvent{
 		{

@@ -15,6 +15,7 @@
 package domain
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"strings"
@@ -158,19 +159,42 @@ func observeCachedTableInvalidationEnqueueFallback(fallbackType string) {
 	metrics.CachedTableInvalidationEnqueueFail.WithLabelValues(fallbackType).Inc()
 }
 
+func keyRangeEqual(left, right kv.KeyRange) bool {
+	return bytes.Equal(left.StartKey, right.StartKey) && bytes.Equal(left.EndKey, right.EndKey)
+}
+
+func appendUniqueKeyRange(dst []kv.KeyRange, keyRange kv.KeyRange) []kv.KeyRange {
+	for _, existing := range dst {
+		if keyRangeEqual(existing, keyRange) {
+			return dst
+		}
+	}
+	return append(dst, kv.KeyRange{
+		StartKey: keyRange.StartKey.Clone(),
+		EndKey:   keyRange.EndKey.Clone(),
+	})
+}
+
 func mergeCachedTableInvalidationRanges(left, right []kv.KeyRange) []kv.KeyRange {
 	if len(left) == 0 || len(right) == 0 {
 		// Empty means full-table invalidation.
 		return nil
 	}
-	total := len(left) + len(right)
-	if total > cachedTableInvalidationCoalesceRangeCap {
-		// Degrade to full invalidation when merged ranges are too many.
-		return nil
+	merged := make([]kv.KeyRange, 0, len(left)+len(right))
+	for _, keyRange := range left {
+		merged = appendUniqueKeyRange(merged, keyRange)
+		if len(merged) > cachedTableInvalidationCoalesceRangeCap {
+			// Degrade to full invalidation when merged ranges are too many.
+			return nil
+		}
 	}
-	merged := make([]kv.KeyRange, 0, total)
-	merged = append(merged, cloneCachedTableInvalidationRanges(left)...)
-	merged = append(merged, cloneCachedTableInvalidationRanges(right)...)
+	for _, keyRange := range right {
+		merged = appendUniqueKeyRange(merged, keyRange)
+		if len(merged) > cachedTableInvalidationCoalesceRangeCap {
+			// Degrade to full invalidation when merged ranges are too many.
+			return nil
+		}
+	}
 	return merged
 }
 
