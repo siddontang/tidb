@@ -8,6 +8,8 @@ go_library(
         "inner_server.go",
         "mock_region.go",
         "mvcc.go",
+        "mvcc_read.go",
+        "mvcc_write.go",
         "region.go",
         "server.go",
         "server_batch.go",
