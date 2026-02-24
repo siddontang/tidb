@@ -27,6 +27,7 @@ go_library(
         "builtin_info.go",
         "builtin_info_vec.go",
         "builtin_json.go",
+        "builtin_json_sigs.go",
         "builtin_json_vec.go",
         "builtin_like.go",
         "builtin_like_vec.go",
