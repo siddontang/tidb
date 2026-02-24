@@ -12,6 +12,7 @@ go_library(
         "partition_pruning.go",
         "state_remote.go",
         "tables.go",
+        "tables_ops.go",
         "testutil.go",
     ],
     importpath = "github.com/pingcap/tidb/pkg/table/tables",
