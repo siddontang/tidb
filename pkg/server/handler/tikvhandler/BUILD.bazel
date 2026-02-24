@@ -5,6 +5,8 @@ go_library(
     srcs = [
         "dxf.go",
         "tikv_handler.go",
+        "tikv_handler_info.go",
+        "tikv_handler_table.go",
     ],
     importpath = "github.com/pingcap/tidb/pkg/server/handler/tikvhandler",
     visibility = ["//visibility:public"],
