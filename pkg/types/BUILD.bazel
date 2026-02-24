@@ -39,6 +39,7 @@ go_library(
         "overflow.go",
         "set.go",
         "time.go",
+        "time_duration.go",
         "time_parse.go",
         "truncate.go",
         "vector.go",
