@@ -17,6 +17,7 @@ go_library(
         "convert.go",
         "core_time.go",
         "datum.go",
+        "datum_convert.go",
         "datum_eval.go",
         "enum.go",
         "errors.go",
