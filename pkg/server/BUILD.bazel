@@ -4,6 +4,7 @@ go_library(
     name = "server",
     srcs = [
         "conn.go",
+        "conn_query.go",
         "conn_stmt.go",
         "conn_stmt_params.go",
         "driver.go",
