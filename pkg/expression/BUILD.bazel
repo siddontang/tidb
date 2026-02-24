@@ -30,6 +30,8 @@ go_library(
         "builtin_like.go",
         "builtin_like_vec.go",
         "builtin_math.go",
+        "builtin_math_log.go",
+        "builtin_math_trig.go",
         "builtin_math_vec.go",
         "builtin_miscellaneous.go",
         "builtin_miscellaneous_vec.go",
