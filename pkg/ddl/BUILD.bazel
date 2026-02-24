@@ -60,6 +60,8 @@ go_library(
         "options.go",
         "owner_mgr.go",
         "partition.go",
+        "partition_drop.go",
+        "partition_exchange_reorg.go",
         "placement_policy.go",
         "reorg.go",
         "reorg_util.go",
