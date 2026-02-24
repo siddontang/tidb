@@ -85,6 +85,8 @@ go_library(
         "stats.go",
         "stringer.go",
         "task.go",
+        "task_agg.go",
+        "task_topn.go",
         "telemetry.go",
         "trace.go",
         "util.go",
