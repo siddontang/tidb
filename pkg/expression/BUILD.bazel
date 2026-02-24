@@ -9,6 +9,7 @@ go_library(
         "builtin_cast.go",
         "builtin_cast_sigs.go",
         "builtin_cast_vec.go",
+        "builtin_cast_vec2.go",
         "builtin_compare.go",
         "builtin_compare_ops.go",
         "builtin_compare_sigs.go",
