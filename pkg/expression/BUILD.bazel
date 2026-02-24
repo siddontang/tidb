@@ -56,6 +56,8 @@ go_library(
         "builtin_time_datetime.go",
         "builtin_time_misc.go",
         "builtin_time_vec.go",
+        "builtin_time_vec_calc.go",
+        "builtin_time_vec_format.go",
         "builtin_time_vec_generated.go",
         "builtin_vec.go",
         "builtin_vec_vec.go",
