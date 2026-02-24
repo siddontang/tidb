@@ -43,6 +43,7 @@ go_library(
         "builtin_op.go",
         "builtin_op_vec.go",
         "builtin_other.go",
+        "builtin_other2.go",
         "builtin_other_vec.go",
         "builtin_other_vec_generated.go",
         "builtin_regexp.go",
