@@ -8,6 +8,7 @@ go_library(
         "builtin_arithmetic_vec.go",
         "builtin_cast.go",
         "builtin_cast_sigs.go",
+        "builtin_cast_sigs2.go",
         "builtin_cast_vec.go",
         "builtin_cast_vec2.go",
         "builtin_compare.go",
