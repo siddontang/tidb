@@ -37,6 +37,7 @@ go_library(
         "detach.go",
         "distribute.go",
         "distsql.go",
+        "distsql_index_lookup.go",
         "expand.go",
         "explain.go",
         "foreign_key.go",
