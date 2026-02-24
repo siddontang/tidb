@@ -14,6 +14,7 @@ go_library(
         "estimate.go",
         "fmsketch.go",
         "histogram.go",
+        "histogram_merge.go",
         "index.go",
         "row_sampler.go",
         "sample.go",
