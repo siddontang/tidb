@@ -9,6 +9,9 @@ go_library(
         "mock_bootstrap.go",
         "nontransactional.go",
         "session.go",
+        "session_auth.go",
+        "session_bootstrap.go",
+        "session_bootstrap_finish.go",
         "sync_upgrade.go",
         "testutil.go",  #keep
         "tidb.go",
@@ -120,7 +123,7 @@ go_library(
         "//pkg/util/parser",
         "//pkg/util/ranger/context",
         "//pkg/util/redact",
-        "//pkg/util/sem/compat",
+        "//pkg/util/sem",
         "//pkg/util/sli",
         "//pkg/util/sqlescape",
         "//pkg/util/sqlexec",
