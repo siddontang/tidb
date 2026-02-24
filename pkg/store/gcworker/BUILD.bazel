@@ -2,7 +2,10 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "gcworker",
-    srcs = ["gc_worker.go"],
+    srcs = [
+        "gc_worker.go",
+        "gc_worker_ops.go",
+    ],
     importpath = "github.com/pingcap/tidb/pkg/store/gcworker",
     visibility = ["//visibility:public"],
     deps = [
