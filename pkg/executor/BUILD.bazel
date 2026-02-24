@@ -80,6 +80,8 @@ go_library(
         "show_stats.go",
         "shuffle.go",
         "simple.go",
+        "simple_system.go",
+        "simple_user.go",
         "slow_query.go",
         "split.go",
         "stmtsummary.go",
