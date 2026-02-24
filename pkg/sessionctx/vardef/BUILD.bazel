@@ -6,6 +6,8 @@ go_library(
         "runtime.go",
         "sysvar.go",
         "tidb_vars.go",
+        "tidb_vars_defaults.go",
+        "tidb_vars_session_global.go",
     ],
     importpath = "github.com/pingcap/tidb/pkg/sessionctx/vardef",
     visibility = ["//visibility:public"],
