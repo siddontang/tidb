@@ -2,7 +2,10 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "tablecodec",
-    srcs = ["tablecodec.go"],
+    srcs = [
+        "tablecodec.go",
+        "tablecodec_index.go",
+    ],
     importpath = "github.com/pingcap/tidb/pkg/tablecodec",
     visibility = ["//visibility:public"],
     deps = [
