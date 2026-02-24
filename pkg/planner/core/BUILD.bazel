@@ -14,6 +14,7 @@ go_library(
         "core_init.go",
         "encode.go",
         "exhaust_physical_plans.go",
+        "exhaust_physical_plans_hints.go",
         "expression_codec_fn.go",
         "expression_rewriter.go",
         "find_best_task.go",
