@@ -17,6 +17,7 @@ go_library(
         "metrics_schema.go",
         "sieve.go",
         "tables.go",
+        "tables_server_info.go",
     ],
     importpath = "github.com/pingcap/tidb/pkg/infoschema",
     visibility = ["//visibility:public"],
