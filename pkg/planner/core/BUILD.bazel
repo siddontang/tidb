@@ -17,6 +17,8 @@ go_library(
         "expression_codec_fn.go",
         "expression_rewriter.go",
         "find_best_task.go",
+        "find_best_task_candidate.go",
+        "find_best_task_convert.go",
         "flat_plan.go",
         "hint_utils.go",
         "index_join_path.go",
