@@ -5,6 +5,8 @@ go_library(
     srcs = [
         "meta.go",
         "meta_autoid.go",
+        "meta_ddl.go",
+        "meta_query.go",
         "reader.go",
     ],
     importpath = "github.com/pingcap/tidb/pkg/meta",
