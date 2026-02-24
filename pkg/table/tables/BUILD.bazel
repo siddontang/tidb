@@ -8,6 +8,8 @@ go_library(
         "index.go",
         "mutation_checker.go",
         "partition.go",
+        "partition_dml.go",
+        "partition_pruning.go",
         "state_remote.go",
         "tables.go",
         "testutil.go",
