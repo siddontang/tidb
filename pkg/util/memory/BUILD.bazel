@@ -5,6 +5,8 @@ go_library(
     srcs = [
         "action.go",
         "arbitrator.go",
+        "arbitrator_exec.go",
+        "arbitrator_risk.go",
         "global_arbitrator.go",
         "meminfo.go",
         "memstats.go",
