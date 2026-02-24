@@ -46,6 +46,7 @@ go_library(
         "generated_column.go",
         "index.go",
         "index_backfill.go",
+        "index_backfill_dist.go",
         "index_cop.go",
         "index_ddl.go",
         "index_merge_tmp.go",
