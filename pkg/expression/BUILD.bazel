@@ -11,6 +11,7 @@ go_library(
         "builtin_cast_vec.go",
         "builtin_compare.go",
         "builtin_compare_ops.go",
+        "builtin_compare_sigs.go",
         "builtin_compare_vec.go",
         "builtin_compare_vec_generated.go",
         "builtin_control.go",
