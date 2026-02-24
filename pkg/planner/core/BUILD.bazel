@@ -17,6 +17,7 @@ go_library(
         "exhaust_physical_plans_hints.go",
         "expression_codec_fn.go",
         "expression_rewriter.go",
+        "expression_rewriter_leave.go",
         "find_best_task.go",
         "find_best_task_candidate.go",
         "find_best_task_convert.go",
