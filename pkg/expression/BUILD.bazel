@@ -59,6 +59,7 @@ go_library(
         "builtin_time.go",
         "builtin_time_calc.go",
         "builtin_time_component.go",
+        "builtin_time_date_arith.go",
         "builtin_time_datetime.go",
         "builtin_time_misc.go",
         "builtin_time_vec.go",
