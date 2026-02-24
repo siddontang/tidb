@@ -65,6 +65,7 @@ go_library(
         "partition.go",
         "partition_drop.go",
         "partition_exchange_reorg.go",
+        "partition_exchange_reorg_ops.go",
         "placement_policy.go",
         "reorg.go",
         "reorg_util.go",
