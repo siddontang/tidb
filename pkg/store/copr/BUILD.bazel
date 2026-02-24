@@ -8,6 +8,7 @@ go_library(
         "coprocessor.go",
         "coprocessor_cache.go",
         "coprocessor_worker.go",
+        "coprocessor_worker_resp.go",
         "key_ranges.go",
         "mpp.go",
         "mpp_probe.go",
