@@ -299,7 +299,7 @@
   "forbidigo": {
     "exclude_files": {
       "pkg/ddl/job_submitter.go": "ignore job_submitter code",
-      "pkg/ddl/executor.go": "ignore executor code",
+      "pkg/ddl/executor.*\\.go": "ignore executor code",
       "pkg/ddl/session/.*.go": "ignore session code",
       "pkg/ddl/schematracker/.*.go": "ignore schematracker",
       ".*test\\.go$": "ignore test files",
