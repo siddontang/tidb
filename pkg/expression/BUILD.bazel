@@ -81,6 +81,8 @@ go_library(
         "schema.go",
         "simple_rewriter.go",
         "util.go",
+        "util_binary_param.go",
+        "util_column_extract.go",
         "vectorized.go",
         "vs_helper.go",
     ],
