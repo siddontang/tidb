@@ -38,6 +38,7 @@ go_library(
         "builtin_math_trig.go",
         "builtin_math_vec.go",
         "builtin_miscellaneous.go",
+        "builtin_miscellaneous2.go",
         "builtin_miscellaneous_vec.go",
         "builtin_op.go",
         "builtin_op_vec.go",
