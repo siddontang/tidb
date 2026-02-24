@@ -4,6 +4,7 @@ go_library(
     name = "domain",
     srcs = [
         "domain.go",
+        "domain_loops.go",
         "domain_serverid.go",
         "domain_stats.go",
         "domain_sysvars.go",
