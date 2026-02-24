@@ -95,6 +95,7 @@ go_library(
         "simple.go",
         "simple_system.go",
         "simple_user.go",
+        "simple_user_ops.go",
         "slow_query.go",
         "split.go",
         "stmtsummary.go",
