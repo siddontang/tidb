@@ -55,6 +55,8 @@ go_library(
         "planbuilder_insert.go",
         "point_get_plan.go",
         "preprocess.go",
+        "preprocess_check.go",
+        "preprocess_resolve.go",
         "property_cols_prune.go",
         "recheck_cte.go",
         "resolve_indices.go",
