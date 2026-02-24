@@ -44,6 +44,8 @@ go_library(
         "import_into.go",
         "index_merge_reader.go",
         "infoschema_reader.go",
+        "infoschema_reader_metadata.go",
+        "infoschema_reader_trx.go",
         "insert.go",
         "insert_common.go",
         "inspection_common.go",
