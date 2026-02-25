@@ -16,6 +16,7 @@ go_library(
         "func_json_objectagg.go",
         "func_lead_lag.go",
         "func_max_min.go",
+        "func_max_min_str.go",
         "func_ntile.go",
         "func_percent_rank.go",
         "func_percentile.go",
