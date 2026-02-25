@@ -53,6 +53,7 @@ go_library(
         "builtin_string_encoding.go",
         "builtin_string_misc.go",
         "builtin_string_vec.go",
+        "builtin_string_vec2.go",
         "builtin_string_vec_encode.go",
         "builtin_string_vec_generated.go",
         "builtin_string_vec_search.go",
