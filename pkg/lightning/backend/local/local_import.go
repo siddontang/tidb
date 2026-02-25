@@ -22,12 +22,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/docker/go-units"
 	"github.com/google/uuid"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	sst "github.com/pingcap/kvproto/pkg/import_sstpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/docker/go-units"
 	"github.com/pingcap/tidb/br/pkg/logutil"
 	"github.com/pingcap/tidb/br/pkg/pdutil"
 	"github.com/pingcap/tidb/br/pkg/restore/split"
