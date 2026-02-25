@@ -4,6 +4,7 @@ go_library(
     name = "checkpoints",
     srcs = [
         "checkpoints.go",
+        "checkpoints_file.go",
         "tidb.go",
     ],
     importpath = "github.com/pingcap/tidb/pkg/lightning/checkpoints",
