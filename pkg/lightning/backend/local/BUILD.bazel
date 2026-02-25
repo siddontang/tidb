@@ -13,6 +13,7 @@ go_library(
         "job_worker.go",
         "local.go",
         "local_freebsd.go",
+        "local_import.go",
         "local_unix.go",
         "local_unix_generic.go",
         "local_windows.go",
