@@ -7,7 +7,7 @@ This ExecPlan is a living document maintained under `PLANS.md`. It accompanies `
 
 A person or workload authenticated by Cloud should connect to its authorized TiDB Instance with a short-lived token while ordinary MySQL SQL grants still limit data access. A token for another Instance must fail. Removing authorization must stop new commands and close affected sessions without resetting unrelated users' credentials. This requires native token validation plus connection lifetime handling, not only an additional JWT field.
 
-The present branch is the design and source-audit increment. No server behavior is changed yet. Complete the implementation milestones below before claiming this capability is available. Begin from pinned TiDB X revision `30d6b0e7e5a993e0b15a32e923a0a576ad70aa8e`; the existing Cloud design calls this kernel capability K07. The runtime demo uses this pinned code and must remain untouched by experiments.
+The present branch includes the design/source audit and an in-progress stateless-verifier/legacy-wire increment. No new server authentication path is enabled. Complete the implementation milestones below before claiming this capability is available. Begin from pinned TiDB X revision `30d6b0e7e5a993e0b15a32e923a0a576ad70aa8e`; the existing Cloud design calls this kernel capability K07. The runtime demo uses this pinned code and must remain untouched by experiments.
 
 ## Progress
 
@@ -17,8 +17,11 @@ The present branch is the design and source-audit increment. No server behavior 
 - [x] Written the proposed strict token, policy, session and rollout contract in the companion design.
 - [x] Repository preparation and existing-token baseline tests passed; generated Bazel/dependency metadata is unchanged.
 - [x] Independent design review completed with all findings resolved; final local links, whitespace and ExecPlan structure checks passed (documentation-only Ready profile).
-- [ ] Run an isolated real-MySQL legacy-token feasibility experiment with owned temporary users/keys and verified TLS.
-- [ ] Implement and test the strict v1 verifier and bounded policy engine.
+- [x] Verified the repeatable native MySQL/TLS legacy-token fixture with owned mock storage and synthetic credentials on the `nextgen` build; this is not deployed TiKV evidence.
+- [ ] Run a separate deployed TiDB X/TiKV/keyspace experiment with an external stock MySQL client before fleet integration.
+- [x] Verified the strict stateless v1 verifier and secret-free identity value, including API-v2 keyspace-bound regressions; no runtime caller is installed.
+- [x] Final independent review and combined-source wire verification passed; the signed local implementation checkpoint and claim release are recorded in the execution Issue.
+- [ ] Implement and test the bounded policy engine, trusted storage/account adapter, restart freshness and anti-rollback handling.
 - [ ] Implement and test typed identity publication, connection activation and terminal session guard.
 - [ ] Implement and test reset/change-user/migration protections and cancellation/cleanup behavior.
 - [ ] Integrate Regional issuance and fleet snapshot distribution, then validate mixed versions and outage bounds before enablement.
@@ -35,6 +38,8 @@ A matched native user can authenticate with `tidb_session_token` before the norm
 The process's configured keyspace name and its actual storage codec identify a keyspace, not a stable Cloud Instance; numeric keyspace IDs also repeat across storage clusters. An operator-provided Instance/storage-cluster/keyspace binding must be validated against `kv.Storage.GetClusterID()` and the actual codec. A client-supplied routing hint does not provide this trust.
 
 The native liveness checker excludes noninterruptible transaction finalization and several long-running operation classes. Connection revocation is not an effect-level write fence and cannot undo a committed transaction or accepted durable job.
+
+Keyspace ID zero is DEFAULT; SYSTEM is identified by its trusted name/classification and can have a positive ID. A numeric range check cannot enforce SYSTEM exclusion. The future adapter must perform this check before invoking the stateless verifier.
 
 ## Decision Log
 
@@ -54,11 +59,16 @@ The native liveness checker excludes noninterruptible transaction finalization a
 - Decision: this first branch delivery contains the kernel contract and implementation plan rather than enabling a partially guarded login path.
   Rationale: the discovered reset/migration and activation races are part of the feature's security boundary. Runtime changes belong in the following individually verifiable milestones.
   Date/Author: 2026-11-03, coordinator `/root`.
+- Decision: split the first executable increment into a real MySQL/TLS legacy-wire fixture backed by mock storage and an unwired stateless v1 verifier.
+  Rationale: this provides repeatable native authentication/grant evidence without mutating retained instances. It does not complete deployed TiKV acceptance, the snapshot engine or held-session enforcement. The standard Go MySQL driver exercises the wire protocol; a separate stock CLI/deployed-instance oracle remains pending.
+  Date/Author: 2026-11-03, coordinator `/root`, forked native-identity session.
 
 ## Outcomes & Retrospective
 
 
-The first branch increment now contains independently reviewed kernel insertion points, protocol/lifetime contracts and required negative tests. Existing legacy claims/JWKS tests and repository preparation passed. Implementation and actual MySQL token proof remain pending. The existing production-like local demo continues to use its verified restricted passwords. Do not interpret a source audit or legacy unit test as proof that the new profile works.
+The first committed increment contains independently reviewed kernel insertion points, protocol/lifetime contracts and required negative tests. This implementation increment adds a stateless verifier, identity value and actual MySQL/TLS legacy-wire fixture, with passing verification evidence below. The existing production-like local demo continues to use its verified restricted passwords. Neither the legacy wire fixture nor isolated new verifier enables the new profile in a running server.
+
+The native-wire fixture passed: verified TLS, native token login, CRUD, explicit SQL grant denials, expired/wrong-subject/bad-signature/plaintext/hostname negatives, expected legacy wrong-audience acceptance, and teardown checks. Strict-verifier and old claims/JWKS tests passed. Independent review identified an API-v2 numeric keyspace range omission and inaccurate SYSTEM wording; the new regression cases failed before the range fix and passed afterward. SYSTEM rejection remains an explicit trusted-adapter obligation. Required code lint, final independent review and combined-source wire verification passed. All remaining policy/session/Cloud integration milestones stay open.
 
 ## Context and Orientation
 
@@ -75,7 +85,9 @@ The current worktree is `/Users/siddon/eng/tidbcloud/kernel-worktrees/enterprise
 ### Milestone 1: Prove the native wire mechanism in isolation
 
 
-Use an owned disposable instance and separate native token user. Install a generated test JWKS, provision least-privilege test grants, and connect using a stock MySQL client supporting `mysql_clear_password` with certificate and hostname verification. Keep the Cloud password out of the SQL client. Demonstrate valid, wrong-user, expired, bad-signature and plaintext-rejected attempts; record the pinned binary, configuration and cleanup oracle. Demonstrate the legacy audience limitation as an expected gap, not as supported isolation. Do not edit either retained demo user's plugin, grants or password.
+First use `TestLegacyTokenVerifiedTLS` in `pkg/server/tests/tls`: one owned in-process TiDB server with mock storage, generated TLS certificate/key and test public JWKS, least-privilege token user, OS-assigned loopback SQL/status listeners, and the existing Go MySQL driver using `mysql_clear_password`. Verify certificate/hostname, observe the negotiated cipher, perform CRUD and reject access to another database and `mysql.user`. Wrong subject, expired token, bad signature and plaintext fail; wrong hostname fails certificate verification. The plaintext guard exercised here is global `require_secure_transport`, which rejects before the clear-password auth-switch. Do not infer that per-user REQUIRE SSL alone prevents a secret from being requested over plaintext. A valid token with an unrelated audience succeeds in the old profile: that is a documented gap, not Instance isolation. The fixture closes clients/server/store, removes its owned credential directory and verifies listener teardown and restored global state. No retained credentials or instances are used.
+
+Before fleet integration, separately use an owned disposable deployed TiDB X/TiKV/keyspace and an external stock MySQL client supporting `mysql_clear_password` with certificate and hostname verification. Keep the Cloud password out of the SQL client. Repeat valid and negative attempts, record the actual pinned binary/configuration, and verify resource ownership/cleanup. The mock-storage Go fixture is not a substitute for this deployed-storage gate.
 
 Start with existing `TestAuthTokenClaims` and `TestJWKSImpl` to understand baseline behavior. They validate legacy code only. A separate actual server/client fixture is necessary before calling this milestone complete. Before launching a disposable server, record a scoped resource owner, port allocation, resource budget and durable cleanup manifest in the execution Issue. Verify process/image and native user ownership before deletion.
 
@@ -83,6 +95,8 @@ Start with existing `TestAuthTokenClaims` and `TestJWKSImpl` to understand basel
 
 
 Create a dependency-light identity type, proposed under `pkg/sessionctx/sessionauth`, and an isolated verifier in `pkg/privilege/privileges`. Use maintained JWS verification already present in go.mod. Implement the exact profile from the companion design, strict bounded parsing, explicit RS256/issuer/key selection, and checks against a trusted descriptor and active binding. Validate all claims on the receiving kernel; issuance alone is not enforcement.
+
+The stateless increment defines `VerifyCloudToken(raw, request, policy, now)` and value-only `sessionauth.Identity`. Request and policy are trusted caller inputs, including the exact native user/host/plugin, TLS/account state and desired/applied grant revision. Snapshot maps/keys must not be mutated concurrently. The function does not verify policy provenance, native database records or SYSTEM classification, and cannot prevent a caller from presenting an old snapshot. It has no runtime caller. Returned session and initial policy-lease deadlines are bounded values, not active timers or revocation enforcement. Tests use deterministic clocks and existing synthetic RSA unit fixtures; wire keys are separately generated and removed.
 
 Implement atomic immutable snapshots with bounded validity, anti-rollback revision handling, identical-content idempotency, per-binding/key retirement and restart watermarks. Keep the transport adapter separate from verification. Reject missing or invalid policy; never fall back to the old plugin. Provide an injectable clock for deterministic boundary tests, while production derives monotonic lease deadlines from validated wall-clock expiries. Do not add Global/KMS requests to the SQL path.
 
@@ -151,7 +165,7 @@ Rollout is opt-in with distinct token users. Stop new issuance, drain or revoke 
 ## Artifacts and Notes
 
 
-At this increment, branch creation, source audit and the following baseline checks are complete. These are not implementation acceptance for the new profile.
+The original design-only increment completed branch creation, source audit and the following baseline checks. These are not implementation acceptance for the new profile.
 
     make bazel_prepare
     # Exit 0; no generated Bazel/dependency metadata diff.
@@ -159,6 +173,29 @@ At this increment, branch creation, source audit and the following baseline chec
     # ok github.com/pingcap/tidb/pkg/privilege/privileges 3.227s
 
 The test ran on Go 1.25.12, macOS/arm64. No direct failpoint/testfailpoint references were found in the targeted privilege package, so failpoint instrumentation was not needed. No real MySQL token session or fleet policy was exercised. Independent reviewer `/root/sql_access_review` approved the design-only scope after resolving storage-cluster identity, typed reset, direct-session authorization, restart freshness, atomic generation-fenced shutdown, skip-grant-table and managed-username downgrade findings. Reviewed technical-content SHA-256 values: design `625cab0acb2f5b37c9bdcb4dfcbe53cc661e775657a11feed3e078003cdec3b5`; plan before this evidence-only finalization `181b8d3f19f5367c3e33b5a56484cd54f183d047b27d2abde5d50fac221d757a`. Local document links, whitespace and required ExecPlan structure passed. The Ready profile applies only to these documentation changes; `make lint` is not required because no code changed. This review does not authorize runtime enablement.
+
+Second increment, Go 1.25.12/macOS arm64 on the same pinned kernel plus this branch: `make bazel_prepare` passed and generated the new source/dependency entries and test shard metadata. Initial verifier/legacy tests passed in 3.257s. Native-wire command:
+
+    go test -run '^TestLegacyTokenVerifiedTLS$' -tags=intest,deadlock,nextgen -count=1 -timeout=10m ./pkg/server/tests/tls
+    # ok github.com/pingcap/tidb/pkg/server/tests/tls 1.419s
+
+The native-wire fixture uses mock storage and a standard Go MySQL client over real loopback TCP/TLS. TLS RSA keys and public JWKS are generated under an owned temporary directory; signing keys stay in process memory. Global JWKS is loaded without a refresh goroutine, and prior JWKS/transport/test-channel state is restored after server teardown. Client closures, server/store helper cleanup, closed SQL/status listeners and deleted credential directory are checked. No standalone deployed binary, TiKV, public endpoint, fleet movement, external CLI or held-session revoke was exercised. Error-surface checks and the strict verifier's fixed sentinels do not constitute captured-log/metrics redaction acceptance. Direct failpoint/testfailpoint references and failpoint BUILD dependencies were absent from both targeted packages; tests run without failpoint instrumentation under the repository's package-based decision rule.
+
+The keyspace-range regression run failed both cases before the fix: the first ID above API-v2 range and the null/API-v1 sentinel were incorrectly accepted. The fix bounds IDs to `[1, 0xFFFFFF]`; zero DEFAULT and named SYSTEM are different concepts. The latter requires the future trusted adapter. Exact regression command:
+
+    go test -run '^TestCloudTokenRejectsUntrustedInputs$/(keyspace_above_API-v2_range|null_keyspace)$' -tags=intest,deadlock -count=1 -timeout=10m ./pkg/privilege/privileges
+    # Before fix: FAIL, both cases returned nil instead of the unavailable-policy error.
+
+Final verifier validation includes the new cases and existing legacy compatibility tests:
+
+    go test -run '^(TestCloudToken.*|TestAuthTokenClaims|TestJWKSImpl)$' -tags=intest,deadlock -count=1 -timeout=10m ./pkg/privilege/privileges
+    # ok github.com/pingcap/tidb/pkg/privilege/privileges 3.545s
+    make lint
+    # Exit 0, including repository revive and dashboard checks.
+
+The Ready profile applies to this bounded code increment only. No RealTiKV suite, broad Bazel lint sweep or new-profile native handshake has run. Local evidence logs remain under `/tmp/kernel-identity-{bazel-prepare,verifier-final,wire-final,range-before,lint}.log`; durable commands, observed outcomes and limits are retained in this plan and the private execution Issue. No new module dependency is introduced.
+
+The exact native-wire command above was rerun against the final combined source after the verifier corrections and passed in 1.707s. Final `gofmt -l` produced no output; staged `git diff --check`, document links and ExecPlan structure checks passed. Independent agent `/root/identity_review` approved the bounded increment with no unresolved findings in [the hash-anchored review](https://github.com/siddontang/tidb-cloud-enterprise/issues/21#issuecomment-6597097267). All nine reviewed file hashes are recorded there; only this ExecPlan's evidence/completion text changed afterward. The original pinned build-source checkout remains clean. The kernel checkpoint stays local and does not publish private design context to public TiDB repositories.
 
 ## Interfaces and Dependencies
 
@@ -170,3 +207,5 @@ The first version consumes authenticated local descriptor/policy files installed
 Revision note (2026-11-03): initial plan written after native session, migration and cancellation audit; runtime implementation deliberately remains gated on the listed tests.
 
 Revision note (2026-11-03): finalized baseline evidence and independent design review. All implementation milestones remain visibly pending; no native authentication behavior changed.
+
+Revision note (2026-11-03): added the stateless verifier/value type and isolated native MySQL/TLS legacy fixture. Split mock-wire evidence from deployed TiKV acceptance, fixed keyspace-range/SYSTEM contract wording after independent review, and retained policy/session/Cloud integration as explicit pending milestones.
