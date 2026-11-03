@@ -12,7 +12,7 @@
 - `pkg/privilege/privileges/cache_test.go` - Tests load user table.
 - `pkg/privilege/privileges/main_test.go` - Configures default goleak settings and registers testdata.
 - `pkg/privilege/privileges/privileges_test.go` - Tests check DB privilege.
-- `pkg/privilege/privileges/sql_token_test.go` - Tests the strict SQL-token wire contract, explicit deployment scopes, bindings and fail-closed verification.
+- `pkg/privilege/privileges/sql_token_test.go` - Tests the strict SQL-token wire contract, external-issuer examples, explicit deployment scopes, bindings and fail-closed verification.
 - `pkg/privilege/privileges/tidb_auth_token_test.go` - Tests auth token claims.
 
 ## pkg/privilege/privileges/ldap

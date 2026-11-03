@@ -1,18 +1,18 @@
 # Implement Native SQL Token Identity
 
-This ExecPlan is a living document maintained under `PLANS.md`. It accompanies `docs/design/2026-11-03-sql-token-identity.md`. Execution ownership and discussion live in the Enterprise execution Issue; this plan records technical dependencies and evidence, not a second team assignment ledger.
+This ExecPlan is a living document maintained under `PLANS.md`. It accompanies `docs/design/2026-11-03-sql-token-identity.md`. Execution ownership and discussion live in [public Issue #4](https://github.com/siddontang/tidb/issues/4), and delivery is [PR #3](https://github.com/siddontang/tidb/pull/3); this plan records technical dependencies and evidence, not a second team assignment ledger.
 
 ## Purpose / Big Picture
 
 
 A person or service authenticated by an external identity provider should connect to its authorized TiDB database with a short-lived token while ordinary MySQL SQL grants still limit data access. A token for another database audience must fail, including when keys and native accounts overlap. Removing authorization must stop new commands and close affected sessions without resetting unrelated users' credentials. This requires native token validation plus connection lifetime handling, not only an additional JWT field.
 
-The present branch includes the design/source audit, stateless-verifier/legacy-wire foundation and an in-progress generic-profile revision. No new server authentication path is enabled. Complete the implementation milestones below before claiming this capability is available. Begin from pinned TiDB X revision `30d6b0e7e5a993e0b15a32e923a0a576ad70aa8e`; the existing Cloud design calls this kernel capability K07. The runtime demo uses this pinned code and must remain untouched by experiments.
+The prototype includes the design/source audit and generic stateless-verifier/legacy-wire foundation. No new server authentication path is enabled. Complete the implementation milestones below before claiming this capability is available. Begin from pinned TiDB X revision `30d6b0e7e5a993e0b15a32e923a0a576ad70aa8e`. Existing deployments must remain untouched by experiments.
 
 ## Progress
 
 
-- [x] Created isolated local branch `feature/enterprise-sql-identity` from the pinned kernel; preserved the detached build-source checkout.
+- [x] Created an isolated working branch from the pinned kernel; preserved the original build-source checkout.
 - [x] Audited authentication, trusted keyspace identity, reset/change-user, migration-token bypass and native cancellation paths.
 - [x] Written the proposed strict token, policy, session and rollout contract in the companion design.
 - [x] Repository preparation and existing-token baseline tests passed; generated Bazel/dependency metadata is unchanged.
@@ -21,9 +21,11 @@ The present branch includes the design/source audit, stateless-verifier/legacy-w
 - [ ] Run a separate deployed TiDB X/TiKV/keyspace experiment with an external stock MySQL client before fleet integration.
 - [x] Verified the strict stateless v1 verifier and secret-free identity value, including API-v2 keyspace-bound regressions; no runtime caller is installed.
 - [x] Final independent review and combined-source wire verification passed; the signed local implementation checkpoint and claim release are recorded in the execution Issue.
-- [x] Audited existing control-plane token issuance, native user/grant provisioning and public-key distribution; recorded private source provenance in the execution Issue.
+- [x] Separated token issuance, native user/grant provisioning and public-key distribution from the receiver contract.
 - [x] Generalized verifier/value types and named protocol constants; added literal-wire and deployment-scope tests.
-- [x] Completed generic-profile targeted verification, code lint and final independent review; signed follow-up publication is tracked in the execution Issue.
+- [x] Completed generic-profile targeted verification, code lint and final independent review at commit `8607790`.
+- [x] Established public Issue #4 as the feature/execution entry point and documented the external issuer integration contract.
+- [x] Completed neutral-example verification and independent public-contract review; signed publication is tracked in Issue #4.
 - [ ] Implement and test the bounded policy engine, trusted storage/account adapter, restart freshness and anti-rollback handling.
 - [ ] Implement and test typed identity publication, connection activation and terminal session guard.
 - [ ] Implement and test reset/change-user/migration protections and cancellation/cleanup behavior.
@@ -47,6 +49,9 @@ Keyspace ID zero is DEFAULT; SYSTEM is identified by its trusted name/classifica
 ## Decision Log
 
 
+- Decision: use public Issue #4 for feature discussion, execution and delivery links, and make external issuer integration self-contained in this repository.
+  Rationale: independently operated systems must be able to implement the same fixed profile without another repository or product-specific terminology. Keep issuer trust provisioning explicit; a token cannot onboard its own issuer.
+  Date/Author: 2026-11-03, coordinator `/root`.
 - Decision: generalize the unregistered prototype as `tidb_sql_token_v1` / `tidb-sql+jwt`, with twelve fixed claims, opaque audience, issuer-scoped immutable principal and explicit storage-scope enum. Remove organization/project/principal-kind claims from the kernel.
   Rationale: source review of existing control-plane issuance/provisioning confirms that product identity and role mappings belong in adapters. The same native contract should work for hosted and self-managed deployments without importing their account model. The old draft was not enabled; legacy `tidb_auth_token` stays unchanged.
   Date/Author: 2026-11-03, coordinator `/root`, independently reviewed by `/root/identity_review`.
@@ -75,11 +80,11 @@ Keyspace ID zero is DEFAULT; SYSTEM is identified by its trusted name/classifica
 ## Outcomes & Retrospective
 
 
-The historical first committed increment contains independently reviewed kernel insertion points, protocol/lifetime contracts and required negative tests. This implementation increment adds a stateless verifier, identity value and actual MySQL/TLS legacy-wire fixture, with passing verification evidence below. The existing production-like local demo continues to use its verified restricted passwords. Neither the legacy wire fixture nor isolated new verifier enables the new profile in a running server.
+The historical first committed increment contains independently reviewed kernel insertion points, protocol/lifetime contracts and required negative tests. This implementation increment adds a stateless verifier, identity value and actual MySQL/TLS legacy-wire fixture, with passing verification evidence below. Neither the legacy wire fixture nor isolated new verifier enables the new profile in a running server.
 
 The previously committed native-wire fixture passed: verified TLS, native token login, CRUD, explicit SQL grant denials, expired/wrong-subject/bad-signature/plaintext/hostname negatives, expected legacy wrong-audience acceptance, and teardown checks. Strict-verifier and old claims/JWKS tests passed. Independent review identified an API-v2 numeric keyspace range omission and inaccurate SYSTEM wording; the new regression cases failed before the range fix and passed afterward. SYSTEM rejection remains an explicit trusted-adapter obligation. Required code lint, final independent review and combined-source wire verification passed. All remaining policy/session/adapter integration milestones stay open.
 
-The generic-profile revision removes product-specific mandatory claims and naming, adds explicit cluster/keyspace scopes and centralizes wire constants. Generic verifier/legacy compatibility tests and the nextgen mock-wire fixture passed, as did Ready lint and independent review. The reviewed public scope covers self-managed and hosted adapters; Cloud product acceptance is conditional on that adapter. This does not enable a native login path or complete session revocation.
+The generic-profile revision removes product-specific mandatory claims and naming, adds explicit cluster/keyspace scopes and centralizes wire constants. Generic verifier/legacy compatibility tests and the nextgen mock-wire fixture passed, as did Ready lint and independent review. The reviewed public scope covers independently configured self-managed and hosted adapters. This does not enable a native login path or complete session revocation.
 
 ## Context and Orientation
 
@@ -88,7 +93,7 @@ A JWT is a signed token carrying identity and scope claims. Its audience identif
 
 Read `AGENTS.md`, `pkg/server/AGENTS.md`, `docs/agents/testing-flow.md`, and the repository verification/test skills before editing. `pkg/privilege/privileges/tidb_auth_token.go` loads legacy keys and verifies signatures. `privileges.go` checks claims/native users. `pkg/privilege/privilege.go` defines the authentication result. `pkg/session/session.go` publishes the authenticated native identity. `pkg/server/conn.go` negotiates plugins, dispatches commands and handles reset/change-user. `pkg/server/server.go` registers/kills connections. `pkg/executor/show.go` and `simple.go` implement session-state export/import. The companion design explains why each is in scope.
 
-The current worktree is `/Users/siddon/eng/tidbcloud/kernel-worktrees/enterprise-sql-identity`; run repository commands there. No private runtime configuration, live Cloud password, existing customer table or signing key is a test fixture. Test keys must be generated for the experiment and destroyed with its owned resources.
+Run repository commands from the root of the working checkout. No live runtime configuration, identity-provider password, existing customer table or signing key is a test fixture. Test keys must be generated for the experiment and destroyed with its owned resources.
 
 ## Plan of Work
 
@@ -98,7 +103,7 @@ The current worktree is `/Users/siddon/eng/tidbcloud/kernel-worktrees/enterprise
 
 First use `TestLegacyTokenVerifiedTLS` in `pkg/server/tests/tls`: one owned in-process TiDB server with mock storage, generated TLS certificate/key and test public JWKS, least-privilege token user, OS-assigned loopback SQL/status listeners, and the existing Go MySQL driver using `mysql_clear_password`. Verify certificate/hostname, observe the negotiated cipher, perform CRUD and reject access to another database and `mysql.user`. Wrong subject, expired token, bad signature and plaintext fail; wrong hostname fails certificate verification. The plaintext guard exercised here is global `require_secure_transport`, which rejects before the clear-password auth-switch. Do not infer that per-user REQUIRE SSL alone prevents a secret from being requested over plaintext. A valid token with an unrelated audience succeeds in the old profile: that is a documented gap, not audience isolation. The fixture closes clients/server/store, removes its owned credential directory and verifies listener teardown and restored global state. No retained credentials or instances are used.
 
-Before fleet integration, separately use an owned disposable deployed TiDB X/TiKV/keyspace and an external stock MySQL client supporting `mysql_clear_password` with certificate and hostname verification. Keep the Cloud password out of the SQL client. Repeat valid and negative attempts, record the actual pinned binary/configuration, and verify resource ownership/cleanup. The mock-storage Go fixture is not a substitute for this deployed-storage gate.
+Before fleet integration, separately use an owned disposable deployed TiDB X/TiKV/keyspace and an external stock MySQL client supporting `mysql_clear_password` with certificate and hostname verification. Keep the identity-provider password out of the SQL client. Repeat valid and negative attempts, record the actual pinned binary/configuration, and verify resource ownership/cleanup. The mock-storage Go fixture is not a substitute for this deployed-storage gate.
 
 Start with existing `TestAuthTokenClaims` and `TestJWKSImpl` to understand baseline behavior. They validate legacy code only. A separate actual server/client fixture is necessary before calling this milestone complete. Before launching a disposable server, record a scoped resource owner, port allocation, resource budget and durable cleanup manifest in the execution Issue. Verify process/image and native user ownership before deletion.
 
@@ -109,9 +114,9 @@ Create a dependency-light identity type, proposed under `pkg/sessionctx/sessiona
 
 The stateless increment defines `VerifySQLToken(raw, request, policy, now)` and value-only `sessionauth.Identity`. Request and policy are trusted caller inputs, including the exact native user/host/plugin, TLS/account state and desired/applied grant revision. Snapshot maps/keys must not be mutated concurrently. The function does not verify policy provenance, native database records or SYSTEM classification, and cannot prevent a caller from presenting an old snapshot. It has no runtime caller. Returned session and initial policy-lease deadlines are bounded values, not active timers or revocation enforcement. Tests use deterministic clocks and existing synthetic RSA unit fixtures; wire keys are separately generated and removed.
 
-Current implementation files are `pkg/privilege/privileges/sql_token.go`, `sql_token_test.go` and `pkg/sessionctx/sessionauth/identity.go`. Trusted targets contain `Audience`, `StorageClusterID`, `StorageScope` and `KeyspaceID`; scope zero is invalid, cluster scope requires canonical keyspace zero, and keyspace scope accepts 0..0xFFFFFF. The adapter must attest codec/mode before normalizing API-v1 null IDs and must reject deployment-reserved keyspaces by trusted classification. Custom claim constants live beside the verifier; standard claim/header constants come from jwx. Keep the twelve-claim literal signed fixture independent of fixture-builder constants. Test self-managed cluster, API-v2 DEFAULT and Cloud adapter audiences, shared-key cross-audience denial and bidirectional cluster-vs-DEFAULT mismatch. Neither product org/project nor a principal-kind enum enters the generic identity.
+Current implementation files are `pkg/privilege/privileges/sql_token.go`, `sql_token_test.go` and `pkg/sessionctx/sessionauth/identity.go`. Trusted targets contain `Audience`, `StorageClusterID`, `StorageScope` and `KeyspaceID`; scope zero is invalid, cluster scope requires canonical keyspace zero, and keyspace scope accepts 0..0xFFFFFF. The adapter must attest codec/mode before normalizing API-v1 null IDs and must reject deployment-reserved keyspaces by trusted classification. Custom claim constants live beside the verifier; standard claim/header constants come from jwx. Keep the twelve-claim literal signed fixture independent of fixture-builder constants. Test self-managed cluster, API-v2 DEFAULT and external-issuer audiences, shared-key cross-audience denial and bidirectional cluster-vs-DEFAULT mismatch. Neither product org/project nor a principal-kind enum enters the generic identity.
 
-Implement atomic immutable snapshots with bounded validity, anti-rollback revision handling, identical-content idempotency, per-binding/key retirement and restart watermarks. Keep the transport adapter separate from verification. Reject missing or invalid policy; never fall back to the old plugin. Provide an injectable clock for deterministic boundary tests, while production derives monotonic lease deadlines from validated wall-clock expiries. Do not add Global/KMS requests to the SQL path.
+Implement atomic immutable snapshots with bounded validity, anti-rollback revision handling, identical-content idempotency, per-binding/key retirement and restart watermarks. Keep the transport adapter separate from verification. Reject missing or invalid policy; never fall back to the old plugin. Provide an injectable clock for deterministic boundary tests, while production derives monotonic lease deadlines from validated wall-clock expiries. Do not add identity-provider, broker or KMS requests to the SQL path.
 
 Tests must reject wrong audience/storage-cluster/scope/keyspace/principal/native user, including the same numeric keyspace ID in another storage cluster, old/revoked binding and policy revisions, missing/duplicate claims, invalid types and algorithm/key substitution. Cover expiry boundaries, clock skew, maximum token lifetime, malformed refresh, snapshot expiry, revision rollback, same-revision changed content, and removal/reintroduction of an old binding/key, and restart after expiry with a rolled-back wall clock. On restart require a fresh authority attestation bound to a new process incarnation/nonce and trusted time before token admission; persisted time/expiry/revocation watermarks alone do not prove freshness or authorize a new lease. Reject startup/readiness when skip-grant-table is combined with the new SQL-token profile; its existing early return must not bypass authentication. Preserve legacy tests. This milestone's isolated verifier is not an enabled login path.
 
@@ -136,11 +141,11 @@ Tests must exercise reset before/after revocation, native account lock/plugin ch
 ### Milestone 5: Integrate broker adapters and fleet operations
 
 
-Only after native gates pass, implement a broker adapter and native-binding reconciliation. A Cloud Regional exchange is one adapter, and self-managed operators may use another identity provider with the same fixed profile. Freeze the matching public token profile and generated API contracts. Distribute descriptors, policy/key snapshots and anti-rollback watermarks through authenticated operator installation or agent delivery. Publish keys, collect per-incarnation acknowledgements, activate issuance, overlap and retire. Separate ordinary key retirement from emergency revocation of held sessions. Measure actual propagation/cutoff bounds under broker/distribution outage and receiver restart.
+Only after native gates pass, implement a broker adapter and native-binding reconciliation. Use an independently configured external issuer with its own resource and principal namespace, following the companion design's external issuer integration contract. Freeze the matching public token profile and generated API contracts. Distribute descriptors, policy/key snapshots and anti-rollback watermarks through authenticated operator installation or agent delivery. Publish keys, collect per-incarnation acknowledgements, activate issuance, overlap and retire. Separate ordinary key retirement from emergency revocation of held sessions. Measure actual propagation/cutoff bounds under broker/distribution outage and receiver restart.
 
 For every adapter, validate that replacement processes preserve the logical database audience only for the same database, mixed-version receivers reject unsupported profiles, TLS/CA rotation preserves security, and distribution disconnection expires policy predictably. SQL grants stay distinct from identity-provider or management roles. All client entry points must use the same native authorization path. These actual-system gates are outside the present stateless increment.
 
-For the Cloud adapter specifically, also validate Global/Region/Agent outages, Essential/Premium movement preserving Instance identity, BYOC disconnection, and identical authorization for SQL Editor and external clients. These product checks are conditional adapter acceptance, not prerequisites for a self-managed operator to implement the generic kernel contract.
+Verify at least one independently implemented issuer adapter against the same conformance cases. A correctly signed token from an unconfigured issuer must fail even if its key ID or native username overlaps a configured issuer. No provider-specific endpoint, identifier prefix or account attribute may be required. Simultaneous multi-issuer receiver selection remains a separately specified capability; one trusted issuer per policy snapshot is the current verifier model.
 
 ## Concrete Steps
 
@@ -180,46 +185,12 @@ Rollout is opt-in with distinct token users. Stop new issuance, drain or revoke 
 ## Artifacts and Notes
 
 
-The evidence below through the publication checkpoint is historical and used the earlier Cloud-specific prototype names. Current generic-profile validation is recorded separately afterward; the old test commands are not commands for the renamed current tests.
+The prototype was built on TiDB X baseline `30d6b0e7e5a993e0b15a32e923a0a576ad70aa8e`. Public commit `86077904c7f768234aaf448f26a9ef77d41b0a63` established the generic verifier, explicit storage modes and independently literal wire fixture. Earlier source/design reviews identified activation, reset/migration, restart freshness and storage-scope gaps; the pending milestones above retain those gates. An earlier regression rejected IDs above the API-v2 range and its null sentinel after first reproducing their acceptance. The current contract additionally distinguishes cluster scope from API-v2 DEFAULT rather than inferring mode from a numeric ID.
 
-The original design-only increment completed branch creation, source audit and the following baseline checks. These are not implementation acceptance for the new profile.
-
-    make bazel_prepare
-    # Exit 0; no generated Bazel/dependency metadata diff.
-    go test -run '^(TestAuthTokenClaims|TestJWKSImpl)$' -tags=intest,deadlock ./pkg/privilege/privileges
-    # ok github.com/pingcap/tidb/pkg/privilege/privileges 3.227s
-
-The test ran on Go 1.25.12, macOS/arm64. No direct failpoint/testfailpoint references were found in the targeted privilege package, so failpoint instrumentation was not needed. No real MySQL token session or fleet policy was exercised. Independent reviewer `/root/sql_access_review` approved the design-only scope after resolving storage-cluster identity, typed reset, direct-session authorization, restart freshness, atomic generation-fenced shutdown, skip-grant-table and managed-username downgrade findings. Reviewed technical-content SHA-256 values: design `625cab0acb2f5b37c9bdcb4dfcbe53cc661e775657a11feed3e078003cdec3b5`; plan before this evidence-only finalization `181b8d3f19f5367c3e33b5a56484cd54f183d047b27d2abde5d50fac221d757a`. Local document links, whitespace and required ExecPlan structure passed. The Ready profile applies only to these documentation changes; `make lint` is not required because no code changed. This review does not authorize runtime enablement.
-
-Second increment, Go 1.25.12/macOS arm64 on the same pinned kernel plus this branch: `make bazel_prepare` passed and generated the new source/dependency entries and test shard metadata. Initial verifier/legacy tests passed in 3.257s. Native-wire command:
-
-    go test -run '^TestLegacyTokenVerifiedTLS$' -tags=intest,deadlock,nextgen -count=1 -timeout=10m ./pkg/server/tests/tls
-    # ok github.com/pingcap/tidb/pkg/server/tests/tls 1.419s
-
-The native-wire fixture uses mock storage and a standard Go MySQL client over real loopback TCP/TLS. TLS RSA keys and public JWKS are generated under an owned temporary directory; signing keys stay in process memory. Global JWKS is loaded without a refresh goroutine, and prior JWKS/transport/test-channel state is restored after server teardown. Client closures, server/store helper cleanup, closed SQL/status listeners and deleted credential directory are checked. No standalone deployed binary, TiKV, public endpoint, fleet movement, external CLI or held-session revoke was exercised. Error-surface checks and the strict verifier's fixed sentinels do not constitute captured-log/metrics redaction acceptance. Direct failpoint/testfailpoint references and failpoint BUILD dependencies were absent from both targeted packages; tests run without failpoint instrumentation under the repository's package-based decision rule.
-
-The keyspace-range regression run failed both cases before the fix: the first ID above API-v2 range and the null/API-v1 sentinel were incorrectly accepted. At that historical checkpoint the fix bounded IDs to `[1, 0xFFFFFF]`; zero DEFAULT and named SYSTEM are different concepts. The latter requires the future trusted adapter. Exact regression command:
-
-    go test -run '^TestCloudTokenRejectsUntrustedInputs$/(keyspace_above_API-v2_range|null_keyspace)$' -tags=intest,deadlock -count=1 -timeout=10m ./pkg/privilege/privileges
-    # Before fix: FAIL, both cases returned nil instead of the unavailable-policy error.
-
-Final verifier validation includes the new cases and existing legacy compatibility tests:
-
-    go test -run '^(TestCloudToken.*|TestAuthTokenClaims|TestJWKSImpl)$' -tags=intest,deadlock -count=1 -timeout=10m ./pkg/privilege/privileges
-    # ok github.com/pingcap/tidb/pkg/privilege/privileges 3.545s
-    make lint
-    # Exit 0, including repository revive and dashboard checks.
-
-The Ready profile applies to this bounded code increment only. No RealTiKV suite, broad Bazel lint sweep or new-profile native handshake has run. Local evidence logs remain under `/tmp/kernel-identity-{bazel-prepare,verifier-final,wire-final,range-before,lint}.log`; durable commands, observed outcomes and limits are retained in this plan and the private execution Issue. No new module dependency is introduced.
-
-The exact native-wire command above was rerun against the final combined source after the verifier corrections and passed in 1.707s. Final `gofmt -l` produced no output; staged `git diff --check`, document links and ExecPlan structure checks passed. Independent agent `/root/identity_review` approved the bounded increment with no unresolved findings in [the hash-anchored review](https://github.com/siddontang/tidb-cloud-enterprise/issues/21#issuecomment-6597097267). All nine reviewed file hashes are recorded there; only this ExecPlan's evidence/completion text changed afterward. The original pinned build-source checkout remains clean. The implementation checkpoint was initially kept local; the subsequent publication scope is recorded below.
-
-The owner explicitly requested publication of both the implementation and design documents to the public `siddontang/tidb` fork, with a PR explaining the complete intended capability and remaining gates. The PR targets that fork's `nextgen` branch initialized at the exact tested kernel base `30d6b0e7e5a993e0b15a32e923a0a576ad70aa8e`; it does not target `pingcap/tidb` or compare the TiDB X change against `master`. Existing design commit `50a6eff` and implementation commit `84032e1` remain intact. Publication adds no runtime functionality and does not change the recorded verification evidence. The private execution Issue remains the coordination record; the public design and PR are self-contained for reviewers without access to that Issue.
-
-Current generic-profile validation (Go 1.25.12/macOS arm64) passed after renaming the implementation and tests:
+Recorded Ready verification at `8607790`, Go 1.25.12/macOS arm64:
 
     make bazel_prepare
-    # Exit 0; generated renamed source and new dependency entries.
+    # Exit 0; generated source/dependency metadata aligned.
     go test -run '^(TestSQLToken.*|TestAuthTokenClaims|TestJWKSImpl)$' -tags=intest,deadlock -count=1 -timeout=10m ./pkg/privilege/privileges
     # ok github.com/pingcap/tidb/pkg/privilege/privileges 3.500s
     go test -run '^TestLegacyTokenVerifiedTLS$' -tags=intest,deadlock,nextgen -count=1 -timeout=10m ./pkg/server/tests/tls
@@ -227,25 +198,38 @@ Current generic-profile validation (Go 1.25.12/macOS arm64) passed after renamin
     make lint
     # Exit 0 after fixing exported-constant documentation comments.
     git diff --cached --check
-    # Exit 0; gofmt, local document links and required ExecPlan structure passed.
+    # Exit 0; gofmt, document links and ExecPlan structure passed.
 
-The two targeted packages still have no direct failpoint/testfailpoint references or BUILD dependencies. A first lint run found missing exported-constant comments; only comments changed after the passing tests, then final lint passed. No further semantic edits followed those tests. Independent agent `/root/identity_review` found no unresolved issues after reviewing generic code, generated metadata, both case maps, the design/plan and rewritten PR body. Review corrected a remaining plan ambiguity: Cloud-specific tiers and regional outages are conditional adapter acceptance, not universal kernel gates. File hashes and source audit provenance are retained in the private execution Issue. Final changes to this plan record evidence only.
+The targeted packages have no direct failpoint/testfailpoint references or BUILD dependencies at this checkpoint, so tests need no instrumentation under the package-based rule. The native-wire fixture uses mock storage and a standard Go MySQL client over real loopback TCP/TLS. TLS keys are generated under an owned temporary directory; signing keys remain in process memory. Public JWKS is loaded without a refresh goroutine; prior process state is restored after teardown. Client/server/store cleanup, closed SQL/status listeners and removal of the credential directory are checked. No retained data or credentials are test fixtures.
 
-Ready applies to this bounded generic-verifier revision. Runtime plugin registration, trusted storage/policy installation, restart freshness, held-session guards/revocation and broker/fleet integration remain unimplemented. No deployed TiKV, external CLI, race-detector or full telemetry redaction acceptance is claimed. The original pinned build-source checkout remains clean; no retained credentials, instances or reference repositories were changed. Local logs are `/tmp/kernel-identity-generic-{bazel,verifier,wire,lint}.log`; commands and outcomes above remain durable without those files.
+Independent agent review found no unresolved issues in that bounded revision; it was not separate human approval. No deployed TiKV, external CLI, new-profile native handshake, held-session revocation, race-detector/load benchmark or complete captured-telemetry redaction acceptance is claimed. The public Issue tracks the unfinished feature; PR #3 references it without closing those gates. Public-contract follow-up verification also passed on Go 1.25.12/macOS arm64:
+
+    go test -run '^(TestSQLToken.*|TestAuthTokenClaims|TestJWKSImpl)$' -tags=intest,deadlock -count=1 -timeout=10m ./pkg/privilege/privileges
+    # ok github.com/pingcap/tidb/pkg/privilege/privileges 3.644s
+    go test -run '^TestLegacyTokenVerifiedTLS$' -tags=intest,deadlock,nextgen -count=1 -timeout=10m ./pkg/server/tests/tls
+    # ok github.com/pingcap/tidb/pkg/server/tests/tls 1.422s
+    make lint
+    # Exit 0.
+    git diff --cached --check
+    # Exit 0; gofmt, neutral terminology, local links and ExecPlan structure passed.
+
+This follow-up changes documentation, comments and synthetic example strings. It adds no Go files, top-level test functions, imports, dependencies or build targets; `make bazel_prepare` is not required again. Independent agent review of the current public Issue, PR draft and seven-file diff found no unresolved issues. The final evidence-only plan update does not change the reviewed protocol. The deployment/runtime limits above remain unchanged.
 
 ## Interfaces and Dependencies
 
 
 The proposed independent identity package contains immutable value types only. `privilege.VerificationInfo` gains a nullable `AuthenticatedIdentity`; existing plugins leave it nil and keep their behavior. SessionVars receives an immutable reference and a read-only `sessionauth.Authorization` checker after successful authentication; the checker references the shared guard state without importing server code into session. `clientConn` owns a guard that references identity plus terminal state, deadlines and an auth generation. Policy installation and guard activation use one explicit ordering protocol; implementation must document lock order and cleanup ownership.
 
-The first version consumes authenticated local descriptor/policy files installed by a trusted operator/agent; no new public status endpoint and no per-query network service. The kernel uses existing native SQL grants and maintained cryptography. The operator/broker retains authoritative identity/binding/policy state and signing permissions. Cloud org/project/tier and identity-kind mappings stay in adapters; the kernel accepts no product-specific mandatory claims. No Cloud password synchronization, Temporal dependency, or automatic SQL grant follows from this design.
+The first version consumes authenticated local descriptor/policy files installed by a trusted operator/agent; no new public status endpoint and no per-query network service. The kernel uses existing native SQL grants and maintained cryptography. The operator/broker retains authoritative identity/binding/policy state and signing permissions. External account attributes and role mappings stay in adapters; the kernel accepts only the fixed profile. No identity-provider password synchronization, workflow-service dependency or automatic SQL grant follows from this design.
 
 Revision note (2026-11-03): initial plan written after native session, migration and cancellation audit; runtime implementation deliberately remains gated on the listed tests.
 
 Revision note (2026-11-03): finalized baseline evidence and independent design review. All implementation milestones remain visibly pending; no native authentication behavior changed.
 
-Revision note (2026-11-03): added the stateless verifier/value type and isolated native MySQL/TLS legacy fixture. Split mock-wire evidence from deployed TiKV acceptance, fixed keyspace-range/SYSTEM contract wording after independent review, and retained policy/session/Cloud integration as explicit pending milestones.
+Revision note (2026-11-03): added the stateless verifier/value type and isolated native MySQL/TLS legacy fixture. Split mock-wire evidence from deployed TiKV acceptance, fixed keyspace-range/SYSTEM contract wording after independent review, and retained policy/session/adapter integration as explicit pending milestones.
 
 Revision note (2026-11-03): recorded the owner's explicit fork-publication request and pinned PR base. This publication-only revision changes no code or security contract.
 
 Revision note (2026-11-03): generalized the unregistered profile and documentation after control-plane source review, retaining legacy compatibility and every pending activation/revocation gate. Current generic-profile validation and final independent review passed; the runtime and adapter milestones remain open.
+
+Revision note (2026-11-03): moved current feature tracking to public Issue #4, removed product-specific terminology and inaccessible references, and specified provider-neutral issuer onboarding and conformance gates. Protocol behavior is unchanged.

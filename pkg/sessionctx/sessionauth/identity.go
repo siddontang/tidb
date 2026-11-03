@@ -30,7 +30,7 @@ const (
 )
 
 // Target binds an operator-defined database audience to its actual storage scope.
-// Audience is opaque: TiDB imposes no Cloud product, organization or ID prefix.
+// Audience is opaque: TiDB imposes no provider-specific resource hierarchy or ID prefix.
 // Keyspace IDs are not globally unique, so StorageClusterID is always required.
 // A trusted adapter must attest scope from the actual codec and reject reserved
 // keyspaces such as SYSTEM by name/classification and deployment policy. This

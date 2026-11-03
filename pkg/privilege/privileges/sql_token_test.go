@@ -47,7 +47,7 @@ func newSQLTokenFixture() sqlTokenFixture {
 		now:     now,
 		request: SQLTokenRequest{Target: target, NativeUsername: "sql_user", NativeHost: "%", NativePlugin: SQLTokenPlugin, TLSEstablished: true},
 		policy: SQLTokenPolicy{
-			Target: target, Issuer: "https://issuer.invalid/region-test", SnapshotRevision: 7,
+			Target: target, Issuer: "https://issuer.invalid/provider-test", SnapshotRevision: 7,
 			ValidFrom: now.Add(-time.Minute), ValidUntil: now.Add(30 * time.Second),
 			MaxTokenLifetime: 5 * time.Minute, MaxSessionDuration: time.Hour,
 			Keys: map[string]*rsa.PublicKey{"test-key": pubKeys[0]},
@@ -59,7 +59,7 @@ func newSQLTokenFixture() sqlTokenFixture {
 		},
 		header: map[string]any{jws.AlgorithmKey: string(jwa.RS256), jws.TypeKey: SQLTokenType, jws.KeyIDKey: "test-key"},
 		claims: map[string]any{
-			SQLTokenClaimVersion: SQLTokenVersion, jwt.IssuerKey: "https://issuer.invalid/region-test", jwt.AudienceKey: "urn:example:database:orders", jwt.SubjectKey: "sql_user",
+			SQLTokenClaimVersion: SQLTokenVersion, jwt.IssuerKey: "https://issuer.invalid/provider-test", jwt.AudienceKey: "urn:example:database:orders", jwt.SubjectKey: "sql_user",
 			SQLTokenClaimPrincipalID: "principal-test",
 			SQLTokenClaimBindingID:   "binding-test", SQLTokenClaimBindingRevision: "3", SQLTokenClaimPolicyRevision: "9",
 			jwt.IssuedAtKey: now.Unix(), jwt.NotBeforeKey: now.Unix(), jwt.ExpirationKey: now.Add(5 * time.Minute).Unix(), jwt.JwtIDKey: "token-test",
@@ -115,7 +115,7 @@ func requireSQLDenied(t *testing.T, raw []byte, f sqlTokenFixture, expected erro
 func TestSQLTokenWireContract(t *testing.T) {
 	f := newSQLTokenFixture()
 	header := []byte(`{"alg":"RS256","typ":"tidb-sql+jwt","kid":"test-key"}`)
-	payload := []byte(`{"ver":1,"iss":"https://issuer.invalid/region-test","aud":"urn:example:database:orders","sub":"sql_user","principal_id":"principal-test","binding_id":"binding-test","binding_revision":"3","policy_revision":"9","iat":1793682000,"nbf":1793682000,"exp":1793682300,"jti":"token-test"}`)
+	payload := []byte(`{"ver":1,"iss":"https://issuer.invalid/provider-test","aud":"urn:example:database:orders","sub":"sql_user","principal_id":"principal-test","binding_id":"binding-test","binding_revision":"3","policy_revision":"9","iat":1793682000,"nbf":1793682000,"exp":1793682300,"jti":"token-test"}`)
 	require.Equal(t, "tidb_sql_token_v1", SQLTokenPlugin)
 	identity, err := VerifySQLToken(signSQLJSON(t, header, payload), f.request, f.policy, f.now)
 	require.NoError(t, err)
@@ -125,7 +125,7 @@ func TestSQLTokenWireContract(t *testing.T) {
 }
 
 func TestSQLTokenDeploymentScopes(t *testing.T) {
-	// These synthetic operator policies need no Cloud organization, project or
+	// These synthetic operator policies need no provider-specific account hierarchy or
 	// human/workload taxonomy. Resource names remain opaque to the verifier.
 	tests := []struct {
 		name, issuer, audience, principal string
@@ -134,7 +134,7 @@ func TestSQLTokenDeploymentScopes(t *testing.T) {
 	}{
 		{"self-managed cluster", "https://broker.invalid", "urn:example:database:orders", "employee:42", sessionauth.StorageScopeCluster, 0},
 		{"API-v2 default", "https://broker.invalid", "database/default", "service:batch", sessionauth.StorageScopeKeyspace, 0},
-		{"Cloud adapter", "https://cloud-broker.invalid", "tidb-cloud:instance:example", "opaque-principal", sessionauth.StorageScopeKeyspace, 42},
+		{"external issuer", "https://external-broker.invalid", "urn:example:database:tenant-42", "opaque-principal", sessionauth.StorageScopeKeyspace, 42},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -249,7 +249,7 @@ func TestSQLTokenRejectsUntrustedInputs(t *testing.T) {
 		change func(*sqlTokenFixture)
 		err    error
 	}{
-		{"different actual audience", func(f *sqlTokenFixture) { f.request.Target.Audience = "inst-other" }, ErrSQLTokenAccessDenied},
+		{"different actual audience", func(f *sqlTokenFixture) { f.request.Target.Audience = "database-other" }, ErrSQLTokenAccessDenied},
 		{"same keyspace in different storage cluster", func(f *sqlTokenFixture) { f.request.Target.StorageClusterID++ }, ErrSQLTokenAccessDenied},
 		{"different actual keyspace", func(f *sqlTokenFixture) { f.request.Target.KeyspaceID++ }, ErrSQLTokenAccessDenied},
 		{"missing actual descriptor", func(f *sqlTokenFixture) { f.request.Target = sessionauth.Target{} }, ErrSQLTokenAccessDenied},
@@ -267,7 +267,7 @@ func TestSQLTokenRejectsUntrustedInputs(t *testing.T) {
 			f.policy.Target = f.request.Target
 		}, ErrSQLTokenPolicyUnavailable},
 		{"unknown storage cluster", func(f *sqlTokenFixture) { f.request.Target.StorageClusterID = 0; f.policy.Target = f.request.Target }, ErrSQLTokenPolicyUnavailable},
-		{"noncanonical target", func(f *sqlTokenFixture) { f.policy.Target.Audience = "inst test" }, ErrSQLTokenPolicyUnavailable},
+		{"noncanonical target", func(f *sqlTokenFixture) { f.policy.Target.Audience = "database test" }, ErrSQLTokenPolicyUnavailable},
 		{"oversized target", func(f *sqlTokenFixture) { f.policy.Target.Audience = strings.Repeat("i", 257) }, ErrSQLTokenPolicyUnavailable},
 		{"wrong native username", func(f *sqlTokenFixture) { f.request.NativeUsername = "other" }, ErrSQLTokenAccessDenied},
 		{"wrong matched host", func(f *sqlTokenFixture) { f.request.NativeHost = "localhost" }, ErrSQLTokenAccessDenied},

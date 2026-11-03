@@ -50,7 +50,7 @@ import (
 // TestLegacyTokenVerifiedTLS exercises native authentication and SQL over actual
 // MySQL/TLS connections. Storage is an owned mock store, not a deployed TiKV
 // cluster. Accepting an unrelated audience is an intentional legacy limitation;
-// this test is not evidence of Instance-scoped authentication or revocation.
+// this test is not evidence of audience-scoped authentication or revocation.
 func TestLegacyTokenVerifiedTLS(t *testing.T) {
 	var sqlAddr, statusAddr, fixtureDir string
 	originalJWKS := privileges.GlobalJWKS
@@ -130,7 +130,7 @@ func TestLegacyTokenVerifiedTLS(t *testing.T) {
 			now := time.Now().Unix()
 			claims := map[string]any{
 				jwt.SubjectKey: "wire_token", "email": "wire@example.invalid", jwt.IssuerKey: "wire-issuer",
-				jwt.IssuedAtKey: now - 1, jwt.ExpirationKey: now + 300, jwt.AudienceKey: "tidb-cloud:instance:wire-instance",
+				jwt.IssuedAtKey: now - 1, jwt.ExpirationKey: now + 300, jwt.AudienceKey: "urn:example:database:wire",
 			}
 			if mutate != nil {
 				mutate(claims)
@@ -202,7 +202,7 @@ func TestLegacyTokenVerifiedTLS(t *testing.T) {
 			require.ErrorAs(t, db.PingContext(context.Background()), &hostnameErr)
 		})
 		t.Run("legacy_accepts_unrelated_audience", func(t *testing.T) {
-			token := makeToken(t, signingKey, func(c map[string]any) { c[jwt.AudienceKey] = "tidb-cloud:instance:unrelated" })
+			token := makeToken(t, signingKey, func(c map[string]any) { c[jwt.AudienceKey] = "urn:example:database:unrelated" })
 			db := openDB(t, "wire_token", token, "token-verified")
 			require.NoError(t, db.PingContext(context.Background()))
 		})
