@@ -36,7 +36,9 @@ import (
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwk"
 	"github.com/lestrrat-go/jwx/v2/jws"
+	"github.com/lestrrat-go/jwx/v2/jwt"
 	"github.com/pingcap/tidb/pkg/errno"
+	pmysql "github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/privilege/privileges"
 	"github.com/pingcap/tidb/pkg/server"
 	"github.com/pingcap/tidb/pkg/server/internal/util"
@@ -117,7 +119,7 @@ func TestLegacyTokenVerifiedTLS(t *testing.T) {
 			"CREATE TABLE wire_allowed.items (id INT PRIMARY KEY, value INT)",
 			"CREATE DATABASE wire_other",
 			"CREATE TABLE wire_other.items (id INT PRIMARY KEY)",
-			`CREATE USER 'wire_token'@'127.0.0.1' IDENTIFIED WITH 'tidb_auth_token' REQUIRE TOKEN_ISSUER 'wire-issuer' ATTRIBUTE '{"email":"wire@example.invalid"}'`,
+			`CREATE USER 'wire_token'@'127.0.0.1' IDENTIFIED WITH '` + pmysql.AuthTiDBAuthToken + `' REQUIRE TOKEN_ISSUER 'wire-issuer' ATTRIBUTE '{"email":"wire@example.invalid"}'`,
 			"GRANT SELECT, INSERT, UPDATE, DELETE ON wire_allowed.* TO 'wire_token'@'127.0.0.1'",
 		} {
 			_, err := admin.Exec(statement)
@@ -127,8 +129,8 @@ func TestLegacyTokenVerifiedTLS(t *testing.T) {
 			t.Helper()
 			now := time.Now().Unix()
 			claims := map[string]any{
-				"sub": "wire_token", "email": "wire@example.invalid", "iss": "wire-issuer",
-				"iat": now - 1, "exp": now + 300, "aud": "tidb-cloud:instance:wire-instance",
+				jwt.SubjectKey: "wire_token", "email": "wire@example.invalid", jwt.IssuerKey: "wire-issuer",
+				jwt.IssuedAtKey: now - 1, jwt.ExpirationKey: now + 300, jwt.AudienceKey: "tidb-cloud:instance:wire-instance",
 			}
 			if mutate != nil {
 				mutate(claims)
@@ -173,10 +175,10 @@ func TestLegacyTokenVerifiedTLS(t *testing.T) {
 			name, token, tlsName string
 			code                 uint16
 		}{
-			{"wrong_subject", makeToken(t, signingKey, func(c map[string]any) { c["sub"] = "other_user" }), "token-verified", errno.ErrAccessDenied},
+			{"wrong_subject", makeToken(t, signingKey, func(c map[string]any) { c[jwt.SubjectKey] = "other_user" }), "token-verified", errno.ErrAccessDenied},
 			{"expired", makeToken(t, signingKey, func(c map[string]any) {
-				c["iat"] = time.Now().Add(-2 * time.Minute).Unix()
-				c["exp"] = time.Now().Add(-time.Minute).Unix()
+				c[jwt.IssuedAtKey] = time.Now().Add(-2 * time.Minute).Unix()
+				c[jwt.ExpirationKey] = time.Now().Add(-time.Minute).Unix()
 			}), "token-verified", errno.ErrAccessDenied},
 			{"bad_signature", makeToken(t, wrongKey, nil), "token-verified", errno.ErrAccessDenied},
 			// require_secure_transport rejects before the clear-password switch;
@@ -200,7 +202,7 @@ func TestLegacyTokenVerifiedTLS(t *testing.T) {
 			require.ErrorAs(t, db.PingContext(context.Background()), &hostnameErr)
 		})
 		t.Run("legacy_accepts_unrelated_audience", func(t *testing.T) {
-			token := makeToken(t, signingKey, func(c map[string]any) { c["aud"] = "tidb-cloud:instance:unrelated" })
+			token := makeToken(t, signingKey, func(c map[string]any) { c[jwt.AudienceKey] = "tidb-cloud:instance:unrelated" })
 			db := openDB(t, "wire_token", token, "token-verified")
 			require.NoError(t, db.PingContext(context.Background()))
 		})

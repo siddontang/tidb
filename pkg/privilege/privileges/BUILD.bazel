@@ -4,9 +4,9 @@ go_library(
     name = "privileges",
     srcs = [
         "cache.go",
-        "cloud_token.go",
         "errors.go",
         "privileges.go",
+        "sql_token.go",
         "tidb_auth_token.go",
     ],
     importpath = "github.com/pingcap/tidb/pkg/privilege/privileges",
@@ -57,9 +57,9 @@ go_test(
     timeout = "short",
     srcs = [
         "cache_test.go",
-        "cloud_token_test.go",
         "main_test.go",
         "privileges_test.go",
+        "sql_token_test.go",
         "tidb_auth_token_test.go",
     ],
     embed = [":privileges"],

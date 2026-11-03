@@ -102,5 +102,6 @@
 ## pkg/server/tests/tls
 
 ### Tests
+- `pkg/server/tests/tls/auth_token_test.go` - Tests legacy native SQL-token login, grants and negative cases over verified MySQL/TLS with owned mock storage.
 - `pkg/server/tests/tls/main_test.go` - Configures default goleak settings and registers testdata.
 - `pkg/server/tests/tls/tls_test.go` - server/tests: Tests TLS verify.

@@ -17,26 +17,38 @@ package sessionauth
 
 import "time"
 
-// Target binds a stable Cloud Instance to its actual storage scope. Keyspace IDs
-// are not globally unique, so the storage-cluster ID is part of the identity.
-// The trusted storage adapter must reject internal keyspaces such as SYSTEM by
-// their actual name/classification; a positive numeric ID alone cannot identify
-// a user keyspace. This value does not perform that classification.
+// StorageScope distinguishes an unkeyspaced cluster from an API-v2 keyspace.
+// The zero value is invalid so omitted scope cannot silently select a deployment.
+type StorageScope uint8
+
+const (
+	// StorageScopeCluster denotes an unkeyspaced cluster (API-v1). Its canonical
+	// KeyspaceID is zero; the adapter normalizes the codec's null sentinel.
+	StorageScopeCluster StorageScope = iota + 1
+	// StorageScopeKeyspace denotes an API-v2 keyspace, including DEFAULT (ID 0).
+	StorageScopeKeyspace
+)
+
+// Target binds an operator-defined database audience to its actual storage scope.
+// Audience is opaque: TiDB imposes no Cloud product, organization or ID prefix.
+// Keyspace IDs are not globally unique, so StorageClusterID is always required.
+// A trusted adapter must attest scope from the actual codec and reject reserved
+// keyspaces such as SYSTEM by name/classification and deployment policy. This
+// value alone performs neither discovery nor classification.
 type Target struct {
-	InstanceID       string
-	OrganizationID   string
-	ProjectID        string
+	Audience         string
 	StorageClusterID uint64
+	StorageScope     StorageScope
 	KeyspaceID       uint32
 }
 
+// Identity uses (Issuer, PrincipalID) as its immutable principal namespace.
 // Identity is the result of authentication, not a grant or a live authorization
 // guard. It contains no token, key, or mutable policy reference. A caller must
 // revalidate policy and register a connection guard before activating a session.
 type Identity struct {
 	Target                       Target
 	PrincipalID                  string
-	PrincipalKind                string
 	NativeUsername               string
 	NativeHost                   string
 	BindingID                    string
