@@ -10,6 +10,7 @@ go_library(
         "//pkg/parser/mysql",
         "//pkg/privilege/conn",
         "//pkg/sessionctx",
+        "//pkg/sessionctx/sessionauth",
         "//pkg/sessionctx/variable",
         "//pkg/types",
         "//pkg/util/sqlexec",

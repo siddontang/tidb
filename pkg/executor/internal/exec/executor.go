@@ -24,6 +24,7 @@ import (
 	"github.com/pingcap/tidb/pkg/domain"
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/parser"
+	"github.com/pingcap/tidb/pkg/privilege/privileges"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
@@ -382,6 +383,17 @@ func (e *BaseExecutor) UpdateDeltaForTableID(id int64) {
 
 // GetSysSession gets a system session context from executor.
 func (e *BaseExecutor) GetSysSession() (sessionctx.Context, error) {
+	vars := e.Ctx().GetSessionVars()
+	identity, authorization := vars.SQLTokenIdentity, vars.SQLTokenAuthorization
+	if identity != nil || authorization != nil {
+		if identity == nil || authorization == nil || authorization.Identity() != *identity || authorization.Check() != nil {
+			return nil, privileges.ErrSQLTokenAccessDenied
+		}
+		target, err := privileges.SQLTokenTargetForStore(e.Ctx().GetStore(), identity.Target.Audience)
+		if err != nil || target != identity.Target {
+			return nil, privileges.ErrSQLTokenAccessDenied
+		}
+	}
 	dom := domain.GetDomain(e.Ctx())
 	sysSessionPool := dom.SysSessionPool()
 	ctx, err := sysSessionPool.Get()
@@ -389,7 +401,23 @@ func (e *BaseExecutor) GetSysSession() (sessionctx.Context, error) {
 		return nil, err
 	}
 	restrictedCtx := ctx.(sessionctx.Context)
-	restrictedCtx.GetSessionVars().InRestrictedSQL = true
+	restrictedVars := restrictedCtx.GetSessionVars()
+	// A pooled session must not retain another connection's authorization.
+	if restrictedVars.SQLTokenIdentity != nil || restrictedVars.SQLTokenAuthorization != nil {
+		sysSessionPool.Destroy(ctx)
+		return nil, privileges.ErrSQLTokenAccessDenied
+	}
+	if identity != nil {
+		target, err := privileges.SQLTokenTargetForStore(restrictedCtx.GetStore(), identity.Target.Audience)
+		if err != nil || target != identity.Target || authorization.Check() != nil {
+			sysSessionPool.Put(ctx)
+			return nil, privileges.ErrSQLTokenAccessDenied
+		}
+		restrictedVars.SQLTokenIdentity = identity
+		restrictedVars.SQLTokenAuthorization = authorization
+		restrictedVars.SQLTokenTarget = &target
+	}
+	restrictedVars.InRestrictedSQL = true
 	return restrictedCtx, nil
 }
 
@@ -400,8 +428,15 @@ func (e *BaseExecutor) ReleaseSysSession(ctx context.Context, sctx sessionctx.Co
 	}
 	dom := domain.GetDomain(e.Ctx())
 	sysSessionPool := dom.SysSessionPool()
-	if _, err := sctx.GetSQLExecutor().ExecuteInternal(ctx, "rollback"); err != nil {
-		sctx.(pools.Resource).Close()
+	_, err := sctx.GetSQLExecutor().ExecuteInternal(ctx, "rollback")
+	// Clear borrowed authority before publishing this session back to the pool.
+	// If revocation denied SQL rollback, Close performs native transaction cleanup.
+	vars := sctx.GetSessionVars()
+	vars.SQLTokenIdentity = nil
+	vars.SQLTokenAuthorization = nil
+	vars.SQLTokenTarget = nil
+	if err != nil {
+		sysSessionPool.Destroy(sctx.(pools.Resource))
 		return
 	}
 	sysSessionPool.Put(sctx.(pools.Resource))

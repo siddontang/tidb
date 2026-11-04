@@ -79,6 +79,7 @@ import (
 	"github.com/pingcap/tidb/pkg/plugin"
 	"github.com/pingcap/tidb/pkg/privilege"
 	"github.com/pingcap/tidb/pkg/privilege/conn"
+	"github.com/pingcap/tidb/pkg/privilege/privileges"
 	"github.com/pingcap/tidb/pkg/privilege/privileges/ldap"
 	"github.com/pingcap/tidb/pkg/resourcegroup"
 	servererr "github.com/pingcap/tidb/pkg/server/err"
@@ -207,6 +208,15 @@ type clientConn struct {
 
 	// Proxy Protocol Enabled
 	ppEnabled bool
+
+	// SQL token guards belong to the physical connection, not a resettable session.
+	// This mutex also serializes revocation against CHANGE USER commit/rollback.
+	sqlToken struct {
+		sync.Mutex
+		current  *privileges.SQLTokenGuard
+		pending  *privileges.SQLTokenGuard
+		terminal bool
+	}
 }
 
 type userResourceLimits struct {
@@ -396,6 +406,7 @@ func (cc *clientConn) Close() error {
 func closeConn(cc *clientConn) error {
 	var err error
 	cc.closeOnce.Do(func() {
+		cc.closeSQLTokenGuards()
 		if cc.connectionID > 0 {
 			cc.server.dom.ReleaseConnID(cc.connectionID)
 			cc.connectionID = 0
@@ -820,6 +831,17 @@ func (cc *clientConn) openSession() error {
 }
 
 func (cc *clientConn) openSessionAndDoAuth(authData []byte, authPlugin string, zstdLevel int) error {
+	defer cc.discardSQLTokenCandidate()
+	if err := cc.prepareSessionAndDoAuth(authData, authPlugin, zstdLevel); err != nil {
+		return err
+	}
+	return cc.commitSQLTokenAuthentication()
+}
+
+func (cc *clientConn) prepareSessionAndDoAuth(authData []byte, authPlugin string, zstdLevel int) error {
+	if err := cc.checkSQLTokenConnection(); err != nil {
+		return err
+	}
 	// Open a context unless this was done before.
 	if ctx := cc.getCtx(); ctx == nil {
 		err := cc.openSession()
@@ -868,6 +890,9 @@ var mockOSUserForAuthSocketTest atomic.Pointer[string]
 
 // Check if the Authentication Plugin of the server, client and user configuration matches
 func (cc *clientConn) checkAuthPlugin(ctx context.Context, resp *handshake.Response41) ([]byte, error) {
+	if err := cc.checkSQLTokenConnection(); err != nil {
+		return nil, err
+	}
 	// Open a context unless this was done before.
 	if ctx := cc.getCtx(); ctx == nil {
 		err := cc.openSession()
@@ -877,8 +902,11 @@ func (cc *clientConn) checkAuthPlugin(ctx context.Context, resp *handshake.Respo
 	}
 
 	authData := resp.Auth
-	// tidb_session_token is always permitted and skips stored user plugin.
+	// Migration credentials must never bypass an externally managed identity.
 	if resp.AuthPlugin == mysql.AuthTiDBSessionToken {
+		if runtime := privileges.CurrentSQLTokenRuntime(); runtime != nil && runtime.IsManagedUsername(cc.user) {
+			return nil, privileges.ErrSQLTokenAccessDenied
+		}
 		return authData, nil
 	}
 	hasPassword := "YES"
@@ -938,6 +966,10 @@ func (cc *clientConn) checkAuthPlugin(ctx context.Context, resp *handshake.Respo
 		}
 		return nil, nil
 	}
+	// Check transport protection before asking a client to send a bearer token.
+	if userplugin == mysql.AuthTiDBSQLToken && cc.tlsConn == nil {
+		return nil, privileges.ErrSQLTokenAccessDenied
+	}
 
 	// If the authentication method send by the server (cc.authPlugin) doesn't match
 	// the plugin configured for the user account in the mysql.user.plugin column
@@ -945,7 +977,7 @@ func (cc *clientConn) checkAuthPlugin(ctx context.Context, resp *handshake.Respo
 	// method send by the client (*authPlugin) then we need to switch the authentication
 	// method to match the one configured for that specific user.
 	if (cc.authPlugin != userplugin) || (cc.authPlugin != resp.AuthPlugin) {
-		if userplugin == mysql.AuthTiDBAuthToken {
+		if userplugin == mysql.AuthTiDBAuthToken || userplugin == mysql.AuthTiDBSQLToken {
 			userplugin = mysql.AuthMySQLClearPassword
 		}
 		if resp.Capability&mysql.ClientPluginAuth > 0 {
@@ -1355,6 +1387,9 @@ func (cc *clientConn) addQueryMetrics(cmd byte, startTime time.Time, err error) 
 // It also gets a token from server which is used to limit the concurrently handling clients.
 // The most frequently used command is ComQuery.
 func (cc *clientConn) dispatch(ctx context.Context, data []byte) error {
+	if err := cc.checkSQLTokenConnection(); err != nil {
+		return err
+	}
 	defer func() {
 		// reset killed for each request
 		cc.ctx.GetSessionVars().SQLKiller.Reset()
@@ -2681,6 +2716,7 @@ func (cc *clientConn) upgradeToTLS(tlsConfig *tls.Config) error {
 }
 
 func (cc *clientConn) handleChangeUser(ctx context.Context, data []byte) error {
+	defer cc.discardSQLTokenCandidate()
 	oldResourceGroup := cc.currentResourceGroupName()
 	oldUser, oldDBName, oldAuthPlugin := cc.user, cc.dbname, cc.authPlugin
 	oldCtx := cc.getCtx()
@@ -2747,7 +2783,15 @@ func (cc *clientConn) handleChangeUser(ctx context.Context, data []byte) error {
 			fakeResp.Auth = newpass
 		}
 	}
-	if err := cc.openSessionAndDoAuth(fakeResp.Auth, fakeResp.AuthPlugin, fakeResp.ZstdLevel); err != nil {
+	if err := cc.prepareSessionAndDoAuth(fakeResp.Auth, fakeResp.AuthPlugin, fakeResp.ZstdLevel); err != nil {
+		restoreOldSession()
+		return err
+	}
+	if err := cc.prepareCommonConnectionReset(ctx); err != nil {
+		restoreOldSession()
+		return err
+	}
+	if err := cc.commitSQLTokenAuthentication(); err != nil {
 		restoreOldSession()
 		return err
 	}
@@ -2757,12 +2801,23 @@ func (cc *clientConn) handleChangeUser(ctx context.Context, data []byte) error {
 		}
 	}
 	cc.moveResourceGroupCounter(oldResourceGroup)
-	return cc.handleCommonConnectionReset(ctx)
+	return cc.writeOK(ctx)
 }
 
-func (cc *clientConn) handleResetConnection(ctx context.Context) error {
+func (cc *clientConn) handleResetConnection(ctx context.Context) (retErr error) {
 	oldResourceGroup := cc.currentResourceGroupName()
 	user := cc.ctx.GetSessionVars().User
+	identity := cc.ctx.GetSessionVars().SQLTokenIdentity
+	authorization := cc.ctx.GetSessionVars().SQLTokenAuthorization
+	defer func() {
+		if retErr != nil && (identity != nil || authorization != nil) {
+			cc.closeSQLTokenGuards()
+			cc.interruptSQLTokenConnection()
+		}
+	}()
+	if err := cc.checkSQLTokenConnection(); err != nil {
+		return err
+	}
 	err := cc.ctx.Close()
 	if err != nil {
 		logutil.Logger(ctx).Debug("close old context failed", zap.Error(err))
@@ -2778,7 +2833,12 @@ func (cc *clientConn) handleResetConnection(ctx context.Context) error {
 	}
 	cc.SetCtx(tidbCtx)
 	cc.moveResourceGroupCounter(oldResourceGroup)
-	if !cc.ctx.AuthWithoutVerification(ctx, user) {
+	if identity != nil || authorization != nil {
+		restorer, ok := cc.ctx.Session.(sqlTokenSessionRestorer)
+		if !ok || identity == nil || authorization == nil || restorer.RestoreSQLToken(ctx, user, *identity, authorization) != nil {
+			return privileges.ErrSQLTokenAccessDenied
+		}
+	} else if !cc.ctx.AuthWithoutVerification(ctx, user) {
 		return errors.New("Could not reset connection")
 	}
 	if cc.dbname != "" { // Restore the current DB
@@ -2793,6 +2853,16 @@ func (cc *clientConn) handleResetConnection(ctx context.Context) error {
 }
 
 func (cc *clientConn) handleCommonConnectionReset(ctx context.Context) error {
+	if err := cc.prepareCommonConnectionReset(ctx); err != nil {
+		return err
+	}
+	if err := cc.checkSQLTokenConnection(); err != nil {
+		return err
+	}
+	return cc.writeOK(ctx)
+}
+
+func (cc *clientConn) prepareCommonConnectionReset(ctx context.Context) error {
 	connectionInfo := cc.connectInfo()
 	cc.ctx.GetSessionVars().ConnectionInfo = connectionInfo
 
@@ -2811,7 +2881,7 @@ func (cc *clientConn) handleCommonConnectionReset(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return cc.writeOK(ctx)
+	return nil
 }
 
 // safe to noop except 0x01 "FLUSH PRIVILEGES"

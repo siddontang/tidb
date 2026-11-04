@@ -2446,6 +2446,19 @@ func (e *ShowExec) fetchShowBuiltins() error {
 }
 
 func (e *ShowExec) fetchShowSessionStates(ctx context.Context) error {
+	vars := e.Ctx().GetSessionVars()
+	if vars.SQLTokenIdentity != nil || vars.SQLTokenAuthorization != nil {
+		return sessionstates.ErrCannotMigrateSession.GenWithStackByArgs("SQL token sessions cannot be migrated")
+	}
+	if user := vars.User; user != nil {
+		managed := user.AuthPlugin == mysql.AuthTiDBSQLToken
+		if runtime := privileges.CurrentSQLTokenRuntime(); runtime != nil {
+			managed = managed || runtime.IsManagedUsername(user.Username) || runtime.IsManagedUsername(user.AuthUsername)
+		}
+		if managed {
+			return sessionstates.ErrCannotMigrateSession.GenWithStackByArgs("SQL token sessions cannot be migrated")
+		}
+	}
 	sessionStates := &sessionstates.SessionStates{}
 	err := e.Ctx().EncodeStates(ctx, sessionStates)
 	if err != nil {

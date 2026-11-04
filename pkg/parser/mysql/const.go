@@ -253,6 +253,7 @@ const (
 	AuthSocket              = "auth_socket"
 	AuthTiDBSessionToken    = "tidb_session_token"
 	AuthTiDBAuthToken       = "tidb_auth_token"
+	AuthTiDBSQLToken        = "tidb_sql_token_v1"
 	AuthLDAPSimple          = "authentication_ldap_simple"
 	AuthLDAPSASL            = "authentication_ldap_sasl"
 )
@@ -418,6 +419,7 @@ var DefaultAuthPlugins = []string{
 	AuthSocket,
 	AuthTiDBSessionToken,
 	AuthTiDBAuthToken,
+	AuthTiDBSQLToken,
 	AuthMySQLClearPassword,
 }
 

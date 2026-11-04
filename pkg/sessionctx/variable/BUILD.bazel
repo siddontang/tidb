@@ -39,6 +39,7 @@ go_library(
         "//pkg/planner/util/fixcontrol",
         "//pkg/privilege/privileges/ldap",
         "//pkg/resourcegroup",
+        "//pkg/sessionctx/sessionauth",
         "//pkg/sessionctx/sessionstates",
         "//pkg/sessionctx/slowlogrule",
         "//pkg/sessionctx/stmtctx",
