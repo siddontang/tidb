@@ -692,14 +692,15 @@ const (
 
 // Security is the security section of the config.
 type Security struct {
-	SkipGrantTable  bool     `toml:"skip-grant-table" json:"skip-grant-table"`
-	SSLCA           string   `toml:"ssl-ca" json:"ssl-ca"`
-	SSLCert         string   `toml:"ssl-cert" json:"ssl-cert"`
-	SSLKey          string   `toml:"ssl-key" json:"ssl-key"`
-	ClusterSSLCA    string   `toml:"cluster-ssl-ca" json:"cluster-ssl-ca"`
-	ClusterSSLCert  string   `toml:"cluster-ssl-cert" json:"cluster-ssl-cert"`
-	ClusterSSLKey   string   `toml:"cluster-ssl-key" json:"cluster-ssl-key"`
-	ClusterVerifyCN []string `toml:"cluster-verify-cn" json:"cluster-verify-cn"`
+	SQLToken        SQLTokenSecurity `toml:"sql-token" json:"sql-token"`
+	SkipGrantTable  bool             `toml:"skip-grant-table" json:"skip-grant-table"`
+	SSLCA           string           `toml:"ssl-ca" json:"ssl-ca"`
+	SSLCert         string           `toml:"ssl-cert" json:"ssl-cert"`
+	SSLKey          string           `toml:"ssl-key" json:"ssl-key"`
+	ClusterSSLCA    string           `toml:"cluster-ssl-ca" json:"cluster-ssl-ca"`
+	ClusterSSLCert  string           `toml:"cluster-ssl-cert" json:"cluster-ssl-cert"`
+	ClusterSSLKey   string           `toml:"cluster-ssl-key" json:"cluster-ssl-key"`
+	ClusterVerifyCN []string         `toml:"cluster-verify-cn" json:"cluster-verify-cn"`
 	// Used for auth plugin `tidb_session_token`.
 	SessionTokenSigningCert string `toml:"session-token-signing-cert" json:"session-token-signing-cert"`
 	SessionTokenSigningKey  string `toml:"session-token-signing-key" json:"session-token-signing-key"`
@@ -720,6 +721,16 @@ type Security struct {
 	AuthTokenRefreshInterval string `toml:"auth-token-refresh-interval" json:"auth-token-refresh-interval"`
 	// Disconnect directly when the password is expired
 	DisconnectOnExpiredPassword bool `toml:"disconnect-on-expired-password" json:"disconnect-on-expired-password"`
+}
+
+// SQLTokenSecurity enables the explicit, externally attested SQL token profile.
+// File paths are operator configuration; SQL clients cannot change this trust root.
+type SQLTokenSecurity struct {
+	Enabled      bool   `toml:"enabled" json:"enabled"`
+	Audience     string `toml:"audience" json:"audience"`
+	AuthorityKey string `toml:"authority-key" json:"authority-key"`
+	PolicyFile   string `toml:"policy-file" json:"policy-file"`
+	StateDir     string `toml:"state-dir" json:"state-dir"`
 }
 
 // The ErrConfigValidationFailed error is used so that external callers can do a type assertion

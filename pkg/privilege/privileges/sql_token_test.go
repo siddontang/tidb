@@ -27,10 +27,84 @@ import (
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jws"
 	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/pingcap/kvproto/pkg/keyspacepb"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/sessionctx/sessionauth"
 	"github.com/stretchr/testify/require"
+	"github.com/tikv/client-go/v2/tikv"
 )
+
+// Only the three storage-isolation observations are needed by the adapter. The
+// embedded interface deliberately supplies no fake transaction implementation.
+type sqlTokenTargetStore struct {
+	kv.Storage
+	codec     tikv.Codec
+	clusterID uint64
+}
+
+func (s sqlTokenTargetStore) GetCodec() tikv.Codec { return s.codec }
+func (s sqlTokenTargetStore) GetClusterID() uint64 { return s.clusterID }
+func (s sqlTokenTargetStore) GetKeyspace() string {
+	if s.codec != nil && s.codec.GetKeyspaceMeta() != nil {
+		return s.codec.GetKeyspaceMeta().Name
+	}
+	return ""
+}
+
+// Real codecs supply all behavior except this deliberately unsupported API
+// version, which exercises the adapter's fail-closed scope selection.
+type sqlTokenUnsupportedCodec struct{ tikv.Codec }
+
+func (sqlTokenUnsupportedCodec) GetAPIVersion() kvrpcpb.APIVersion { return kvrpcpb.APIVersion_V1TTL }
+
+func TestSQLTokenTargetForStore(t *testing.T) {
+	const audience = "urn:example:database:orders"
+	v1 := tikv.NewCodecV1(tikv.ModeTxn)
+	// The unkeyspaced codec reports a null sentinel, which the adapter must
+	// normalize to cluster scope with canonical KeyspaceID 0.
+	require.Equal(t, uint32(0xffffffff), uint32(v1.GetKeyspaceID()))
+	v2 := func(id uint32, name string) tikv.Codec {
+		codec, err := tikv.NewCodecV2(tikv.ModeTxn, &keyspacepb.KeyspaceMeta{Id: id, Name: name})
+		require.NoError(t, err)
+		return codec
+	}
+	store := func(codec tikv.Codec, clusterID uint64) kv.Storage {
+		return sqlTokenTargetStore{codec: codec, clusterID: clusterID}
+	}
+	tests := []struct {
+		name     string
+		store    kv.Storage
+		audience string
+		expected sessionauth.Target
+		denied   bool
+	}{
+		{"API-v1 cluster", store(v1, 101), audience, sessionauth.Target{Audience: audience, StorageClusterID: 101, StorageScope: sessionauth.StorageScopeCluster, KeyspaceID: 0}, false},
+		{"API-v2 DEFAULT", store(v2(0, "DEFAULT"), 101), audience, sessionauth.Target{Audience: audience, StorageClusterID: 101, StorageScope: sessionauth.StorageScopeKeyspace, KeyspaceID: 0}, false},
+		{"API-v2 customer", store(v2(42, "customer-orders"), 101), audience, sessionauth.Target{Audience: audience, StorageClusterID: 101, StorageScope: sessionauth.StorageScopeKeyspace, KeyspaceID: 42}, false},
+		{"API-v2 maximum ID", store(v2(0xffffff, "customer-max"), 101), audience, sessionauth.Target{Audience: audience, StorageClusterID: 101, StorageScope: sessionauth.StorageScopeKeyspace, KeyspaceID: 0xffffff}, false},
+		// SYSTEM may have a positive, in-range ID. Its actual name, not a
+		// numeric-ID heuristic, must exclude it from external SQL identity.
+		{"actual SYSTEM", store(v2(17, "SYSTEM"), 101), audience, sessionauth.Target{}, true},
+		{"nil storage", nil, audience, sessionauth.Target{}, true},
+		{"nil codec", store(nil, 101), audience, sessionauth.Target{}, true},
+		{"missing cluster ID", store(v1, 0), audience, sessionauth.Target{}, true},
+		{"unsupported API scope", store(sqlTokenUnsupportedCodec{Codec: v1}, 101), audience, sessionauth.Target{}, true},
+		{"missing audience", store(v1, 101), "", sessionauth.Target{}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target, err := SQLTokenTargetForStore(tt.store, tt.audience)
+			if tt.denied {
+				require.ErrorIs(t, err, ErrSQLTokenAccessDenied)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, tt.expected, target)
+		})
+	}
+}
 
 type sqlTokenFixture struct {
 	now     time.Time

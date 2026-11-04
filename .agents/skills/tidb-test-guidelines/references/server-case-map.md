@@ -16,6 +16,7 @@
 - `pkg/server/main_test.go` - Configures default goleak settings and registers testdata.
 - `pkg/server/mock_conn_test.go` - server: Tests mock conn.
 - `pkg/server/server_test.go` - server: Tests issue46197.
+- `pkg/server/sql_token_test.go` - Guard callback generation fencing, shutdown admission barriers and rejected-bootstrap worker cleanup.
 - `pkg/server/stat_test.go` - server: Tests uptime.
 - `pkg/server/tidb_library_test.go` - server: Tests memory leak.
 - `pkg/server/tidb_test.go` - server: Tests RC read check TSO conflict.
@@ -103,5 +104,6 @@
 
 ### Tests
 - `pkg/server/tests/tls/auth_token_test.go` - Tests legacy native SQL-token login, grants and credential failures using neutral audience examples over verified MySQL/TLS with owned mock storage.
+- `pkg/server/tests/tls/sql_token_identity_test.go` - Opt-in native SQL-token login over verified TLS, locked-account provisioning, explicit grants, reset/change-user, active/idle/prepared revocation, pessimistic transaction cleanup and expired policy leases.
 - `pkg/server/tests/tls/main_test.go` - Configures default goleak settings and registers testdata.
 - `pkg/server/tests/tls/tls_test.go` - server/tests: Tests TLS verify.

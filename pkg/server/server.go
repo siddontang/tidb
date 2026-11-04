@@ -151,6 +151,8 @@ type Server struct {
 	internalSessions    map[any]struct{}
 	autoIDService       *autoid.Service
 	authTokenCancelFunc context.CancelFunc
+	sqlTokenRuntime     *privileges.SQLTokenRuntime
+	sqlTokenClosed      atomic.Bool
 	wg                  sync.WaitGroup
 	printMDLLogTime     time.Time
 
@@ -317,6 +319,19 @@ func NewServer(cfg *config.Config, driver IDriver) (*Server, error) {
 		return nil, errors.Trace(err)
 	}
 
+	if tlsConfig != nil {
+		setSSLVariable(s.cfg.Security.SSLCA, s.cfg.Security.SSLKey, s.cfg.Security.SSLCert)
+		atomic.StorePointer(&s.tlsConfig, unsafe.Pointer(tlsConfig))
+		logutil.BgLogger().Info("mysql protocol server secure connection is enabled",
+			zap.Bool("client verification enabled", len(variable.GetSysVar("ssl_ca").Value) > 0))
+	}
+	if s.tlsConfig != nil {
+		s.capability |= mysql.ClientSSL
+	}
+	if err := s.initSQLTokenRuntime(); err != nil {
+		return nil, err
+	}
+	// Start background renewal only after all bootstrap validation succeeds.
 	// Automatically reload auto-generated certificates.
 	// The certificates are re-created every 30 days and are valid for 90 days.
 	if autoReload {
@@ -334,15 +349,6 @@ func NewServer(cfg *config.Config, driver IDriver) (*Server, error) {
 		}()
 	}
 
-	if tlsConfig != nil {
-		setSSLVariable(s.cfg.Security.SSLCA, s.cfg.Security.SSLKey, s.cfg.Security.SSLCert)
-		atomic.StorePointer(&s.tlsConfig, unsafe.Pointer(tlsConfig))
-		logutil.BgLogger().Info("mysql protocol server secure connection is enabled",
-			zap.Bool("client verification enabled", len(variable.GetSysVar("ssl_ca").Value) > 0))
-	}
-	if s.tlsConfig != nil {
-		s.capability |= mysql.ClientSSL
-	}
 	variable.RegisterStatistics(s)
 	return s, nil
 }
@@ -661,6 +667,7 @@ func (s *Server) closeListener() {
 
 // Close closes the server.
 func (s *Server) Close() {
+	s.closeSQLTokenRuntime()
 	s.startShutdown()
 	s.rwlock.Lock() // // prevent new connections
 	defer s.rwlock.Unlock()

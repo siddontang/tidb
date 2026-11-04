@@ -28,13 +28,14 @@ import (
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jws"
 	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/sessionctx/sessionauth"
 )
 
 const (
-	// SQLTokenPlugin is a proposed, opt-in native authentication profile. This
-	// verifier does not register it with the server or enable an authentication path.
-	SQLTokenPlugin = "tidb_sql_token_v1"
+	// SQLTokenPlugin is the opt-in native authentication profile. Its receiver
+	// remains unavailable until an operator installs a fresh authenticated policy.
+	SQLTokenPlugin = mysql.AuthTiDBSQLToken
 	// SQLTokenType pins the protected JWT header to the native SQL profile.
 	SQLTokenType = "tidb-sql+jwt"
 	// SQLTokenVersion is the exact JSON number required by the v1 profile.
@@ -130,11 +131,18 @@ type SQLTokenPolicy struct {
 // handshake integration, snapshot refresh, or SQL grants. All errors are fixed
 // sentinels; parser/cryptography errors must not expose authentication material.
 func VerifySQLToken(raw []byte, request SQLTokenRequest, policy SQLTokenPolicy, now time.Time) (sessionauth.Identity, error) {
+	return verifySQLTokenAtBounds(raw, request, policy, now, now)
+}
+
+// verifySQLTokenAtBounds uses the earliest trusted time for not-before checks and
+// the latest for expiry. A challenged authority response has bounded uncertainty;
+// using its upper bound for nbf would admit a token before it becomes valid.
+func verifySQLTokenAtBounds(raw []byte, request SQLTokenRequest, policy SQLTokenPolicy, lower, upper time.Time) (sessionauth.Identity, error) {
 	var zero sessionauth.Identity
 	if !validSQLTarget(policy.Target) || !sqlTokenString(policy.Issuer, sqlTokenMaxIssuerBytes) ||
-		policy.SnapshotRevision == 0 || !validSQLTime(now) || !validSQLTime(policy.ValidFrom) ||
+		policy.SnapshotRevision == 0 || !validSQLTime(lower) || !validSQLTime(upper) || upper.Before(lower) || !validSQLTime(policy.ValidFrom) ||
 		!validSQLTime(policy.ValidUntil) || !policy.ValidFrom.Before(policy.ValidUntil) ||
-		now.Before(policy.ValidFrom) || !now.Before(policy.ValidUntil) ||
+		lower.Before(policy.ValidFrom) || !upper.Before(policy.ValidUntil) ||
 		policy.MaxTokenLifetime <= 0 || policy.MaxTokenLifetime > sqlTokenMaxLifetime ||
 		policy.MaxSessionDuration <= 0 || policy.MaxSessionDuration > sqlTokenMaxSessionDuration {
 		return zero, ErrSQLTokenPolicyUnavailable
@@ -190,7 +198,7 @@ func VerifySQLToken(raw []byte, request SQLTokenRequest, policy SQLTokenPolicy, 
 	nbf, nbfOK := sqlTokenNumericDate(claims[jwt.NotBeforeKey])
 	exp, expOK := sqlTokenNumericDate(claims[jwt.ExpirationKey])
 	if !iatOK || !nbfOK || !expOK || iat.After(nbf) || !nbf.Before(exp) ||
-		iat.After(now) || nbf.After(now) || !now.Before(exp) || exp.Sub(iat) > policy.MaxTokenLifetime {
+		iat.After(lower) || nbf.After(lower) || !upper.Before(exp) || exp.Sub(iat) > policy.MaxTokenLifetime {
 		return zero, ErrInvalidSQLToken
 	}
 	if claims[jwt.IssuerKey] != policy.Issuer || claims[jwt.AudienceKey] != policy.Target.Audience ||
@@ -199,7 +207,7 @@ func VerifySQLToken(raw []byte, request SQLTokenRequest, policy SQLTokenPolicy, 
 	}
 	bindingID := claims[SQLTokenClaimBindingID].(string)
 	binding, ok := policy.Bindings[bindingID]
-	if !ok || !binding.Enabled || !validSQLTime(binding.ExpiresAt) || !now.Before(binding.ExpiresAt) ||
+	if !ok || !binding.Enabled || !validSQLTime(binding.ExpiresAt) || !upper.Before(binding.ExpiresAt) ||
 		!sqlTokenString(binding.PrincipalID, sqlTokenMaxIDBytes) ||
 		binding.NativeUsername != request.NativeUsername || binding.NativeHost != request.NativeHost ||
 		binding.BindingRevision == 0 || binding.BindingRevision != bindingRevision ||
@@ -210,16 +218,16 @@ func VerifySQLToken(raw []byte, request SQLTokenRequest, policy SQLTokenPolicy, 
 	}
 	// Token expiry limits login, not session duration. These initial deadlines do
 	// not authorize a caller to skip guard registration or later policy checks.
-	sessionLifetime := min(policy.MaxSessionDuration, binding.ExpiresAt.Sub(now))
+	sessionLifetime := min(policy.MaxSessionDuration, binding.ExpiresAt.Sub(upper))
 	return sessionauth.Identity{
 		Target:         policy.Target,
 		PrincipalID:    binding.PrincipalID,
 		NativeUsername: request.NativeUsername, NativeHost: request.NativeHost,
 		BindingID: bindingID, BindingRevision: bindingRevision, PolicyRevision: policyRevision,
 		Issuer: policy.Issuer, KeyID: kid, Profile: SQLTokenPlugin, TokenID: claims[jwt.JwtIDKey].(string),
-		VerificationSnapshotRevision: policy.SnapshotRevision, AuthenticatedAt: now,
-		SessionDeadline:     now.Add(sessionLifetime),
-		PolicyLeaseDeadline: now.Add(min(sessionLifetime, policy.ValidUntil.Sub(now))),
+		VerificationSnapshotRevision: policy.SnapshotRevision, AuthenticatedAt: lower,
+		SessionDeadline:     lower.Add(sessionLifetime),
+		PolicyLeaseDeadline: lower.Add(min(sessionLifetime, policy.ValidUntil.Sub(upper))),
 	}, nil
 }
 

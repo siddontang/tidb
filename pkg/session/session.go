@@ -2218,6 +2218,9 @@ func ExecRestrictedStmt4Test(ctx context.Context, s sessionapi.Session,
 
 // only set and clean session with execOption
 func (s *session) useCurrentSession(execOption sqlexec.ExecOption) (*session, func(), error) {
+	if err := s.checkSQLTokenAccess(); err != nil {
+		return nil, nil, err
+	}
 	var err error
 	orgSnapshotInfoSchema, orgSnapshotTS := s.sessionVars.SnapshotInfoschema, s.sessionVars.SnapshotTS
 	if execOption.SnapshotTS != 0 {
@@ -2270,11 +2273,18 @@ func (s *session) useCurrentSession(execOption sqlexec.ExecOption) (*session, fu
 }
 
 func (s *session) getInternalSession(execOption sqlexec.ExecOption) (*session, func(), error) {
+	if err := s.checkSQLTokenAccess(); err != nil {
+		return nil, nil, err
+	}
 	tmp, err := s.sysSessionPool().Get()
 	if err != nil {
 		return nil, nil, errors.Trace(err)
 	}
 	se := tmp.(*session)
+	if err := s.checkSQLTokenStore(se.store); err != nil {
+		s.sysSessionPool().Put(tmp)
+		return nil, nil, err
+	}
 
 	// The special session will share the `InspectionTableCache` with current session
 	// if the current session in inspection mode.
@@ -2311,7 +2321,18 @@ func (s *session) getInternalSession(execOption sqlexec.ExecOption) (*session, f
 		se.sessionVars.PartitionPruneMode.Store(execOption.PartitionPruneMode)
 	}
 	se.sessionVars.EnableDDLAnalyzeExecOpt = execOption.EnableDDLAnalyze
+	// Internal work keeps its native restricted privileges, but work performed
+	// for a token session retains that session's scope and lifetime authority.
+	previousIdentity := se.sessionVars.SQLTokenIdentity
+	previousAuthorization := se.sessionVars.SQLTokenAuthorization
+	previousTarget := se.sessionVars.SQLTokenTarget
+	se.sessionVars.SQLTokenIdentity = s.sessionVars.SQLTokenIdentity
+	se.sessionVars.SQLTokenAuthorization = s.sessionVars.SQLTokenAuthorization
+	se.sessionVars.SQLTokenTarget = s.sessionVars.SQLTokenTarget
 	return se, func() {
+		se.sessionVars.SQLTokenIdentity = previousIdentity
+		se.sessionVars.SQLTokenAuthorization = previousAuthorization
+		se.sessionVars.SQLTokenTarget = previousTarget
 		se.sessionVars.AnalyzeVersion = prevStatsVer
 		se.sessionVars.EnableAnalyzeSnapshot = prevAnalyzeSnapshot
 		if err := se.sessionVars.SetSystemVar(vardef.TiDBSnapshot, ""); err != nil {
@@ -2433,6 +2454,9 @@ func (i isInternalAlias) isInternalDumpTriggerCheck(config *traceevent.DumpTrigg
 }
 
 func (s *session) ExecuteStmt(ctx context.Context, stmtNode ast.StmtNode) (sqlexec.RecordSet, error) {
+	if err := s.checkSQLTokenAccess(); err != nil {
+		return nil, err
+	}
 	if fr := traceevent.GetFlightRecorder(); fr != nil {
 		traceevent.CheckFlightRecorderDumpTrigger(ctx, "dump_trigger.sampling", fr.CheckSampling)
 	}
@@ -3243,6 +3267,9 @@ func (s *session) rollbackOnError(ctx context.Context) {
 
 // PrepareStmt is used for executing prepare statement in binary protocol
 func (s *session) PrepareStmt(sql string) (stmtID uint32, paramCount int, fields []*resolve.ResultField, err error) {
+	if err = s.checkSQLTokenAccess(); err != nil {
+		return
+	}
 	defer func() {
 		if s.sessionVars.StmtCtx != nil {
 			s.sessionVars.StmtCtx.DetachMemDiskTracker()
@@ -3594,6 +3621,17 @@ func (s *session) Auth(user *auth.UserIdentity, authentication, salt []byte, aut
 	if err != nil {
 		return privileges.ErrAccessDenied.FastGenByArgs(user.Username, user.Hostname, hasPassword)
 	}
+	// The audience is operator configured; storage identity comes from this
+	// session's actual store, never client attributes or JWT claims.
+	s.sessionVars.SQLTokenTarget = nil
+	if runtime := privileges.CurrentSQLTokenRuntime(); runtime != nil {
+		target, targetErr := privileges.SQLTokenTargetForStore(s.store, runtime.Target().Audience)
+		if targetErr == nil {
+			s.sessionVars.SQLTokenTarget = &target
+		} else if runtime.IsManagedUsername(user.Username) || user.AuthPlugin == mysql.AuthTiDBSQLToken {
+			return privileges.ErrSQLTokenAccessDenied
+		}
+	}
 	// Check whether continuous login failure is enabled to lock the account.
 	// If enabled, determine whether to unlock the account and notify TiDB to update the cache.
 	enableAutoLock := pm.IsAccountAutoLockEnabled(authUser.Username, authUser.Hostname)
@@ -3691,11 +3729,18 @@ func (s *session) Auth(user *auth.UserIdentity, authentication, salt []byte, aut
 			return err
 		}
 	}
+	roles := pm.GetDefaultRoles(context.Background(), authUser.Username, authUser.Hostname)
+	authorization, err := s.stageSQLTokenAuthentication(info.SQLTokenIdentity, authConn, info.SQLTokenNativeCheck)
+	if err != nil {
+		return err
+	}
 	pm.AuthSuccess(authUser.Username, authUser.Hostname)
 	user.AuthUsername = authUser.Username
 	user.AuthHostname = authUser.Hostname
 	s.sessionVars.User = user
-	s.sessionVars.ActiveRoles = pm.GetDefaultRoles(context.Background(), user.AuthUsername, user.AuthHostname)
+	s.sessionVars.ActiveRoles = roles
+	s.sessionVars.SQLTokenIdentity = info.SQLTokenIdentity
+	s.sessionVars.SQLTokenAuthorization = authorization
 	return nil
 }
 
@@ -3930,6 +3975,14 @@ func (s *session) MatchIdentity(ctx context.Context, username, remoteHost string
 
 // AuthWithoutVerification is required by the ResetConnection RPC
 func (s *session) AuthWithoutVerification(ctx context.Context, user *auth.UserIdentity) bool {
+	if user == nil || s.sessionVars.SQLTokenIdentity != nil || s.sessionVars.SQLTokenAuthorization != nil ||
+		user.AuthPlugin == mysql.AuthTiDBSQLToken {
+		return false
+	}
+	if runtime := privileges.CurrentSQLTokenRuntime(); runtime != nil &&
+		(runtime.IsManagedUsername(user.Username) || runtime.IsManagedUsername(user.AuthUsername)) {
+		return false
+	}
 	pm := privilege.GetPrivilegeManager(s)
 	authUser, err := s.MatchIdentity(ctx, user.Username, user.Hostname)
 	if err != nil {
@@ -5468,6 +5521,9 @@ func (s *session) SetMemoryFootprintChangeHook() {
 
 func (s *session) EncodeStates(ctx context.Context,
 	sessionStates *sessionstates.SessionStates) error {
+	if s.isSQLTokenSession() {
+		return sessionstates.ErrCannotMigrateSession.GenWithStackByArgs("SQL token sessions cannot be migrated")
+	}
 	// Transaction status is hard to encode, so we do not support it.
 	s.txn.mu.Lock()
 	valid := s.txn.Valid()

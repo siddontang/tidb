@@ -2097,6 +2097,10 @@ func (p *MySQLPrivilege) SetGlobalVarsAccessor(globalVars variable.GlobalVarAcce
 type Handle struct {
 	sctx util.SessionPool
 	priv atomic.Pointer[MySQLPrivilege]
+	// sqlTokenNativeMu orders snapshot publication with token account epochs.
+	// Publication never calls the SQL-token runtime while holding this mutex.
+	sqlTokenNativeMu     sync.Mutex
+	sqlTokenNativeEpochs map[auth.RoleIdentity]*sqlTokenNativeEpoch
 	// Only load the active user's data to save memory
 	// username => struct{}
 	activeUsers sync.Map
@@ -2133,10 +2137,13 @@ func (h *Handle) ensureActiveUser(ctx context.Context, user string) error {
 }
 
 func (h *Handle) merge(data *MySQLPrivilege, userList map[string]struct{}) {
+	h.sqlTokenNativeMu.Lock()
+	defer h.sqlTokenNativeMu.Unlock()
 	for {
 		old := h.Get()
 		swapped := h.priv.CompareAndSwap(old, old.merge(data, userList))
 		if swapped {
+			h.refreshSQLTokenNativeEpochsLocked(h.Get())
 			break
 		}
 	}
@@ -2164,7 +2171,7 @@ func (h *Handle) UpdateAll() error {
 	if err != nil {
 		return errors.Trace(err)
 	}
-	h.priv.Store(priv)
+	h.publishSQLTokenNativeSnapshot(priv)
 	h.fullData.Store(true)
 	return nil
 }

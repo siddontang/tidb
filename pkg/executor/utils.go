@@ -132,6 +132,11 @@ func encodedPassword(n *ast.UserSpec, defaultPlugin string) (string, bool) {
 	if authPlugin == "" {
 		authPlugin = defaultPlugin
 	}
+	// SQL tokens are presented only at connection authentication. Native account
+	// rows carry neither a password hash nor a reusable token/issuer string.
+	if authPlugin == mysql.AuthTiDBSQLToken {
+		return "", opt.AuthString == "" && opt.HashString == ""
+	}
 	if opt.ByAuthString {
 		switch authPlugin {
 		case mysql.AuthCachingSha2Password, mysql.AuthTiDBSM3Password:

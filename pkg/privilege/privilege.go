@@ -22,6 +22,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/privilege/conn"
 	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/sessionctx/sessionauth"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/sqlexec"
@@ -35,6 +36,10 @@ func (k keyType) String() string {
 
 // VerificationInfo records some information returned by Manager.ConnectionVerification
 type VerificationInfo struct {
+	// SQLTokenIdentity is published only after native authentication succeeds.
+	SQLTokenIdentity *sessionauth.Identity
+	// SQLTokenNativeCheck fences native authorization changes since verification.
+	SQLTokenNativeCheck func() bool
 	// InSandBoxMode indicates that the session will enter sandbox mode, and only execute statement for resetting password.
 	InSandBoxMode bool
 	// FailedDueToWrongPassword indicates that the verification failed due to wrong password.

@@ -63,3 +63,19 @@ type Identity struct {
 	SessionDeadline              time.Time
 	PolicyLeaseDeadline          time.Time
 }
+
+// Authorization is a live, terminal-on-revocation guard owned by the physical
+// connection. RESET CONNECTION may reuse it but must never renew its deadline.
+// Implementations must be safe for concurrent policy updates and SQL execution.
+type Authorization interface {
+	Check() error
+	Identity() Identity
+}
+
+// Connection stages a verified identity until the complete native login succeeds.
+// NativeCheck reads the exact native account from the privilege cache; it must
+// not access mutable session state, perform I/O, or acquire connection locks.
+// A failed change-user attempt discards the candidate and retains the old guard.
+type Connection interface {
+	StageSQLTokenIdentity(identity Identity, nativeCheck func() bool) (Authorization, error)
+}

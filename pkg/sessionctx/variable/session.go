@@ -45,6 +45,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	ptypes "github.com/pingcap/tidb/pkg/parser/types"
 	"github.com/pingcap/tidb/pkg/resourcegroup"
+	"github.com/pingcap/tidb/pkg/sessionctx/sessionauth"
 	"github.com/pingcap/tidb/pkg/sessionctx/sessionstates"
 	"github.com/pingcap/tidb/pkg/sessionctx/slowlogrule"
 	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
@@ -865,6 +866,14 @@ type SessionVars struct {
 
 	// User is the user identity with which the session login.
 	User *auth.UserIdentity
+
+	// SQLTokenTarget is derived from the actual session store during authentication.
+	// These trusted fields are never encoded or decoded as SessionStates.
+	SQLTokenTarget *sessionauth.Target
+	// SQLTokenIdentity contains verified, secret-free identity facts.
+	SQLTokenIdentity *sessionauth.Identity
+	// SQLTokenAuthorization is owned by the connection and survives session reset.
+	SQLTokenAuthorization sessionauth.Authorization
 
 	// Port is the port of the connected socket
 	Port string

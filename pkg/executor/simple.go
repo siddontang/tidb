@@ -50,6 +50,7 @@ import (
 	"github.com/pingcap/tidb/pkg/planner/core/resolve"
 	"github.com/pingcap/tidb/pkg/plugin"
 	"github.com/pingcap/tidb/pkg/privilege"
+	"github.com/pingcap/tidb/pkg/privilege/privileges"
 	"github.com/pingcap/tidb/pkg/resourcegroup"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/sessionstates"
@@ -1201,7 +1202,7 @@ func (e *SimpleExec) executeCreateUser(ctx context.Context, s *ast.CreateUserStm
 		var pluginImpl *extension.AuthPlugin
 
 		switch authPlugin {
-		case mysql.AuthNativePassword, mysql.AuthCachingSha2Password, mysql.AuthTiDBSM3Password, mysql.AuthSocket, mysql.AuthTiDBAuthToken, mysql.AuthLDAPSimple, mysql.AuthLDAPSASL:
+		case mysql.AuthNativePassword, mysql.AuthCachingSha2Password, mysql.AuthTiDBSM3Password, mysql.AuthSocket, mysql.AuthTiDBAuthToken, mysql.AuthTiDBSQLToken, mysql.AuthLDAPSimple, mysql.AuthLDAPSASL:
 		default:
 			found := false
 			if extensions, err := extension.GetExtensions(); err != nil {
@@ -1672,6 +1673,23 @@ func (e *SimpleExec) executeAlterUser(ctx context.Context, s *ast.AlterUserStmt)
 		s.Specs = []*ast.UserSpec{spec}
 	}
 
+	// Password-only ALTER USER is normally allowed for oneself without CREATE
+	// USER. Token-bound accounts cannot use that exception to change auth mode.
+	vars := e.Ctx().GetSessionVars()
+	if user := vars.User; user != nil {
+		managed := vars.SQLTokenIdentity != nil || vars.SQLTokenAuthorization != nil || user.AuthPlugin == mysql.AuthTiDBSQLToken
+		if runtime := privileges.CurrentSQLTokenRuntime(); runtime != nil {
+			managed = managed || runtime.IsManagedUsername(user.Username) || runtime.IsManagedUsername(user.AuthUsername)
+		}
+		if managed {
+			for _, spec := range s.Specs {
+				if spec.AuthOpt != nil && (spec.User.CurrentUser || spec.User.Username == user.Username || spec.User.Username == user.AuthUsername) {
+					return privileges.ErrSQLTokenAccessDenied
+				}
+			}
+		}
+	}
+
 	userResource := &resourceOptionsInfo{
 		maxQueriesPerHour:     0,
 		maxUpdatesPerHour:     0,
@@ -1826,7 +1844,7 @@ func (e *SimpleExec) executeAlterUser(ctx context.Context, s *ast.AlterUserStmt)
 			authPlugins := extensions.GetAuthPlugins()
 			var authPluginImpl *extension.AuthPlugin
 			switch spec.AuthOpt.AuthPlugin {
-			case mysql.AuthNativePassword, mysql.AuthCachingSha2Password, mysql.AuthTiDBSM3Password, mysql.AuthSocket, mysql.AuthLDAPSimple, mysql.AuthLDAPSASL, "":
+			case mysql.AuthNativePassword, mysql.AuthCachingSha2Password, mysql.AuthTiDBSM3Password, mysql.AuthSocket, mysql.AuthTiDBSQLToken, mysql.AuthLDAPSimple, mysql.AuthLDAPSASL, "":
 				authTokenOptionHandler = noNeedAuthTokenOptions
 			case mysql.AuthTiDBAuthToken:
 				if authTokenOptionHandler != OptionalAuthTokenOptions {
@@ -2537,6 +2555,12 @@ func (e *SimpleExec) executeSetPwd(ctx context.Context, s *ast.SetPwdStmt) error
 	}
 	if !exists {
 		return errors.Trace(exeerrors.ErrPasswordNoMatch)
+	}
+	if authplugin == mysql.AuthTiDBSQLToken {
+		return privileges.ErrSQLTokenAccessDenied
+	}
+	if runtime := privileges.CurrentSQLTokenRuntime(); runtime != nil && runtime.IsManagedUsername(u) {
+		return privileges.ErrSQLTokenAccessDenied
 	}
 	if e.Ctx().InSandBoxMode() {
 		if !(s.User == nil || s.User.CurrentUser ||

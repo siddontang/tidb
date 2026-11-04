@@ -288,6 +288,9 @@ func (p *UserPrivileges) authenticateWithPlugin(user *auth.UserIdentity, authent
 
 func (p *UserPrivileges) isValidHash(record *UserRecord) bool {
 	pwd := record.AuthenticationString
+	if record.AuthPlugin == mysql.AuthTiDBSQLToken {
+		return pwd == ""
+	}
 	if pwd == "" {
 		return true
 	}
@@ -346,6 +349,10 @@ func (p *UserPrivileges) GetUserResources(user, host string) (int64, error) {
 
 // GetAuthPluginForConnection gets the authentication plugin used in connection establishment.
 func (p *UserPrivileges) GetAuthPluginForConnection(ctx context.Context, user, host string) (string, error) {
+	runtime := CurrentSQLTokenRuntime()
+	if SkipWithGrant && runtime != nil {
+		return "", ErrSQLTokenAccessDenied
+	}
 	if SkipWithGrant {
 		return mysql.AuthNativePassword, nil
 	}
@@ -355,6 +362,15 @@ func (p *UserPrivileges) GetAuthPluginForConnection(ctx context.Context, user, h
 	record := mysqlPriv.connectionVerification(user, host)
 	if record == nil {
 		return "", errors.New("Failed to get user record")
+	}
+	if runtime != nil && runtime.IsManagedUsername(user) && record.AuthPlugin != mysql.AuthTiDBSQLToken {
+		return "", ErrSQLTokenAccessDenied
+	}
+	if record.AuthPlugin == mysql.AuthTiDBSQLToken {
+		if runtime == nil || record.AuthenticationString != "" {
+			return "", ErrSQLTokenAccessDenied
+		}
+		return mysql.AuthTiDBSQLToken, nil
 	}
 	if authPlugin, ok := p.authPlugins[record.AuthPlugin]; ok {
 		return authPlugin.Name, nil
@@ -410,6 +426,9 @@ func (p *UserPrivileges) MatchUserResourceGroupName(exec sqlexec.RestrictedSQLEx
 
 // GetAuthWithoutVerification implements the Manager interface.
 func (p *UserPrivileges) GetAuthWithoutVerification(user, host string) (success bool) {
+	if runtime := CurrentSQLTokenRuntime(); runtime != nil && (SkipWithGrant || runtime.IsManagedUsername(user)) {
+		return false
+	}
 	if SkipWithGrant {
 		p.user = user
 		p.host = host
@@ -425,6 +444,9 @@ func (p *UserPrivileges) GetAuthWithoutVerification(user, host string) (success 
 		return
 	}
 
+	if record.AuthPlugin == mysql.AuthTiDBSQLToken {
+		return false
+	}
 	p.user = user
 	p.host = record.Host
 	success = true
@@ -592,6 +614,10 @@ func BuildPasswordLockingJSON(failedLoginAttempts int64,
 
 // ConnectionVerification implements the Manager interface.
 func (p *UserPrivileges) ConnectionVerification(user *auth.UserIdentity, authUser, authHost string, authentication, salt []byte, sessionVars *variable.SessionVars, authConn conn.AuthConn) (info privilege.VerificationInfo, err error) {
+	runtime := CurrentSQLTokenRuntime()
+	if SkipWithGrant && (runtime != nil || user.AuthPlugin == mysql.AuthTiDBSQLToken) {
+		return info, ErrSQLTokenAccessDenied
+	}
 	if SkipWithGrant {
 		p.user = authUser
 		p.host = authHost
@@ -626,8 +652,42 @@ func (p *UserPrivileges) ConnectionVerification(user *auth.UserIdentity, authUse
 		return info, ErrAccessDenied.FastGenByArgs(user.Username, user.Hostname, hasPassword)
 	}
 
-	// If the user uses session token to log in, skip checking record.AuthPlugin.
-	if user.AuthPlugin == mysql.AuthTiDBSessionToken {
+	// Classification precedes migration and password authentication. A managed
+	// username remains token-only even after a privileged native plugin change.
+	managed := runtime != nil && (runtime.IsManagedUsername(user.Username) || runtime.IsManagedUsername(authUser))
+	if managed && (record.AuthPlugin != mysql.AuthTiDBSQLToken || user.Username != authUser) {
+		return info, ErrSQLTokenAccessDenied
+	}
+	if record.AuthPlugin == mysql.AuthTiDBSQLToken {
+		if runtime == nil || user.AuthPlugin == mysql.AuthTiDBSessionToken || user.Username != authUser ||
+			sessionVars.SQLTokenTarget == nil || sessionVars.TLSConnectionState == nil ||
+			record.AccountLocked || record.AutoAccountLocked || record.PasswordExpired {
+			return info, ErrSQLTokenAccessDenied
+		}
+		// mysql_clear_password carries one terminating NUL. Never trim arbitrary
+		// bytes or log verifier errors containing untrusted authentication input.
+		raw := authentication
+		if len(raw) > 0 && raw[len(raw)-1] == 0 {
+			raw = raw[:len(raw)-1]
+		}
+		nativeCheck := p.Handle.sqlTokenNativeCheckForSnapshot(authUser, authHost, mysqlPriv)
+		if !nativeCheck() {
+			return info, ErrSQLTokenAccessDenied
+		}
+		identity, verifyErr := runtime.Authenticate(raw, SQLTokenRequest{
+			Target: *sessionVars.SQLTokenTarget, NativeUsername: record.User,
+			NativeHost: record.Host, NativePlugin: record.AuthPlugin,
+			AccountLocked: record.AccountLocked || record.AutoAccountLocked, TLSEstablished: true,
+		})
+		if verifyErr != nil {
+			return info, ErrSQLTokenAccessDenied
+		}
+		info.SQLTokenIdentity = &identity
+		info.SQLTokenNativeCheck = nativeCheck
+	} else if user.AuthPlugin == mysql.AuthTiDBSQLToken {
+		return info, ErrSQLTokenAccessDenied
+	} else if user.AuthPlugin == mysql.AuthTiDBSessionToken {
+		// Legacy migration remains available only to non-token-managed accounts.
 		if err = sessionstates.ValidateSessionToken(authentication, user.Username); err != nil {
 			logutil.BgLogger().Warn("verify session token failed", zap.String("username", user.Username), zap.Error(err))
 			return info, ErrAccessDenied.FastGenByArgs(user.Username, user.Hostname, hasPassword)
@@ -721,8 +781,36 @@ func (p *UserPrivileges) ConnectionVerification(user *auth.UserIdentity, authUse
 	// Otherwise, the user cannot log in or execute statements after migration.
 	if user.AuthPlugin != mysql.AuthTiDBSessionToken {
 		info.InSandBoxMode, err = p.CheckPasswordExpired(sessionVars, record)
+		if info.SQLTokenIdentity != nil && (err != nil || info.InSandBoxMode) {
+			info.SQLTokenIdentity = nil
+			info.SQLTokenNativeCheck = nil
+			return info, ErrSQLTokenAccessDenied
+		}
 	}
 	return
+}
+
+// SQLTokenNativeCheck captures the exact native authorization generation.
+// It performs no SQL, network I/O or session mutation and is safe for guard checks.
+func (p *UserPrivileges) SQLTokenNativeCheck(user, host string) func() bool {
+	return p.Handle.sqlTokenNativeCheck(user, host)
+}
+
+// SQLTokenValidateAccount applies native account expiry rules during reset.
+// Guard callbacks must use SQLTokenNativeCheck instead: this method may read globals.
+func (p *UserPrivileges) SQLTokenValidateAccount(user, host string, vars *variable.SessionVars) error {
+	if !p.SQLTokenNativeCheck(user, host)() {
+		return ErrSQLTokenAccessDenied
+	}
+	record := p.Handle.Get().connectionVerification(user, host)
+	if record == nil {
+		return ErrSQLTokenAccessDenied
+	}
+	sandbox, err := p.CheckPasswordExpired(vars, record)
+	if err != nil || sandbox {
+		return ErrSQLTokenAccessDenied
+	}
+	return nil
 }
 
 // AuthSuccess is to make the permission take effect.
