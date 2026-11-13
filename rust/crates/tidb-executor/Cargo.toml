@@ -19,6 +19,7 @@ test-util = [
 ]
 
 [dependencies]
+tidb-br-show = { path = "../tidb-br-show" }
 tidb-failpoint = { path = "../tidb-failpoint" }
 tidb-cpuprofile = { path = "../tidb-cpuprofile" }
 tidb-temptable = { path = "../tidb-temptable" }

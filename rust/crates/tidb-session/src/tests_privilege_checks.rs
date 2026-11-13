@@ -63,6 +63,18 @@ fn show_grants_quotes_accounts_as_go_does() {
     );
 }
 
+/// Go buildSimple checks the BRIE privilege before showMetaExec opens storage.
+#[test]
+fn show_backup_metadata_checks_backup_admin_before_opening_storage() {
+    let (registry, mut root) = setup();
+    root.run("create user backup_reader").unwrap();
+    let mut reader = session_as(&registry, root.shared_catalog(), "backup_reader", "%");
+    let sql = "SHOW BACKUP METADATA FROM 'local:///nonexistent-tidb-br-metadata'";
+    assert_eq!(error_of(&mut reader, sql).0, 1227);
+    root.run("grant BACKUP_ADMIN on *.* to backup_reader").unwrap();
+    assert!(error_of(&mut reader, sql).1.contains("load backupmeta failed"));
+}
+
 /// Go `buildAdmin` needs SUPER for every ADMIN statement past its early
 /// returns, refused as `ErrPrivilegeCheckFail`; FLUSH PLAN CACHE is one of
 /// those early returns.

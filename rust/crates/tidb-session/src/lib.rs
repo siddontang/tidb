@@ -2430,6 +2430,15 @@ impl Session {
         self.run_with_columns_parsed(bound, sql)
     }
 
+    fn fixed_prepared_columns(statement: &Stmt) -> Option<Vec<(String, FieldType)>> {
+        if matches!(statement, Stmt::Admin(admin) if matches!(admin.as_ref(),
+            tidb_ast::AdminStmt::Brie(brie) if brie.kind == tidb_ast::BrieKind::ShowBackupMetadata))
+        {
+            return Some(tidb_executor::brie::backup_metadata_columns());
+        }
+        session_states::prepared_columns(statement)
+    }
+
     /// Plans a bound prepared query for its result metadata without opening
     /// or draining a storage reader. Go's `PrepareExec` builds the
     /// `PlanCacheStmt` and takes its schema from the plan; it does not execute
@@ -2441,7 +2450,7 @@ impl Session {
         &mut self,
         mut statement: Stmt,
     ) -> Result<Vec<(String, FieldType)>, DriverError> {
-        if let Some(columns) = session_states::prepared_columns(&statement) {
+        if let Some(columns) = Self::fixed_prepared_columns(&statement) {
             return Ok(columns);
         }
         let parameters = tidb_executor::bound_parameter_values(&mut statement)?;
@@ -2470,7 +2479,7 @@ impl Session {
     /// Resolves PREPARE result metadata with NULL markers without publishing
     /// an execution cache entry or access-path pins.
     pub fn probe_prepared(&mut self, prepared: &PreparedAst) -> Result<StmtOutput, DriverError> {
-        if let Some(columns) = session_states::prepared_columns(prepared.statement()) {
+        if let Some(columns) = Self::fixed_prepared_columns(prepared.statement()) {
             return Ok(StmtOutput::Rows { columns, rows: Vec::new() });
         }
         let values = vec![Datum::Null; prepared.parameter_count()];

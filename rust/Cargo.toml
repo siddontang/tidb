@@ -7,6 +7,7 @@
 resolver = "2"
 members = [
     "crates/tidb-failpoint",
+    "crates/tidb-br-show",
     "crates/tidb-server-err",
     "crates/tidb-plannererrors",
     "crates/tidb-errctx",

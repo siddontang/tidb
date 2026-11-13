@@ -35,6 +35,7 @@ mod reorg_partition_ddl_failures_source;
 mod row_decoder_source;
 mod shard_row_id_bits_source;
 mod shared_physical_select_builder_source;
+mod show_backup_metadata;
 mod table_mode_transition_source;
 mod table_options_source;
 mod tagged_ptr_source;

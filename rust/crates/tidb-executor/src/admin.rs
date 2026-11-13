@@ -804,6 +804,9 @@ pub trait AdminExec: crate::index_advisor::RecommendIndexExec {
             // See `crate::explain`'s module doc for every place
             // this tier's plan text diverges from Go's and why.
             tidb_ast::AdminStmt::Explain(explain) => self.explain_stmt(explain),
+            tidb_ast::AdminStmt::Brie(brie) if brie.kind == tidb_ast::BrieKind::ShowBackupMetadata => {
+                crate::brie::show_backup_metadata(&brie.storage, &self.session_time_zone()).map(Some)
+            }
             // Go `executeAdminSetBDRRole` / `executeAdminUnsetBDRRole` write
             // the meta key `BDRRole`; `AdminShowBDRRoleExec` reads it.
             tidb_ast::AdminStmt::SetBdrRole(_)

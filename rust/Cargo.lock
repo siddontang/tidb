@@ -3700,6 +3700,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidb-br-show"
+version = "0.0.0"
+dependencies = [
+ "prost 0.14.4",
+ "serde_json",
+ "sha2",
+ "tidb-model",
+ "tikv-client-kvproto",
+]
+
+[[package]]
 name = "tidb-breakpoint"
 version = "0.0.0"
 dependencies = [
@@ -4985,6 +4996,7 @@ dependencies = [
  "tidb-ast",
  "tidb-autoid",
  "tidb-bindinfo",
+ "tidb-br-show",
  "tidb-breakpoint",
  "tidb-charset",
  "tidb-chunk",
