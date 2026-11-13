@@ -3908,6 +3908,7 @@ fn ddl_after_loaded_statistics_matches_go() {
         .open_session(session_context(75))
         .expect("session opens");
     rows(&mut session, "USE test");
+    rows(&mut session, "SET tidb_stats_load_sync_wait=60000");
     rows(
         &mut session,
         "CREATE TABLE stats_ddl_after_load (c1 INT, c2 INT, INDEX idx(c1, c2))",

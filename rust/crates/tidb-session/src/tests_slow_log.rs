@@ -655,6 +655,7 @@ fn an_index_lookups_partial_aggregate_request_peaks_like_go() {
         let dir = log_dir("partial-aggregate-mem-max");
         let (slow, _) = install_loggers(&dir);
         let mut session = Session::new();
+        session.run("SET @@time_zone = 'Asia/Shanghai'").unwrap();
         let values = if table == "clustered" {
             session
                 .run("CREATE TABLE t (a VARCHAR(10) PRIMARY KEY CLUSTERED, b INT, c INT, KEY (b))")

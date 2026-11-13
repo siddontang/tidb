@@ -7747,6 +7747,7 @@ fn an_index_lookup_charges_its_tasks_like_go() {
     ];
     let fresh = |query: &str| {
         let mut session = Session::new();
+        session.run("SET @@time_zone = 'Asia/Shanghai'").unwrap();
         for sql in setup {
             let table = sql.split_whitespace().nth(2).unwrap_or_default();
             if query.contains(&format!("FROM {table} ")) {

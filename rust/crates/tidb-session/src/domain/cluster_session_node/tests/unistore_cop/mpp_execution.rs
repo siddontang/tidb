@@ -926,6 +926,7 @@ fn test_issue_57149() {
 #[test]
 fn json_comparison_stays_above_the_mpp_reader_as_go() {
     let (stack, mut session) = tiflash_session(1, 2171);
+    rows(&mut session, "SET tidb_stats_load_sync_wait=60000");
     rows(&mut session, "create table t1 (pk int  NOT NULL PRIMARY KEY AUTO_INCREMENT, i INT, j JSON)");
     rows(&mut session, "alter table test.t1 set tiflash replica 1");
     replica_available(&stack, &mut session, "t1");
@@ -1823,6 +1824,7 @@ fn test_mpp_bcj_model() {
 #[test]
 fn test_mpp_prefer_bcj() {
     let (stack, mut session) = tiflash_session(3, 2200);
+    rows(&mut session, "SET tidb_stats_load_sync_wait=60000");
     rows(&mut session, "drop table if exists t1");
     rows(&mut session, "create table t1 (a int)");
     rows(&mut session, "drop table if exists t2");
