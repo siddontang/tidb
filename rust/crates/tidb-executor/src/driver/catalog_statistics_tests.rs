@@ -244,63 +244,85 @@
     }
 
     #[test]
-    fn a_singleflight_transport_timeout_activates_statement_failure_before_wait_timer() {
+    fn singleflight_transport_timeouts_before_wait_match_go() {
         let store = crate::test_store::store();
         let handle = Arc::new(StatsHandle::default());
         let _guard = STATS_LOAD_TEST_LOCK.lock().unwrap();
-        // Go master TestSyncWaitStatsLoadWithFailedResultBeforeTimer: prepare
-        // the result before waiting instead of relying on two racing timers.
-        for pseudo in [false, true] {
-            let catalog = tidb_infoschema_perfschema::mock_catalog();
-            let requested = tidb_model::StatsLoadItem {
-                table_item_id: tidb_model::TableItemID {
-                    table_id: 9_800_001,
-                    id: 1,
-                    is_index: false,
-                    is_sync_load_failed: false,
-                },
-                full_load: true,
-            };
-            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-            sender
-                .send(tidb_stats_handle_syncload::sync_load::SyncLoadOutcome::TransportError(
-                    "sync load took too long to return".to_owned(),
-                ))
-                .unwrap();
-            let context = crate::StmtContext::for_query().with_txn_store(Box::new(store.clone())).with_stats_handle(Arc::clone(&handle)).with_stats_load_policy(100, pseudo, 1000);
-            context.install_pending_statistics_load(
-                vec![receiver],
-                vec![requested],
-                std::time::Duration::from_secs(1),
-            );
-            let consumed = tidb_stats_handle_metrics::SYNC_LOAD_TOTAL.get();
-            let timeouts = tidb_stats_handle_metrics::SYNC_LOAD_TIMEOUT_TOTAL.get();
-            let result = catalog.wait_statistics_load(&context);
-            assert!(tidb_stats_handle_metrics::SYNC_LOAD_TOTAL.get() >= consumed + 1.0);
-            assert!(tidb_stats_handle_metrics::SYNC_LOAD_TIMEOUT_TOTAL.get() >= timeouts + 1.0);
-            assert!(
-                context.sync_stats_failed(),
-                "an undelivered item must fail the statement load"
-            );
-            if pseudo {
-                result.expect("pseudo timeout falls back");
-                assert!(context.skip_plan_cache());
-                assert_eq!(context.take_warnings().len(), 1);
-            } else {
-                assert!(result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("some requested items are not loaded in time"));
+        use tidb_stats_handle_metrics::{
+            SYNC_LOAD_HISTOGRAM, SYNC_LOAD_TIMEOUT_TOTAL, SYNC_LOAD_TOTAL,
+        };
+        use tidb_stats_handle_syncload::sync_load::SyncLoadOutcome;
+
+        // Go SyncWaitStatsLoad logs result.Err and continues reading channels.
+        // Buffer the results before waiting to avoid racing the two timers.
+        for (message, worker_error) in [
+            ("sync load took too long to return", None),
+            (
+                "sync load stats channel is full and timeout sending task to channel",
+                Some("storage read failed after retry".to_owned()),
+            ),
+        ] {
+            for pseudo in [false, true] {
+                let catalog = tidb_infoschema_perfschema::mock_catalog();
+                let requested = tidb_model::StatsLoadItem {
+                    table_item_id: tidb_model::TableItemID {
+                        table_id: 9_800_001,
+                        id: 1,
+                        is_index: false,
+                        is_sync_load_failed: false,
+                    },
+                    full_load: true,
+                };
+                let mut delivered = requested;
+                delivered.table_item_id.id = 2;
+                let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                sender
+                    .send(SyncLoadOutcome::TransportError(message.to_owned()))
+                    .unwrap();
+                let (item_sender, item_receiver) = std::sync::mpsc::sync_channel(1);
+                item_sender
+                    .send(SyncLoadOutcome::Item {
+                        item: delivered.table_item_id,
+                        error: worker_error.clone(),
+                    })
+                    .unwrap();
+                let context = crate::StmtContext::for_query()
+                    .with_txn_store(Box::new(store.clone()))
+                    .with_stats_handle(Arc::clone(&handle))
+                    .with_stats_load_policy(100, pseudo, 1000);
+                context.install_pending_statistics_load(
+                    vec![receiver, item_receiver],
+                    vec![requested, delivered],
+                    std::time::Duration::from_secs(1),
+                );
+                let consumed = SYNC_LOAD_TOTAL.get();
+                let timeouts = SYNC_LOAD_TIMEOUT_TOTAL.get();
+                let observations = SYNC_LOAD_HISTOGRAM.get_sample_count();
+                catalog
+                    .wait_statistics_load(&context)
+                    .expect("Go completes the wait after consuming all results");
+                assert_eq!(SYNC_LOAD_TOTAL.get(), consumed + 2.0);
+                assert_eq!(SYNC_LOAD_TIMEOUT_TOTAL.get(), timeouts);
+                assert_eq!(SYNC_LOAD_HISTOGRAM.get_sample_count(), observations);
+                assert!(!context.sync_stats_failed());
                 assert!(!context.skip_plan_cache());
+                assert!(context.take_warnings().is_empty());
+                for item in [requested, delivered] {
+                    let mut failed = item.table_item_id;
+                    failed.is_sync_load_failed = true;
+                    assert!(
+                        !tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS
+                            .all_items()
+                            .iter()
+                            .any(|item| item.table_item_id == failed)
+                    );
+                }
+                assert!(context.take_pending_statistics_load().is_none());
+                catalog
+                    .wait_statistics_load(&context)
+                    .expect("completed wait is consumed");
+                assert_eq!(SYNC_LOAD_TOTAL.get(), consumed + 2.0);
             }
-            let mut failed = requested.table_item_id;
-            failed.is_sync_load_failed = true;
-            assert!(tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS
-                .all_items()
-                .iter()
-                .any(|item| item.table_item_id == failed));
-            tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.delete(failed);
-            assert!(context.take_pending_statistics_load().is_none());
         }
     }
 
@@ -356,12 +378,13 @@
     }
 
     #[test]
-    fn statistics_wait_timeout_and_closed_channel_record_consumption() {
+    fn statistics_wait_timeout_and_closed_channel_follow_failure_policy() {
         let store = crate::test_store::store();
         let handle = Arc::new(StatsHandle::default());
         let _guard = STATS_LOAD_TEST_LOCK.lock().unwrap();
         use tidb_stats_handle_metrics::{SYNC_LOAD_TIMEOUT_TOTAL, SYNC_LOAD_TOTAL};
-        for closed in [false, true] {
+        use tidb_stats_handle_syncload::sync_load::SyncLoadOutcome;
+        for (closed, pseudo) in [(false, false), (true, false), (false, true), (true, true)] {
             let catalog = tidb_infoschema_perfschema::mock_catalog();
             let requested = tidb_model::StatsLoadItem {
                 table_item_id: tidb_model::TableItemID {
@@ -372,7 +395,19 @@
                 },
                 full_load: true,
             };
-            let context = crate::StmtContext::for_query().with_txn_store(Box::new(store.clone())).with_stats_handle(Arc::clone(&handle)).with_stats_load_policy(100, false, 1);
+            // An earlier request timeout must not bypass the remaining channel.
+            let mut earlier = requested;
+            earlier.table_item_id.id = 2;
+            let (earlier_sender, earlier_receiver) = std::sync::mpsc::sync_channel(1);
+            earlier_sender
+                .send(SyncLoadOutcome::TransportError(
+                    "sync load took too long to return".to_owned(),
+                ))
+                .unwrap();
+            let context = crate::StmtContext::for_query()
+                .with_txn_store(Box::new(store.clone()))
+                .with_stats_handle(Arc::clone(&handle))
+                .with_stats_load_policy(100, pseudo, 1);
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             let sender = if closed {
                 drop(sender);
@@ -381,26 +416,48 @@
                 Some(sender)
             };
             context.install_pending_statistics_load(
-                vec![receiver],
-                vec![requested],
+                vec![earlier_receiver, receiver],
+                vec![earlier, requested],
                 std::time::Duration::from_millis(1),
             );
             let count = SYNC_LOAD_TOTAL.get();
             let timeouts = SYNC_LOAD_TIMEOUT_TOTAL.get();
-            let error = catalog.wait_statistics_load(&context).unwrap_err();
-            assert!(error.to_string().contains(if closed {
-                "channel closed unexpectedly"
+            let result = catalog.wait_statistics_load(&context);
+            let message = if closed {
+                "sync load stats channel closed unexpectedly"
             } else {
                 "sync load stats timeout"
-            }));
-            assert!(context.sync_stats_failed());
-            assert!(SYNC_LOAD_TOTAL.get() >= count + 1.0);
-            if !closed {
-                assert!(SYNC_LOAD_TIMEOUT_TOTAL.get() >= timeouts + 1.0);
+            };
+            if pseudo {
+                result.expect("statement wait failure falls back to pseudo statistics");
+                let warnings = context.take_warnings();
+                assert_eq!(warnings.len(), 1);
+                let (_, code, warning) = warnings[0].parts();
+                assert_eq!(code, 1105);
+                assert_eq!(warning, message);
+            } else {
+                assert_eq!(result.unwrap_err().to_string(), message);
+                assert!(context.take_warnings().is_empty());
             }
-            let mut failed = requested.table_item_id;
-            failed.is_sync_load_failed = true;
-            tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.delete(failed);
+            assert_eq!(context.skip_plan_cache(), pseudo);
+            assert!(context.sync_stats_failed());
+            assert_eq!(SYNC_LOAD_TOTAL.get(), count + 2.0);
+            assert_eq!(
+                SYNC_LOAD_TIMEOUT_TOTAL.get(),
+                timeouts + if closed { 0.0 } else { 1.0 }
+            );
+            for item in [earlier, requested] {
+                let mut failed = item.table_item_id;
+                failed.is_sync_load_failed = true;
+                assert!(
+                    tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS
+                        .all_items()
+                        .iter()
+                        .any(|item| item.table_item_id == failed)
+                );
+                tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.delete(failed);
+            }
+            assert!(context.take_pending_statistics_load().is_none());
             drop(sender);
         }
     }

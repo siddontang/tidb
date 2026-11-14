@@ -120,8 +120,8 @@ impl CatalogStatisticsLoad for SessionExtendedInfoSchema {
                     if let Some(error) = error {
                         tracing::warn!(error = %error, "synchronous statistics item load failed");
                     }
-                    // A worker error is still a delivered result. Only missing
-                    // results fail Go's SyncWaitStatsLoad completion check.
+                    // A worker error is still a delivered item result for
+                    // Go's completion histogram.
                     remaining_items.remove(&item);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -138,13 +138,10 @@ impl CatalogStatisticsLoad for SessionExtendedInfoSchema {
         if wait_error.is_none() {
             if remaining_items.is_empty() {
                 SYNC_LOAD_HISTOGRAM.observe(pending.started.elapsed().as_millis() as f64);
-                return Ok(());
             }
-            // The singleflight timer may finish before the statement starts
-            // waiting. Apply the same failure policy regardless of timer order.
-            SYNC_LOAD_TIMEOUT_TOTAL.inc();
-            wait_error =
-                Some("sync load stats failed: some requested items are not loaded in time");
+            // Go SyncWaitStatsLoad returns nil after consuming every result,
+            // including request timeouts delivered before its own wait timer.
+            return Ok(());
         }
         tidb_stats_handle::enqueue_sync_load_failures(&requested_items, &remaining_items);
         context.report_sync_stats_failed();
