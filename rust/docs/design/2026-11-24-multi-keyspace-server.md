@@ -1,6 +1,6 @@
 # Multi-keyspace tidb-server: one process, many tenants
 
-- Status: **Draft for review**. No code has been written yet.
+- Status: **Draft for review, revision 2**: addresses the review of `42b666f`. No code has been written yet.
 - Scope: the Rust SQL node (`rust/crates/tidb-server`), Next Generation kernel (`--features nextgen`) only.
 - Branch base: `hparser-integration` @ `73a0893eff`.
 
@@ -40,12 +40,16 @@ observe another tenant.
   per keyspace**:
   - a pool of standby processes waits under `pkg/standby`;
   - a process is activated for a keyspace over HTTP;
-  - an external gateway routes connections to the right process using the
-    prefix. Go only sees the gateway through connection attributes
-    (`TiDB-Gateway-ConnID`, `GATEWAY_SECURECONN_ATTR_KEY`) and the PROXY
-    protocol.
+  - an external gateway sits in front. Go only sees the gateway through
+    connection attributes (`TiDB-Gateway-ConnID`,
+    `GATEWAY_SECURECONN_ATTR_KEY`) and the PROXY protocol.
+- **Inference, not documented:** the public docs establish only the prefixed
+  username and the verified-TLS requirement. They do not say how the hosted
+  gateway routes connections. That it routes on the prefix is inferred from
+  the Essential docs, where an exclusive endpoint removes the need for the
+  prefix.
 
-This design moves that routing step into the SQL node itself.
+This design does that routing step inside the SQL node itself.
 
 ### 2.2 What the Rust node already has
 
@@ -95,20 +99,70 @@ objects already work per keyspace. The process wiring and many globals do not.
 
 | Input user | Result |
 | --- | --- |
-| `ks.account` with `ks` an ENABLED keyspace that this node may serve | Routed to `ks`. Authenticates as the full name `ks.account` against `ks`'s `mysql.user`. |
-| `ks.account` with `ks` unknown, disabled or not allowed | `ER_ACCESS_DENIED_ERROR` (1045). This is the same error as a wrong password, so that keyspace existence is not leaked. |
+| `ks.account` with `ks` an ENABLED, **provisioned** (§4.1) keyspace that this node may serve | Routed to `ks`. Authenticates as the full name `ks.account` against `ks`'s `mysql.user`. There is no fallback to the unprefixed `account`. |
+| `ks.account` with `ks` unknown, disabled, unprovisioned, not allowed, or `SYSTEM` | `ER_ACCESS_DENIED_ERROR` (1045). This is the same error as a wrong password, so that keyspace existence is not leaked. `SYSTEM` is never routable on the shared listener (§5.5). |
 | `account` without a `.` | Rejected with 1045, unless `default-keyspace` is set. In that case it is routed there, with Go's `GetUsernameVariants` behavior: `root` → `ks.root`. |
 
-Parsing rules:
+Parsing and validation rules, matching Go's two separate checks:
 
-- Split at the **first** `.`.
-- Keyspace names are `[A-Za-z0-9_-]` (`tidb-naming::check_keyspace_name`), so
-  they never contain `.`.
-- The account part may contain further dots. Go's
-  `ValidateUsernameFormat` requires exactly one `.` for created users, and
-  that rule is kept for `CREATE USER`.
-- The same rule covers `COM_CHANGE_USER`. In v1, changing to a different
+- Routing splits at the **first** `.`. Keyspace names are `[A-Za-z0-9_-]`
+  (`tidb-naming::check_keyspace_name`), so they never contain `.`.
+- **`CREATE`/`ALTER`/`GRANT USER`** apply Go's `ValidateUsername`: the name
+  must start with `<the session's keyspace>.` (`pkg/executor/simple.go:1181`).
+  Further dots in the account part are allowed there.
+- **Identity lookup** applies Go's one-dot predicate `ValidateUsernameFormat`
+  through `checkUserVariantMismatch` (`pkg/server/conn.go:898`). A name of the
+  `x.y` shape whose prefix is not the session's keyspace fails with
+  `ErrUserPrefixMismatch`. In multi-keyspace mode, routing has already chosen
+  the keyspace from the prefix, so this check passes for every routed
+  connection, and it is kept for parity.
+- `COM_CHANGE_USER` uses the same routing. In v1, changing to a different
   keyspace on an existing connection is rejected; the client must reconnect.
+
+### 4.1 Accounts, first login and migration
+
+Bootstrap creates a plain, **passwordless** `root`, in Go and in Rust
+(`rust/crates/tidb-session/src/bootstrap.rs:232`). Lookup only ever uses
+`ks.root`, so a freshly bootstrapped keyspace has no account that can log in
+through the shared listener. That is deliberate: a passwordless account must
+never be reachable there.
+
+- **Provisioning is a separate operator step**, and a keyspace is admitted
+  only once it is done. It extends Go's `--keyspace-activate` mode, which
+  bootstraps a keyspace and exits:
+
+  ```sh
+  tidb-server --keyspace-activate --keyspace-name ks1 --path <pd> \
+      --initial-admin-password-file /secure/ks1-root.pw   # new flag
+  ```
+
+  This bootstraps `ks1` if needed. In one transaction it then creates
+  `'ks1.root'@'%'` with that password, `ALL PRIVILEGES ... WITH GRANT OPTION`,
+  and writes a `tidb_multi_keyspace_provisioned` row to `mysql.tidb`. The same
+  operation is available on the operator listener (§5.5).
+- **At runtime open**, the registry refuses (1045) a keyspace that has no
+  provisioned row.
+- **Existing keyspaces** whose accounts are unprefixed (`app`) are migrated by
+  the same command with `--migrate-accounts`. It issues
+  `RENAME USER 'app'@'h' TO 'ks1.app'@'h'` for every non-internal account.
+  `RENAME USER` carries table, column and role grants, and the bootstrap
+  `root` is renamed only if it has a password.
+- **Rolling upgrade.** Switch the keyspace's existing single-keyspace nodes to
+  `deploy-mode = starter` first, so they apply Go's prefix policy. Then migrate
+  the accounts. Then add multi-keyspace nodes. Starter-mode single-keyspace
+  nodes accept both `app` (via `GetUsernameVariants`, `app` → `ks1.app`) and
+  `ks1.app`, so clients keep working throughout.
+- **Rollback.** Remove the multi-keyspace nodes. The prefixed accounts keep
+  working on Starter-mode single-keyspace nodes. Undoing the rename is optional
+  and uses the same tool in reverse.
+- **Test.** On a fresh keyspace:
+  - provision it, then log in as `ks1.root` with the provisioned password;
+  - `CREATE USER 'ks1.app'` and log in as it;
+  - check that `CREATE USER 'app'` and `CREATE USER 'ks2.app'` both fail
+    with Go's error;
+  - check that `ks1.root` cannot log in before provisioning;
+  - on an existing keyspace, run `--migrate-accounts` and check that its grants
+    survive.
 
 The mapping from prefix to keyspace is the identity function in v1, as in Go.
 An opaque alias, like Starter's random 15-character prefix, can be added later
@@ -185,40 +239,118 @@ and bootstraps the keyspace if needed. See open question Q4 for a later
 ### 5.3 `KeyspaceRegistry`
 
 - `get_or_open(name)`: single-flight. Concurrent first connections wait on one
-  open, bounded by `keyspace-open-timeout` (default 30s). A failed open is
-  cached briefly as `Failed` with backoff.
+  open, bounded by `open-timeout` (default 30s). A failed open is cached briefly
+  as `Failed` with backoff.
 - Admission:
-  - `keyspace-allow-list`, a list of names or `*`;
-  - `max-keyspaces`, the cap on open runtimes;
-  - the PD keyspace state must be `ENABLED`.
-- Idle close: when a runtime has had no connections for `keyspace-idle-timeout`
-  (default 10m), it is closed. Owner roles are resigned first, so another node
-  takes over. `preload-keyspaces` are never idle-closed.
-- PD watch: a keyspace that becomes `DISABLED` or `ARCHIVED` is drained:
-  - new connections are refused;
-  - existing connections get a configurable grace period, then are killed.
-- The SYSTEM runtime is always open. Go requires SYSTEM to be bootstrapped
-  before any user keyspace (`session.go:4318`), and user runtimes reach it
-  through the existing cross-keyspace path.
+  - `allow-list`, a list of names. `*` is accepted only with `dev-mode = true`,
+    and it never includes `SYSTEM`;
+  - `max-keyspaces` caps **Opening + Ready + Draining** runtimes together, so
+    concurrent opens count. A connection that would exceed the cap gets
+    `ER_CON_COUNT_ERROR` (1040) after routing;
+  - the PD keyspace state must be `ENABLED`, and the keyspace must be
+    provisioned (§4.1).
+- The SYSTEM runtime is always open but **internal**. User runtimes reach it
+  through the existing cross-keyspace path, and operators reach it through the
+  operator listener (§5.5). Go requires SYSTEM to be bootstrapped before any
+  user keyspace (`session.go:4318`).
+
+**What keeps a runtime alive.** A runtime holds a **pin count**. Every pin is
+taken and released under the registry lock.
+
+| Pin | Taken | Released |
+| --- | --- | --- |
+| Connection | When routing resolves the keyspace, **before** authentication and before waiting on an Opening runtime | On connection close, including a failed authentication |
+| Background job | When this node becomes owner of, or starts executing, tenant work: DDL jobs in the tenant's queue, DXF/IMPORT subtasks, TTL jobs, a running auto-analyze, an MV refresh | When the job finishes or ownership moves away |
+| Preload | At startup, for `preload` keyspaces | Never |
+
+**Idle close.** A Ready runtime with zero pins for `idle-timeout` moves to
+Draining, under the same lock that `get_or_open` uses to add a pin, so a
+reconnect can never race with eviction:
+
+- a connection that arrives once Draining has started waits for Closed and
+  then triggers a fresh open;
+- before closing, the runtime checks the tenant's own queues (`mysql.tidb_ddl_job`,
+  DXF task tables, TTL jobs). If any work is unfinished and this node may be
+  the **last serving node**, the close is cancelled and the runtime returns to
+  Ready. "Last serving node" means no other live server-info record in the
+  tenant's namespace.
+
+Closing resigns owner roles, so another node can take over, then stops the
+loops and unregisters server info.
+
+**PD disable or archive.** A keyspace that becomes `DISABLED` or `ARCHIVED` is
+drained:
+
+- new connections are refused;
+- existing connections are killed after `drain-grace` (default 30s);
+- unfinished jobs are abandoned exactly as when a node stops, and the next
+  owner resumes them once the keyspace is enabled again.
+
+**Tests.**
+
+- A reconnect during eviction, with concurrent open and close.
+- A DDL job submitted by a client that then disconnects, with only one serving
+  node. The runtime must stay open until the job is done.
+- A burst of first connections to more keyspaces than `max-keyspaces`.
 
 ### 5.4 Configuration
 
 ```toml
 [multi-keyspace]
 enable = false                # off: exactly today's behavior; keyspace-name required
-allow-list = ["*"]            # or explicit names
+allow-list = ["keyspace1", "keyspace2"]  # "*" only with dev-mode; never SYSTEM
 preload = ["keyspace1"]
 default-keyspace = ""         # route prefix-less users here; empty = reject
-max-keyspaces = 64
+max-keyspaces = 64            # Opening + Ready + Draining
 idle-timeout = "10m"
 open-timeout = "30s"
-default-authentication-plugin = "mysql_native_password"  # greeting before tenant is known (§6.7)
+drain-grace = "30s"
+default-authentication-plugin = "caching_sha2_password"  # greeting before tenant is known (§6.7)
+dev-mode = false              # allows "*", plaintext; never for shared deployments
+operator-addr = "127.0.0.1:4100"  # §5.5; mTLS required unless loopback + dev-mode
+```
+
+With `enable = true`, the shared SQL listener **requires TLS before the
+handshake response**: the `[security]` certificate must be configured, and a
+plaintext client is rejected. This is a process-level rule, because the
+password exchange happens before the tenant, and so its
+`require_secure_transport`, is known. Clients connect with verified TLS:
+
+```sh
+mysql -h tidb.example.com -P 4000 -u 'keyspace1.root' -p \
+      --ssl-mode=VERIFY_IDENTITY --ssl-ca=/path/to/ca.pem
 ```
 
 With `enable = true`, `keyspace-name` must be empty. The nextgen kernel check
 in `standby_node::check_kernel_config` is relaxed to accept "multi-keyspace
 enabled" in place of "keyspace name or standby mode". Standby mode and
 multi-keyspace mode are mutually exclusive.
+
+### 5.5 Operator path: SYSTEM, process administration and status APIs
+
+Tenants and operators get separate doors:
+
+- **Shared SQL listener (tenants).** Only allow-listed user keyspaces are
+  routable. `SYSTEM.x` is rejected with 1045. A tenant's `root` can change only
+  its own keyspace's state.
+- **Operator listener** (`operator-addr`). It requires mTLS with an operator
+  client certificate (CA from `[security] operator-ca`); plaintext is allowed
+  only on loopback with `dev-mode`. It serves:
+  - SQL to SYSTEM;
+  - process-wide administration: instance-scoped variables (§6.3),
+    provisioning and account migration (§4.1), forced drain or close of a
+    runtime;
+  - every tenant-scoped HTTP status endpoint (§6.9), selected by
+    `/ks/<name>/…`.
+
+  The operator certificate is the authority, so the path selector is honored
+  only there.
+- **The public status port** keeps only process endpoints that expose no tenant
+  data: `/status` and the health checks. `/metrics` carries per-tenant labels,
+  so it moves to the operator listener in multi-keyspace mode.
+- There is **no tenant self-service HTTP API in v1**. If one is added later,
+  the keyspace is derived from the authenticated tenant identity, never from a
+  path or query parameter.
 
 ## 6. Removing single-keyspace globals
 
@@ -267,8 +399,9 @@ The plan:
 1. Classify all 83 atomics into an appendix generated from the source:
    - **instance-scoped**, truly per process (for example instance plan-cache
      memory limits or log settings). These stay process-wide. In
-     multi-keyspace mode, setting them requires a process-level administrator,
-     not a tenant `root`. See Q6.
+     multi-keyspace mode they can be set only through process config or the
+     operator listener (§5.5). A tenant `root` gets
+     `ER_SPECIFIC_ACCESS_DENIED_ERROR`.
    - **global-scoped**, where Go semantics are "for this cluster". These move
      into a per-runtime `VardefSnapshot` owned by `GlobalSysvars`. Readers take
      it from the session's domain instead of the static.
@@ -302,17 +435,57 @@ Moving it into the `Domain` is preferred, because it closes with the tenant.
 
 ### 6.6 Connection IDs, server IDs and `KILL`
 
-The connection ID is allocated before the handshake, from one keyspace's
-`ServerIdAuthority` (global kill embeds the server ID). The replacement:
+With global kill, a connection ID embeds the node's server ID.
+`ServerIdAuthority` leases that server ID in the **tenant's** namespaced etcd
+(`cluster_stack.rs:831`). Remote `KILL` finds the owning node by looking up the
+server ID among the tenant's server-info records.
 
-- The process takes **one server ID from the SYSTEM keyspace's etcd** and
-  allocates every connection ID from it, so IDs are unique within the process
-  for all tenants.
-- Each runtime's serverinfo record carries that same server ID, so global kill
-  routing still finds the process.
-- `KILL <id>` and `SHOW PROCESSLIST` resolve only connections of the caller's
-  keyspace. A connection ID from another tenant behaves exactly like a
-  nonexistent one (`ER_NO_SUCH_THREAD`).
+The connection ID must be fixed **before** the tenant is known: it is in the
+handshake greeting, and drivers such as Connector/J use it for
+`KILL QUERY`. So a multi-keyspace process needs one server ID that is valid
+in every tenant it serves. A server ID leased only in SYSTEM is not enough,
+because a single-keyspace nextgen node in that tenant may already lease the
+same ID. Publishing it there would make remote `KILL` ambiguous.
+
+**Rule: a node publishes a server ID in a tenant only after reserving it in
+that tenant's own namespace.**
+
+1. At startup the multi-keyspace process picks a candidate server ID and
+   reserves it **in SYSTEM's namespace**, with the existing lease and CAS. This
+   keeps IDs unique among multi-keyspace nodes.
+2. At each runtime open, the process reserves the **same ID in the tenant's
+   namespace**, using the exact key, lease and CAS that single-keyspace nodes
+   use today. Only after the reservation succeeds does it register server info
+   and start admitting connections for that tenant. In the tenant's namespace,
+   the ID is now owned by exactly one node, whatever its kind.
+3. **Collision.** If the ID is already leased in the tenant's namespace (by a
+   single-keyspace node, or by a multi-keyspace node whose SYSTEM lease
+   expired), the open fails. The runtime goes to `Failed` with backoff, logs a
+   warning with both node identities, and that tenant's connections get 1045
+   on this node. Other nodes keep serving it. The process does not switch IDs,
+   because connections already greeted would keep the old one.
+4. **Lease renewal** runs for every reservation. Losing the tenant's lease
+   drains only that runtime, mirroring Go's lost-server-ID handling for that
+   tenant. Losing the SYSTEM lease stops new handshakes on the whole process
+   until it re-acquires a fresh candidate ID. Runtimes whose tenant leases are
+   still held keep serving their existing connections.
+5. **ID space.** With `enable-32bits-connection-id`, the server ID has 11 bits,
+   so at most 2,047 IDs. Multi-keyspace mode requires 64-bit connection IDs, so
+   that reserving one ID across many namespaces stays easy.
+
+`KILL <id>` and `SHOW PROCESSLIST` resolve only connections of the caller's
+keyspace. A connection ID from another tenant behaves exactly like a
+nonexistent one (`ER_NO_SUCH_THREAD`).
+
+**Mixed-fleet test.** One multi-keyspace node and one single-keyspace
+**nextgen** node serve the same tenant, with a failpoint that forces
+overlapping candidate IDs. Check:
+
+- the second node to open the tenant fails with the collision error, and never
+  publishes the ID;
+- remote `KILL` and `KILL QUERY` work in both directions;
+- lease expiry and renewal on both nodes, including a tenant-lease loss on the
+  multi-keyspace node that drains only that tenant.
 
 ### 6.7 Decisions taken before the tenant is known
 
@@ -341,8 +514,9 @@ The connection ID is allocated before the handshake, from one keyspace's
 ### 6.9 Status port and AutoID service
 
 - The status HTTP server is wired to one factory (`cluster_boot.rs:192-249`).
-  Per-tenant endpoints take `?keyspace=` or a `/ks/<name>/…` prefix. Process
-  endpoints (`/status`, `/metrics`) stay global.
+  In multi-keyspace mode, tenant-scoped endpoints are served only on the
+  operator listener under `/ks/<name>/…`. Examples are schema, regions, MVCC,
+  DDL history and the stats dump. See §5.5 for who may call them.
 - The AutoID `Service` is bound to one keyspace ID and rejects others
   (`tidb-autoid-service/src/lib.rs:491`). It becomes a map from keyspace ID to
   service, populated by runtime open and close.
@@ -366,6 +540,11 @@ The following become per runtime:
   `keyspace2`.
 - **Error shape.** Routing failures look exactly like failed authentication
   (§4).
+- **Transport.** The shared listener requires TLS before credentials are sent
+  (§5.4). Operators use a separate mTLS listener (§5.5). SYSTEM, process-wide
+  settings and tenant status APIs are never reachable with a tenant identity.
+- **No passwordless entry.** Only provisioned prefixed accounts can log in
+  (§4.1).
 - **Information leakage.** §6.6 and §6.8 are release blockers. Multi-keyspace
   mode must not be documented as tenant-isolated until the isolation test suite
   (§9) passes.
@@ -405,8 +584,15 @@ playground. Later mitigations, only if the measurements call for them:
 - **Multi-tenant integration**, on the local TiDB X playground (CSE + RustFS,
   already working on the Singapore Mac), with SYSTEM, `keyspace1` and
   `keyspace2` created through the PD keyspace API:
-  - data isolation: same database and table names in both tenants, different
-    contents;
+  - data isolation: same database and table names in both tenants, with
+    **overlapping table IDs** and different contents;
+  - concurrent AutoID allocations in both tenants, including
+    `AUTO_ID_CACHE=1` tables once Phase 3f lands;
+  - GC safety: a long transaction in `keyspace1` while GC runs in `keyspace2`
+    and in `keyspace1`, with every row the long transaction reads still intact;
+  - provisioning and first login (§4.1);
+  - routing and the operator path: TLS required, `SYSTEM.root` rejected on the
+    shared listener, operator listener mTLS;
   - auth isolation: `keyspace1.root` cannot log into `keyspace2`, with the
     1045 error shape;
   - `SET GLOBAL` isolation for a sample from each class in §6.3;
@@ -416,9 +602,11 @@ playground. Later mitigations, only if the measurements call for them:
   - idle close and reopen;
   - keyspace disabled while connected;
   - a restart with preload.
-- **Mixed fleet.** A multi-keyspace node and a classic single-keyspace node
-  serve the same keyspace at the same time: DDL ownership handoff and schema
-  version sync must interoperate.
+- **Mixed fleet.** A multi-keyspace node and a single-keyspace **nextgen** node
+  serve the same keyspace at the same time. Check:
+  - DDL ownership handoff and schema version sync;
+  - server-ID reservation and remote `KILL` (§6.6);
+  - registry lifecycle (§5.3).
 
 ## 10. Plan
 
@@ -429,7 +617,7 @@ in parallel once Phase 1 lands.
 | --- | --- | --- |
 | **0** | This design; decisions on §11 | Owner sign-off |
 | **1. Extract the runtime** | `ProcessServices` + `KeyspaceRuntime::open/close` + `KeyspaceRegistry` with one preloaded runtime. Pure refactor; no routing, no behavior change | All default-mode gates green; baseline footprint numbers for N=1 |
-| **2. Routing MVP** (behind `multi-keyspace.enable`) | Handshake split and registry lookup; process-level connection and server IDs (§6.6); greeting plugin from config; allow-list, preload, max-keyspaces; open timeout | Two tenants on one node with data and auth isolation passing. Known leaks listed in release notes; flag documented as experimental |
+| **2. Controlled demo** (behind `multi-keyspace.enable` **and** `dev-mode`) | Handshake split and registry lookup; TLS rule and operator listener (§5.4, §5.5); provisioning (§4.1); server-ID reservation (§6.6); pin-count lifecycle without idle close (§5.3); greeting plugin from config; allow-list, preload, max-keyspaces. **Pulled forward from 3d:** per-keyspace min-start-ts / GC tracking (§6.5), because GC is a data-loss risk even in a demo. **Unsupported operations are rejected** with `ER_NOT_SUPPORTED_YET` until their phase lands: placement and resource-group DDL (3b), `AUTO_ID_CACHE=1` tables (3f), IMPORT INTO / BR / external storage (3f), tenant HTTP status APIs | Two tenants on one node: data, auth, GC-safety and AutoID tests (§9) pass; every rejected operation has a test asserting the rejection. **Not for shared deployment.** |
 | **3a** | Keyspace identity reads + resource tags + username policy (§6.1) | Unit and integration tests; no empty-keyspace assertions firing |
 | **3b** | PD/infosync singletons into `RuntimeServices` (§6.2) | Resource-group, placement and label-rule SQL per tenant |
 | **3c** | `SET GLOBAL` / vardef split (§6.3), with the generated classification appendix | `SET GLOBAL` isolation tests for every global-scoped atomic |
@@ -439,9 +627,18 @@ in parallel once Phase 1 lands.
 | **4. Lifecycle** | Idle close, PD state watch and drain, per-tenant `max_connections`, optional prefix alias (Q1) | Lifecycle tests; leak check that repeated open/close does not grow memory or file descriptors |
 | **5. Hardening** | Full isolation suite; footprint benchmark N=1/10/50; per-tenant memory quota; docs | The isolation suite is the bar for calling the mode tenant-isolated |
 
-Phase 2 may be developed alongside Phase 3. The flag stays experimental until
-3a, 3c and 3e are done, because those are the cross-tenant correctness and
-leakage items.
+Phase 2 may be developed alongside Phase 3.
+
+**Gate for the first shared deployment**, meaning `dev-mode` off with real
+tenants:
+
+- **all** of 3a–3f and Phase 4 are done;
+- every supported operation uses the correct tenant's service: GC tracking,
+  placement and label clients, AutoID dispatch, resource tags,
+  `SET GLOBAL`, observability;
+- every operation without a tenant-correct implementation is rejected, not
+  approximated;
+- the §9 isolation suite, including the mixed-fleet test, passes.
 
 ## 11. Open questions
 
@@ -463,6 +660,11 @@ leakage items.
   experiment (`siddontang/tidb`), or should it be proposed to
   `ngaut/tidb@hparser-integration` as a deliberate, flag-gated extension
   beyond Go parity?
-- **Q6. Instance-scoped variables.** In multi-keyspace mode, who may set
-  process-wide variables? *Recommendation:* only the SYSTEM keyspace's `root`,
-  or process config. Tenant `root` gets `ER_SPECIFIC_ACCESS_DENIED_ERROR`.
+- **Q6. Operator identity.** *Resolved in review:* the operator listener uses
+  mTLS operator certificates (§5.5). SYSTEM is internal, and no SQL identity
+  on the shared listener has process-wide powers. *Remaining question:* should
+  operator certificates map to SQL users inside SYSTEM for auditing, or is the
+  certificate subject enough?
+- **Q7. Provisioning owner.** Is `tidb-server --keyspace-activate
+  --initial-admin-password-file` the right provisioning path, or is there an
+  existing control-plane component that should own it?
