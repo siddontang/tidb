@@ -601,9 +601,9 @@ independent of the TiDB phases except where noted.
   non-200 only for a whole-process graceful shutdown.
 
 The TiProxy changes are tracked as **Phase 3h**, with K1–K3 needed before any
-shared deployment behind TiProxy. They live in the TiProxy repository, on a
-branch of `siddontang/tiproxy` if a fork is used, and do not block TiDB Phases
-1–3g.
+shared deployment behind TiProxy. **Decision (siddontang, 2026-11-24):** they live on a
+branch of a `siddontang/tiproxy` fork, based on `pingcap/tiproxy` `rust`. They
+do not block TiDB Phases 1–3g.
 
 ## 6. Removing single-keyspace globals
 
