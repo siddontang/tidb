@@ -1,6 +1,6 @@
 # Multi-keyspace tidb-server: one process, many tenants
 
-- Status: **Draft for review, revision 3**: addresses the reviews of `42b666f` and `7cbdef8ad3`. No code has been written yet.
+- Status: **Draft for review, revision 4**: addresses the reviews of `42b666f`, `7cbdef8ad3` and `08d9476bfc`. No code has been written yet.
 - Scope: the Rust SQL node (`rust/crates/tidb-server`), Next Generation kernel (`--features nextgen`) only.
 - Branch base: `hparser-integration` @ `73a0893eff`.
 
@@ -166,8 +166,22 @@ never be reachable there.
      `tidb_multi_keyspace_migration` row in `mysql.tidb` with state
      `in_progress`.
   4. **Rename** each account with `RENAME USER`. That statement carries the
-     credential and table, column and role grants. Each step is idempotent: a
-     step whose source is gone and whose destination exists is skipped.
+     credential and table, column and role grants.
+     - **Account changes are frozen** for the duration. While the migration
+       row is `in_progress`, every serving node of the keyspace rejects
+       `CREATE`/`ALTER`/`DROP`/`RENAME USER`, `GRANT`/`REVOKE` and
+       `SET PASSWORD` with a clear error. Nodes read the row through the
+       privilege-reload path they already run, and the tool waits until every
+       live node reports the new privilege version before the first rename.
+       Without the Phase 1b release, nodes cannot enforce the freeze, so the
+       tool requires a coordinated cutover (no other account writers) and
+       says so.
+     - **Completion is recorded, not inferred.** After each rename, in the
+       same transaction where possible and otherwise immediately after, the
+       tool marks that entry `done` in the stored plan. On retry, an entry not
+       marked `done` whose source is gone and whose destination exists is
+       **not** assumed to be the migration's work. The tool stops and reports
+       it for the operator to resolve.
   5. **Finish.** Only after every rename succeeds, set the migration row to
      `done` and write the provisioned marker.
 
@@ -189,6 +203,13 @@ never be reachable there.
      `deploy-mode = starter`.
   2. Run migrate mode. Clients using `app` and `ks1.app` both keep working.
   3. Add multi-keyspace nodes. These accept only `ks1.app`.
+     - **Acceptance criterion:** a shared node joins a client endpoint only
+       after every client of that endpoint connects as `ks1.app`. Otherwise a
+       connection pool using `app` succeeds on one backend and gets 1045 on
+       the next. Legacy clients stay on an endpoint backed only by
+       single-keyspace nodes until they switch. Verify this from the
+       single-keyspace nodes' login records: no successful `app`-form logins
+       on that endpoint over a full client reconnect window.
 - **Coordinated cutover**, for keyspaces whose nodes cannot take the
   compatibility release: stop client traffic, migrate, and switch every client
   to `ks1.app` before reopening. This is documented, but it is not the default
@@ -211,7 +232,10 @@ never be reachable there.
     - a pre-existing destination account aborts the run with no writes;
     - a run interrupted after some renames completes on retry, with the marker
       written once;
-    - a passwordless-only `root` stops the run.
+    - a passwordless-only `root` stops the run;
+    - an interrupted migration while another node attempts an account change:
+      the change is rejected by the freeze, and the retry stops on any rename
+      it did not record.
   - Rolling path:
     - on a single-keyspace Rust node with the compatibility release, a fresh
       connection as plain `app` succeeds after migration;
