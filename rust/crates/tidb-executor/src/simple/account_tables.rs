@@ -215,6 +215,35 @@ pub fn alter_user_failed_login_json(info: &AlterUserPasswordLocking, lock_accoun
     format!("\"Password_locking\": {{{}}}", password_locking_array.join(","))
 }
 
+/// The shared body of Go `userExistsWithRetryVariants` and
+/// `userExistsInternalWithRetryVariants` (`executor/simple.go:2705`,
+/// `:2726`) over any account-existence probe: the first `policy` variant of
+/// `name` that exists rewrites `name` to it; otherwise, unless
+/// [`skip_exact_username_lookup`] says the name belongs to another keyspace,
+/// the exact name is probed. `policy` is Go's `keyspace.GetUsernamePolicy()`.
+pub fn retry_username_variants(
+    policy: &tidb_keyspace::UsernamePolicy,
+    name: &mut String,
+    mut user_exists: impl FnMut(&str) -> Result<bool, DriverError>,
+) -> Result<bool, DriverError> {
+    for variant in policy.get_username_variants(name) {
+        if user_exists(&variant)? {
+            *name = variant;
+            return Ok(true);
+        }
+    }
+    if skip_exact_username_lookup(policy, name) {
+        return Ok(false);
+    }
+    user_exists(name)
+}
+
+/// Go `skipExactUsernameLookup` (`executor/simple.go:2743`): a name with one
+/// dot that fails the policy carries another keyspace's prefix.
+pub fn skip_exact_username_lookup(policy: &tidb_keyspace::UsernamePolicy, name: &str) -> bool {
+    policy.validate_username(name).is_err() && policy.validate_username_format(name)
+}
+
 /// The privilege-table writes, over [`AccountSession`].
 pub trait UserTableExec: AccountSession {
     /// Go `userExists`: the account's `mysql.user` row through restricted
@@ -229,6 +258,18 @@ pub trait UserTableExec: AccountSession {
             ),
         )?;
         Ok(!rows.is_empty())
+    }
+
+    /// Go `userExistsWithRetryVariants` (`executor/simple.go:2705`):
+    /// [`Self::user_exists`] through the username policy's variants,
+    /// rewriting `name` to the variant that exists.
+    fn user_exists_with_retry_variants(
+        &mut self,
+        name: &mut String,
+        host: &str,
+    ) -> Result<bool, DriverError> {
+        let policy = tidb_keyspace::get_username_policy();
+        retry_username_variants(&policy, name, |user| self.user_exists(user, host))
     }
 
     /// Go `isRole`: a locked account with an expired password.
@@ -1153,3 +1194,95 @@ pub trait UserTableExec: AccountSession {
 
 impl<S: AccountSession> UserTableExec for S {}
 
+
+#[cfg(test)]
+mod tests {
+    use super::{retry_username_variants, skip_exact_username_lookup};
+    use crate::DriverError;
+
+    fn prefix(user_prefix: &str) -> tidb_keyspace::UsernamePolicy {
+        tidb_keyspace::UsernamePolicy::Prefix {
+            user_prefix: user_prefix.to_owned(),
+        }
+    }
+
+    /// Probes `name` against `accounts`, recording every name asked for.
+    fn probe(
+        policy: &tidb_keyspace::UsernamePolicy,
+        accounts: &[&str],
+        name: &str,
+    ) -> (Result<bool, DriverError>, String, Vec<String>) {
+        let mut name = name.to_owned();
+        let mut asked = Vec::new();
+        let exists = retry_username_variants(policy, &mut name, |user| {
+            asked.push(user.to_owned());
+            Ok(accounts.contains(&user))
+        });
+        (exists, name, asked)
+    }
+
+    /// Go `userExistsWithRetryVariants`: under the `SYSTEM` prefix an
+    /// unprefixed name resolves to its `SYSTEM.` account and is rewritten to
+    /// it; with no such account the exact name is still asked for.
+    #[test]
+    fn username_variants_resolve_to_the_prefixed_account() {
+        let policy = prefix("SYSTEM");
+        let accounts = ["SYSTEM.u1", "SYSTEM.keao.yang", "plain"];
+
+        let (exists, name, asked) = probe(&policy, &accounts, "u1");
+        assert!(exists.unwrap());
+        assert_eq!(name, "SYSTEM.u1");
+        assert_eq!(asked, ["SYSTEM.u1"]);
+
+        let (exists, name, _) = probe(&policy, &accounts, "keao.yang");
+        assert!(exists.unwrap());
+        assert_eq!(name, "SYSTEM.keao.yang");
+
+        // A prefixed name has no variant: one exact lookup.
+        let (exists, name, asked) = probe(&policy, &accounts, "SYSTEM.u1");
+        assert!(exists.unwrap());
+        assert_eq!(name, "SYSTEM.u1");
+        assert_eq!(asked, ["SYSTEM.u1"]);
+
+        // A variant that does not exist falls back to the exact name.
+        let (exists, name, asked) = probe(&policy, &accounts, "plain");
+        assert!(exists.unwrap());
+        assert_eq!(name, "plain");
+        assert_eq!(asked, ["SYSTEM.plain", "plain"]);
+    }
+
+    /// Go `skipExactUsernameLookup`: a one-dot name with another keyspace's
+    /// prefix is never looked up exactly, so it does not exist here even
+    /// when that account row is present; a two-dot name is.
+    #[test]
+    fn another_keyspaces_prefixed_name_skips_the_exact_lookup() {
+        let policy = prefix("SYSTEM");
+        let accounts = ["OTHER.u1", "a.b.c"];
+        assert!(skip_exact_username_lookup(&policy, "OTHER.u1"));
+        let (exists, name, asked) = probe(&policy, &accounts, "OTHER.u1");
+        assert!(!exists.unwrap());
+        assert_eq!(name, "OTHER.u1");
+        assert_eq!(asked, ["SYSTEM.OTHER.u1"]);
+
+        assert!(!skip_exact_username_lookup(&policy, "a.b.c"));
+        let (exists, _, asked) = probe(&policy, &accounts, "a.b.c");
+        assert!(exists.unwrap());
+        assert_eq!(asked, ["SYSTEM.a.b.c", "a.b.c"]);
+    }
+
+    /// Outside Starter (Go's `defaultUsernamePolicy`), and under an empty
+    /// prefix, the lookup is exactly Go `userExists`.
+    #[test]
+    fn the_default_policy_looks_up_the_exact_name() {
+        for policy in [tidb_keyspace::UsernamePolicy::Default, prefix("")] {
+            assert!(!skip_exact_username_lookup(&policy, "OTHER.u1"));
+            let (exists, name, asked) = probe(&policy, &["u1"], "u1");
+            assert!(exists.unwrap());
+            assert_eq!(name, "u1");
+            assert_eq!(asked, ["u1"]);
+            let (exists, _, asked) = probe(&policy, &["u1"], "OTHER.u1");
+            assert!(!exists.unwrap());
+            assert_eq!(asked, ["OTHER.u1"]);
+        }
+    }
+}

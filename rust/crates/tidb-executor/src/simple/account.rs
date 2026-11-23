@@ -677,6 +677,7 @@ pub trait AccountExec: super::account_tables::UserTableExec {
         let mut users: Vec<(&str, &str)> = Vec::with_capacity(specs.len());
         for (user, host, auth, _) in specs {
             let (user, host) = (*user, *host);
+            tidb_keyspace::get_username_policy().validate_username(user)?;
             if user.len() > tidb_parser::auth::USER_NAME_MAX_LENGTH {
                 return Err(tidb_planner::preprocess::wrong_string_length_error(
                     user,
@@ -935,21 +936,43 @@ pub trait AccountExec: super::account_tables::UserTableExec {
         // keeps the CURRENT_USER AST pseudo-user's empty username/hostname in
         // this statement: NONE deletes `@` as a no-op, while ALL/regular fail
         // the ordinary target-existence check for `@`.
-        let accounts = if sole_current
-            || matches!(&set_default.selection, tidb_ast::DefaultRoleSelection::None)
-        {
+        //
+        // Go's `userExistsWithRetryVariants` rewrites each target (and, for
+        // explicit roles, each role) to the username-policy variant it finds,
+        // so every later step names the stored account.
+        let policy = tidb_keyspace::get_username_policy();
+        let accounts = if sole_current {
             set_default
                 .users
                 .iter()
                 .map(|spec| (spec.user.clone(), spec.host.clone()))
                 .collect()
+        } else if matches!(&set_default.selection, tidb_ast::DefaultRoleSelection::None) {
+            set_default
+                .users
+                .iter()
+                .map(|spec| {
+                    let mut user = spec.user.clone();
+                    // Go `setDefaultRoleNone`: in Starter mode the lookup
+                    // only resolves the name; a missing account is no error.
+                    if tidb_config_deploymode::is_starter() {
+                        super::account_tables::retry_username_variants(&policy, &mut user, |user| {
+                            Ok(registry.user_exists(user, &spec.host))
+                        })?;
+                    }
+                    Ok((user, spec.host.clone()))
+                })
+                .collect::<Result<Vec<_>, DriverError>>()?
         } else {
             set_default
                 .users
                 .iter()
                 .map(|spec| {
-                    if registry.user_exists(&spec.user, &spec.host) {
-                        Ok((spec.user.clone(), spec.host.clone()))
+                    let mut user = spec.user.clone();
+                    if super::account_tables::retry_username_variants(&policy, &mut user, |user| {
+                        Ok(registry.user_exists(user, &spec.host))
+                    })? {
+                        Ok((user, spec.host.clone()))
                     } else {
                         Err(DriverError::from(
                             tidb_exeerrors::ERR_CANNOT_USER
@@ -962,17 +985,18 @@ pub trait AccountExec: super::account_tables::UserTableExec {
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
+        let mut resolved_roles = match &set_default.selection {
+            tidb_ast::DefaultRoleSelection::Roles(roles) => roles.clone(),
+            _ => Vec::new(),
+        };
         if matches!(
             &set_default.selection,
             tidb_ast::DefaultRoleSelection::Roles(_)
         ) && !sole_current
         {
-            let tidb_ast::DefaultRoleSelection::Roles(roles) = &set_default.selection else {
-                unreachable!("the selection was matched above")
-            };
-            for role in roles {
-                let (role, host) = role_identity(role);
-                if !self.user_exists(&role, &host)? {
+            for spec in &mut resolved_roles {
+                let (mut role, host) = role_identity(spec);
+                if !self.user_exists_with_retry_variants(&mut role, &host)? {
                     return Err(DriverError::from(
                         tidb_exeerrors::ERR_CANNOT_USER
                             .gen_with_stack_by_args(&[
@@ -981,6 +1005,7 @@ pub trait AccountExec: super::account_tables::UserTableExec {
                             ]),
                     ));
                 }
+                spec.role = role;
             }
         }
         // Go performs this replacement in one transaction. Resolve every
@@ -991,7 +1016,8 @@ pub trait AccountExec: super::account_tables::UserTableExec {
             let roles = match &set_default.selection {
                 tidb_ast::DefaultRoleSelection::None => Vec::new(),
                 tidb_ast::DefaultRoleSelection::All => registry.granted_roles(account),
-                tidb_ast::DefaultRoleSelection::Roles(roles) => {
+                tidb_ast::DefaultRoleSelection::Roles(_) => {
+                    let roles = &resolved_roles;
                     // Go's skip-grant manager makes `FindEdge` return false:
                     // an explicit role therefore reports 3530 even when the
                     // storage row exists. `ALL` and `NONE` remain storage
@@ -1039,11 +1065,16 @@ pub trait AccountExec: super::account_tables::UserTableExec {
                 "roles require a server front end with a privilege registry",
             ));
         };
+        // Go `userExistsWithRetryVariants` rewrites each role to the
+        // username-policy variant it finds.
+        let policy = tidb_keyspace::get_username_policy();
         roles
             .iter()
             .map(|spec| {
-                let (role, host) = role_identity(spec);
-                if registry.user_exists(&role, &host) {
+                let (mut role, host) = role_identity(spec);
+                if super::account_tables::retry_username_variants(&policy, &mut role, |role| {
+                    Ok(registry.user_exists(role, &host))
+                })? {
                     Ok((role, host))
                 } else {
                     Err(missing(&role, &host))
@@ -1065,11 +1096,16 @@ pub trait AccountExec: super::account_tables::UserTableExec {
                 "roles require a server front end with a privilege registry",
             ));
         };
+        // Go `userExistsWithRetryVariants` rewrites each account to the
+        // username-policy variant it finds.
+        let policy = tidb_keyspace::get_username_policy();
         users
             .iter()
             .map(|spec| {
-                let (user, host) = self.resolve_account(spec)?;
-                if registry.user_exists(&user, &host) {
+                let (mut user, host) = self.resolve_account(spec)?;
+                if super::account_tables::retry_username_variants(&policy, &mut user, |user| {
+                    Ok(registry.user_exists(user, &host))
+                })? {
                     Ok((user, host))
                 } else {
                     Err(DriverError::from(
@@ -1195,8 +1231,10 @@ pub trait AccountExec: super::account_tables::UserTableExec {
                     || (!gone.contains(account) && registry.user_exists(&account.0, &account.1))
             };
             for (old, new) in &resolved {
-                // Go `executeRenameUser` checks the NEW name's lengths before
-                // it looks either account up.
+                // Go `executeRenameUser` checks the NEW name against the
+                // username policy, then its lengths, before it looks either
+                // account up.
+                tidb_keyspace::get_username_policy().validate_username(&new.0)?;
                 if new.0.len() > tidb_parser::auth::USER_NAME_MAX_LENGTH {
                     return Err(tidb_planner::preprocess::wrong_string_length_error(
                         &new.0,
@@ -1384,6 +1422,9 @@ pub trait AccountExec: super::account_tables::UserTableExec {
         // with `default_authentication_plugin`. The accounts to create are
         // collected here and written only after every check has passed.
         let no_auto_create_user = self.session_vars().sql_mode().has_no_auto_create_user_mode();
+        // Go's user lookup rewrites each grantee's name in place to the
+        // username-policy variant it finds; every later step uses `users`.
+        let mut users = grant.users.clone();
         match &grant.level {
             tidb_ast::GrantLevel::Global => {
                 let (static_mask, dynamic) = self.split_global_privs(&grant.privileges, true)?;
@@ -1397,11 +1438,11 @@ pub trait AccountExec: super::account_tables::UserTableExec {
                 // property of the user".
                 let names_static = grant.privileges.iter().any(|privilege| !privilege.dynamic);
                 let mask = static_mask | if names_static { with_grant } else { 0 };
-                let missing = self.grantees_missing(&grant.users, no_auto_create_user)?;
+                let missing = self.grantees_missing(&mut users, no_auto_create_user)?;
                 self.grant_column_list_outside_table_scope(grant, None)?;
                 tls_policy = load_tls_policy()?;
-                self.create_grantees(&grant.users, &missing)?;
-                for spec in &grant.users {
+                self.create_grantees(&users, &missing)?;
+                for spec in &users {
                     let user = spec.user.user.as_str();
                     let host = spec.user.host.as_str();
                     // Go `grant.go` `composeGlobalPrivUpdate`: the same bits
@@ -1421,11 +1462,11 @@ pub trait AccountExec: super::account_tables::UserTableExec {
                 let database = self.resolve_grant_database(database.as_deref())?;
                 let privs = self.resolve_scoped_privs(&grant.privileges, ScopeKind::Database)?;
                 let mask = privs.iter().fold(0u64, |mask, priv_| mask | priv_.bit()) | with_grant;
-                let missing = self.grantees_missing(&grant.users, no_auto_create_user)?;
+                let missing = self.grantees_missing(&mut users, no_auto_create_user)?;
                 self.grant_column_list_outside_table_scope(grant, Some(&database))?;
                 tls_policy = load_tls_policy()?;
-                self.create_grantees(&grant.users, &missing)?;
-                for spec in &grant.users {
+                self.create_grantees(&users, &missing)?;
+                for spec in &users {
                     let user = spec.user.user.as_str();
                     let host = spec.user.host.as_str();
                     let (user, host) = (user.to_owned(), host.to_owned());
@@ -1438,7 +1479,7 @@ pub trait AccountExec: super::account_tables::UserTableExec {
                     table: privs,
                     columns,
                 } = self.resolve_table_scope_privs(&grant.privileges)?;
-                let missing = self.grantees_missing(&grant.users, no_auto_create_user)?;
+                let missing = self.grantees_missing(&mut users, no_auto_create_user)?;
                 // Go allows granting on a table that does not exist only
                 // when the privilege list includes `CREATE` (captured:
                 // issues #28533/#29268); otherwise it reports
@@ -1474,8 +1515,8 @@ pub trait AccountExec: super::account_tables::UserTableExec {
                 if with_grant != 0 {
                     table_privs_written.push(tidb_mysql::GrantPriv);
                 }
-                self.create_grantees(&grant.users, &missing)?;
-                for spec in &grant.users {
+                self.create_grantees(&users, &missing)?;
+                for spec in &users {
                     let user = spec.user.user.as_str();
                     let host = spec.user.host.as_str();
                     // The TABLE row is created even by a column-only grant
@@ -1497,7 +1538,7 @@ pub trait AccountExec: super::account_tables::UserTableExec {
             }
         }
         if let Some(policy) = tls_policy {
-            for spec in &grant.users {
+            for spec in &users {
                 self.mirror_global_priv(
                     &spec.user.user,
                     &spec.user.host,
@@ -1511,19 +1552,24 @@ pub trait AccountExec: super::account_tables::UserTableExec {
 
     /// Go `GrantExec.Next`'s `userExists` pass: the positions of the
     /// grantees with no account, refused under `NO_AUTO_CREATE_USER`.
+    ///
+    /// Go `userExistsWithRetryVariants` rewrites each grantee to the
+    /// username-policy variant it finds, and a grantee to be created must
+    /// pass `ValidateUsername` (`executor/grant.go:181-189`).
     fn grantees_missing(
         &mut self,
-        users: &[tidb_ast::CreateUserSpec],
+        users: &mut [tidb_ast::CreateUserSpec],
         no_auto_create_user: bool,
     ) -> Result<Vec<usize>, DriverError> {
         let mut missing = Vec::new();
-        for (position, spec) in users.iter().enumerate() {
-            if !self.user_exists(&spec.user.user, &spec.user.host)? {
+        for (position, spec) in users.iter_mut().enumerate() {
+            if !self.user_exists_with_retry_variants(&mut spec.user.user, &spec.user.host)? {
                 if no_auto_create_user {
                     return Err(DriverError::from(
                         tidb_exeerrors::ERR_CANT_CREATE_USER_WITH_GRANT.gen_with_stack_by_args(&[]),
                     ));
                 }
+                tidb_keyspace::get_username_policy().validate_username(&spec.user.user)?;
                 missing.push(position);
             }
         }
@@ -1531,10 +1577,12 @@ pub trait AccountExec: super::account_tables::UserTableExec {
     }
 
     /// Go `RevokeExec.Next`: every revokee must have an account
-    /// (`Unknown user`).
-    fn revokees_exist(&mut self, users: &[tidb_ast::CreateUserSpec]) -> Result<(), DriverError> {
+    /// (`Unknown user`). Go `userExistsWithRetryVariants`
+    /// (`executor/revoke.go:106`) rewrites each revokee to the
+    /// username-policy variant it finds.
+    fn revokees_exist(&mut self, users: &mut [tidb_ast::CreateUserSpec]) -> Result<(), DriverError> {
         for spec in users {
-            if !self.user_exists(&spec.user.user, &spec.user.host)? {
+            if !self.user_exists_with_retry_variants(&mut spec.user.user, &spec.user.host)? {
                 return Err(DriverError::from(tidb_terror::MysqlError::unknown(format!(
                     "Unknown user: {}@{}",
                     spec.user.user, spec.user.host
@@ -1623,10 +1671,14 @@ pub trait AccountExec: super::account_tables::UserTableExec {
         // with `r4` absent reports "Unknown user" and r1/r2/r3 keep every
         // bit). Verified after each arm's privilege gate, before its first
         // registry write.
+        //
+        // The user lookup rewrites each revokee's name in place to the
+        // username-policy variant it finds; every later step uses `users`.
+        let mut users = revoke.users.clone();
         match &revoke.level {
             tidb_ast::GrantLevel::Global => {
                 let (mask, dynamic) = self.split_global_privs(&revoke.privileges, false)?;
-                self.revokees_exist(&revoke.users)?;
+                self.revokees_exist(&mut users)?;
                 let revoke_all_dynamic = revoke
                     .privileges
                     .iter()
@@ -1636,7 +1688,7 @@ pub trait AccountExec: super::account_tables::UserTableExec {
                     .filter(|name| !tidb_privilege::is_dynamic_privilege(name))
                     .cloned()
                     .collect();
-                for spec in &revoke.users {
+                for spec in &users {
                     let user = spec.user.user.as_str();
                     let host = spec.user.host.as_str();
                     if !self.user_exists(user, host)? {
@@ -1673,8 +1725,8 @@ pub trait AccountExec: super::account_tables::UserTableExec {
                 let database = self.resolve_grant_database(database.as_deref())?;
                 let privs = self.resolve_scoped_privs(&revoke.privileges, ScopeKind::Database)?;
                 let mask = privs.iter().fold(0u64, |mask, priv_| mask | priv_.bit());
-                self.revokees_exist(&revoke.users)?;
-                for spec in &revoke.users {
+                self.revokees_exist(&mut users)?;
+                for spec in &users {
                     let user = spec.user.user.as_str();
                     let host = spec.user.host.as_str();
                     if !self.user_exists(user, host)? {
@@ -1695,8 +1747,8 @@ pub trait AccountExec: super::account_tables::UserTableExec {
                     table: privs,
                     columns,
                 } = self.resolve_table_scope_privs(&revoke.privileges)?;
-                self.revokees_exist(&revoke.users)?;
-                for spec in &revoke.users {
+                self.revokees_exist(&mut users)?;
+                for spec in &users {
                     let user = spec.user.user.as_str();
                     let host = spec.user.host.as_str();
                     if !self.user_exists(user, host)? {
@@ -1716,7 +1768,7 @@ pub trait AccountExec: super::account_tables::UserTableExec {
                 // `REVOKE` resolves columns through `table.FindCol` too, but
                 // only once the table rows are known to exist.
                 let columns = self.resolve_grant_columns(&database, table, &columns)?;
-                for spec in &revoke.users {
+                for spec in &users {
                     let user = spec.user.user.as_str();
                     let host = spec.user.host.as_str();
                     let (user, host) = (user.to_owned(), host.to_owned());
