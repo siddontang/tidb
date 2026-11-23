@@ -91,7 +91,7 @@ fn main() -> ExitCode {
             }
             // Go `main`: the kernel-type checks, then in standby mode the
             // wait for activation, which rewrites the configuration.
-            if let Err(message) = tidb_server::standby_node::check_kernel_config() {
+            if let Err(message) = tidb_server::standby_node::install_and_check_kernel_config(&config) {
                 eprintln!("{message}");
                 return ExitCode::SUCCESS;
             }
