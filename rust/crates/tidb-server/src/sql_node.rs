@@ -28,6 +28,7 @@ use tidb_globalconn::Allocator;
 use crate::configured_user_store::ConfiguredUserStore;
 use crate::client_socket::ClientSocket;
 use tidb_session::domain::peer_address::PeerAddress;
+use crate::keyspace_registry::ConnectionRouter;
 use crate::mysql_connection::{
     serve_mysql_connection_with_runtime, MysqlConnectionError, MysqlConnectionRuntime,
 };
@@ -359,11 +360,25 @@ struct WorkerPool {
     terminal_workers: mpsc::Receiver<WorkerTerminal>,
 }
 
-#[derive(Clone)]
-struct WorkerConnectionConfig {
+struct WorkerConnectionConfig<F> {
     server_port: u16,
     max_allowed_packet: usize,
     tls: Option<Arc<MysqlTlsManager>>,
+    /// Chooses each connection's keyspace from its user name when the node
+    /// serves more than one (`crate::keyspace_registry`); `None` serves
+    /// every connection from the node's one factory.
+    router: Option<Arc<dyn ConnectionRouter<F>>>,
+}
+
+impl<F> Clone for WorkerConnectionConfig<F> {
+    fn clone(&self) -> Self {
+        Self {
+            server_port: self.server_port,
+            max_allowed_packet: self.max_allowed_packet,
+            tls: self.tls.clone(),
+            router: self.router.clone(),
+        }
+    }
 }
 
 struct WorkerHandle {
@@ -569,6 +584,8 @@ pub struct ConcurrentSqlNode<F: QuerySessionFactory> {
     socket: Option<SocketListener>,
     factory: Arc<F>,
     users: Arc<ConfiguredUserStore>,
+    /// See [`WorkerConnectionConfig::router`].
+    router: Option<Arc<dyn ConnectionRouter<F>>>,
     tracker: Arc<ConnectionTracker>,
     max_allowed_packet: usize,
     /// Shared TLS owner; each accepted connection uses its current material
@@ -746,6 +763,7 @@ impl<F: QuerySessionFactory> ConcurrentSqlNode<F> {
             socket,
             factory,
             users,
+            router: None,
             tracker,
             max_allowed_packet: config.max_allowed_packet,
             tls,
@@ -790,6 +808,18 @@ impl<F: QuerySessionFactory> ConcurrentSqlNode<F> {
     pub fn with_shutdown_grace(mut self, grace: Duration) -> Self {
         self.shutdown_grace = grace;
         self
+    }
+
+    /// Serves each connection from the keyspace its user name selects.
+    #[must_use]
+    pub(crate) fn with_router(mut self, router: Arc<dyn ConnectionRouter<F>>) -> Self {
+        self.router = Some(router);
+        self
+    }
+
+    /// The TLS owner this node bound, for the keyspaces it opens later.
+    pub(crate) fn tls_manager(&self) -> Arc<MysqlTlsManager> {
+        Arc::clone(&self.tls)
     }
 
     /// Go `Server.autoIDService`: the service this node's standby shutdown
@@ -865,6 +895,7 @@ impl<F: QuerySessionFactory> ConcurrentSqlNode<F> {
                 server_port: self.server_port,
                 max_allowed_packet: self.max_allowed_packet,
                 tls: Some(Arc::clone(&self.tls)),
+                router: self.router.clone(),
             },
             self.shutdown.waker.clone(),
         )?;
@@ -877,6 +908,7 @@ impl<F: QuerySessionFactory> ConcurrentSqlNode<F> {
             server_port: self.server_port,
             max_allowed_packet: self.max_allowed_packet,
             tls: Some(Arc::clone(&self.tls)),
+            router: self.router.clone(),
         };
         let accept_result = (|| loop {
             if limit == Some(accepted) || self.shutdown.is_shutdown_requested() {
@@ -1222,7 +1254,7 @@ fn serve_connection_work<F: QuerySessionFactory>(
     factory: &Arc<F>,
     users: &Arc<ConfiguredUserStore>,
     tracker: &Arc<ConnectionTracker>,
-    connection: &WorkerConnectionConfig,
+    connection: &WorkerConnectionConfig<F>,
 ) {
     let ConnectionWork {
         stream,
@@ -1240,6 +1272,7 @@ fn serve_connection_work<F: QuerySessionFactory>(
         cancellation,
         factory.as_ref(),
         users.as_ref(),
+        connection.router.as_deref(),
         tracker,
         MysqlConnectionRuntime {
             server_port: Some(connection.server_port),
@@ -1299,7 +1332,7 @@ fn dedicated_connection_job<F: QuerySessionFactory>(
     factory: Arc<F>,
     users: Arc<ConfiguredUserStore>,
     tracker: Arc<ConnectionTracker>,
-    connection: WorkerConnectionConfig,
+    connection: WorkerConnectionConfig<F>,
     terminal: TerminalSender,
 ) -> WorkerJob {
     Box::new(move || {
@@ -1324,7 +1357,7 @@ fn spawn_workers<F: QuerySessionFactory>(
     factory: &Arc<F>,
     users: &Arc<ConfiguredUserStore>,
     tracker: &Arc<ConnectionTracker>,
-    connection: WorkerConnectionConfig,
+    connection: WorkerConnectionConfig<F>,
     waker: AcceptWaker,
 ) -> Result<WorkerPool, SqlNodeError> {
     spawn_workers_with(count, factory, users, tracker, connection, waker, |index, job| {
@@ -1340,7 +1373,7 @@ fn spawn_workers_with<F, S>(
     factory: &Arc<F>,
     users: &Arc<ConfiguredUserStore>,
     tracker: &Arc<ConnectionTracker>,
-    connection: WorkerConnectionConfig,
+    connection: WorkerConnectionConfig<F>,
     waker: AcceptWaker,
     mut spawn: S,
 ) -> Result<WorkerPool, SqlNodeError>
@@ -1853,6 +1886,7 @@ mod tests {
                 server_port: 0,
                 max_allowed_packet: tidb_protocol::DEFAULT_MAX_ALLOWED_PACKET,
                 tls: None,
+                router: None,
             },
             AcceptWaker::default(),
             move |index, job: WorkerJob| {

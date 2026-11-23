@@ -1024,6 +1024,7 @@ pub fn serve_mysql_connection_with_tls<F: QuerySessionFactory>(
         cancellation,
         factory,
         users,
+        None,
         tracker,
         MysqlConnectionRuntime {
             max_allowed_packet,
@@ -1272,6 +1273,7 @@ pub(crate) fn serve_mysql_connection_with_runtime<F: QuerySessionFactory>(
     cancellation: ConnectionCancellation,
     factory: &F,
     users: &ConfiguredUserStore,
+    router: Option<&dyn crate::keyspace_registry::ConnectionRouter<F>>,
     tracker: &Arc<ConnectionTracker>,
     runtime: MysqlConnectionRuntime<'_>,
 ) -> Result<ConnectionReport, MysqlConnectionError> {
@@ -1312,6 +1314,7 @@ pub(crate) fn serve_mysql_connection_with_runtime<F: QuerySessionFactory>(
             cancellation,
             factory,
             users,
+            router,
             runtime,
             &mut commands,
             &tracker.command_limiter,
@@ -1352,12 +1355,14 @@ pub(crate) fn serve_mysql_connection_with_runtime<F: QuerySessionFactory>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn serve_connection_inner<F: QuerySessionFactory>(
     stream: ClientSocket,
     identity: AcceptedConnectionIdentity,
     cancellation: ConnectionCancellation,
     factory: &F,
     users: &ConfiguredUserStore,
+    router: Option<&dyn crate::keyspace_registry::ConnectionRouter<F>>,
     mut runtime: MysqlConnectionRuntime<'_>,
     commands: &mut ConnectionCommandCounts,
     command_limiter: &CommandLimiter,
@@ -1484,6 +1489,34 @@ fn serve_connection_inner<F: QuerySessionFactory>(
     let mut response_user = response.user.to_string_lossy().into_owned();
     let response_db_name = response.db_name.to_string_lossy().into_owned();
     output.set_user(response_user.clone());
+    // Multi-keyspace serving (design §4): the user name's `<keyspace>.`
+    // prefix selects the keyspace before any authentication decision, and
+    // the rest of the login and the session run against that keyspace's
+    // accounts and factory. A keyspace that cannot be served answers like a
+    // failed login, so its existence is not revealed.
+    let routed;
+    let (factory, users) = match router {
+        None => (factory, users),
+        Some(router) => match router.route(&response_user) {
+            Some(keyspace) => {
+                routed = keyspace;
+                (routed.0.as_ref(), routed.1.as_ref())
+            }
+            None => {
+                return rejected_login(
+                    events,
+                    &mut output,
+                    reply_sequence,
+                    ER_ACCESS_DENIED_ERROR,
+                    *b"28000",
+                    access_denied_message(&response_user, &peer_addr.host(), &response.auth),
+                    response.capability & CLIENT_PROTOCOL_41 != 0,
+                    connection_id,
+                    *commands,
+                );
+            }
+        },
+    };
     // Go rejects an insecure transport immediately after parsing the full
     // handshake response, before selecting an account plugin or sending an
     // AuthSwitchRequest. Keep the returned token so the account verifier
