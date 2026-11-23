@@ -1,6 +1,6 @@
 # Multi-keyspace tidb-server: one process, many tenants
 
-- Status: **Draft for review, revision 4**: addresses the reviews of `42b666f`, `7cbdef8ad3` and `08d9476bfc`. No code has been written yet.
+- Status: **Draft for review, revision 5**: adds session migration (§5.6); addresses the reviews of `42b666f`, `7cbdef8ad3` and `08d9476bfc`. No code has been written yet.
 - Scope: the Rust SQL node (`rust/crates/tidb-server`), Next Generation kernel (`--features nextgen`) only.
 - Branch base: `hparser-integration` @ `73a0893eff`.
 
@@ -430,6 +430,95 @@ Tenants and operators get separate doors:
   the keyspace is derived from the authenticated tenant identity, never from a
   path or query parameter.
 
+### 5.6 Session migration through a proxy
+
+A proxy in front of the SQL nodes, for example TiProxy, can move a client's
+session from one tidb-server to another without the client noticing. Typical
+reasons are rebalancing tenants, scaling in, draining a runtime (§5.3), or
+rolling restarts. The session is **encoded on the source node and restored on
+the target node**, and the client's TCP connection to the proxy never breaks.
+
+Go TiDB already defines this protocol, and the Rust port already has its
+pieces:
+
+- Rust has `rust/crates/tidb-sessionstates`, with `session_states.rs` and
+  `session_token.rs`, plus `tidb-session/src/session_states.rs`.
+- `mysql_connection.rs:1131` accepts the `tidb_session_token` plugin.
+
+The flow:
+
+1. The proxy waits until the session is **migratable**: it is between
+   statements and has no open transaction. Go also refuses sessions that hold
+   temporary tables, table locks or advisory locks, among others; it returns
+   `ErrCannotMigrateSession` in those cases.
+2. On the source node, the proxy runs `SHOW SESSION_STATES`, which returns two
+   things:
+   - a JSON **session state**: user variables and their types, session system
+     variables, prepared statements and their IDs, current database, last
+     insert ID, warnings, found rows, sequence values, bindings, and so on;
+   - a **session token**: `{username, sign-time, expire-time, signature}`,
+     signed with `security.session-token-signing-cert`. The cert is shared by
+     the whole fleet and rotated periodically.
+3. The proxy opens a new backend connection to the target node as the same
+   user, authenticating with the `tidb_session_token` plugin and the token, so
+   no password is needed.
+4. On the target, it runs `SET SESSION_STATES '<json>'`. The target rebuilds the
+   session: it re-prepares statements from their SQL text, keeping the
+   client-visible statement IDs, and restores variables. Then it drops the
+   source connection.
+
+**What multi-keyspace mode adds:**
+
+- **Routing comes for free.** The token's username is the full `ks.app`, so the
+  target node routes the token login exactly like a password login (§4). It
+  opens or reuses `ks`'s runtime, and the session lands in the same tenant.
+  The target may be a multi-keyspace node or a single-keyspace node of `ks`;
+  both understand the same format, which also covers the mixed fleet.
+- **Bind the token to the keyspace.**
+  - The signing cert is fleet-wide, so a token alone does not prove which
+    tenant it came from.
+  - In multi-keyspace mode every username is prefixed, and the signature
+    covers the username. So a `ks1.app` token cannot be replayed as `ks2.app`.
+  - A single-keyspace node outside Starter mode signs unprefixed usernames
+    (`app`). Such a token would be accepted by **any** keyspace that has an
+    `app` account, a cross-tenant login.
+  - Fix: add a `keyspace` field, covered by the signature, to tokens signed in
+    nextgen. The verifier rejects a token whose `keyspace` does not match the
+    routed keyspace, and a multi-keyspace node rejects nextgen tokens without
+    the field. Older tokens stay valid only on the single-keyspace nodes that
+    signed them.
+- **Session state is tenant-scoped.**
+  - Restored global-dependent values are checked against the target tenant's
+    sysvars, not the process's (§6.3).
+  - Prepared statements are rebuilt against the target tenant's catalog.
+  - Statement IDs and connection IDs: the connection ID changes with the
+    backend, and the proxy keeps the client-visible one stable. `KILL` issued
+    by the client goes through the proxy.
+- **Drain uses it.** Idle close never has connections to move. A drain for PD
+  disable, scale-in or rebalancing does: a node behind a migration-capable proxy can ask the proxy to move each session once
+  it is migratable, before killing it at `drain-grace`. This uses TiProxy's
+  existing health and "graceful wait" signal: the node reports itself
+  unhealthy for that tenant, and the proxy migrates. Without a proxy,
+  connections are simply closed, as today.
+- **Lifetime.** Rust keeps Go's lifetimes: 60s by default, 8h in Starter mode
+  (`STARTER_TOKEN_LIFETIME`). A migrated session's pin (§5.3) is taken on the
+  target at routing time, as for any login.
+
+**Tests**, run in Phase 3g on the local TiDB X playground with a proxy or a
+scripted proxy:
+
+- Migrate a session with user variables, session sysvars, prepared statements
+  and a current database from node A to node B. The proxy's client keeps
+  executing the prepared statements with the same IDs.
+- Migrate between a multi-keyspace node and a single-keyspace node of the same
+  keyspace, in both directions.
+- Migration is refused mid-transaction and with a temporary table.
+- A `ks1` token presented as `ks2`, and an unprefixed nextgen token presented
+  to a multi-keyspace node, are both rejected with 1045.
+- An expired token is rejected.
+- Signing-cert rotation during migration.
+- Drain with a proxy: no client sees an error.
+
 ## 6. Removing single-keyspace globals
 
 This is the bulk of the work. Each row names the current global and its
@@ -689,7 +778,7 @@ playground. Later mitigations, only if the measurements call for them:
 ## 10. Plan
 
 Each phase is shippable. Phase 1b is independent of Phase 1 and can run in
-parallel with it. Phases 3a–3f are independent of each other and can run
+parallel with it. Phases 3a–3g are independent of each other and can run
 in parallel once Phase 1 lands.
 
 | Phase | Deliverable | Gate |
@@ -704,7 +793,8 @@ in parallel once Phase 1 lands.
 | **3d** | ID-keyed caches into the runtime (§6.4) and transaction/GC maps (§6.5) | Stats and DDL concurrency in two tenants; GC safe point per tenant |
 | **3e** | Observability isolation (§6.8) | Processlist, KILL, statement summary and slow-query filtering tests |
 | **3f** | Status port multiplexing + AutoID service map + per-store globals (§6.9, §6.10) | AUTO_ID_CACHE=1 tables in two tenants; IMPORT INTO per tenant |
-| **4. Lifecycle** | Idle close, PD state watch and drain, per-tenant `max_connections`, optional prefix alias (Q1) | Lifecycle tests; leak check that repeated open/close does not grow memory or file descriptors |
+| **3g** | Session migration (§5.6): keyspace-bound session tokens, token logins through routing, tenant-scoped `SET SESSION_STATES`, parity check of the ported session-states code in multi-keyspace mode | §5.6 migration tests, including cross-tenant token replay rejection |
+| **4. Lifecycle** | Idle close, PD state watch and drain (using proxy session migration when present, §5.6), per-tenant `max_connections`, optional prefix alias (Q1) | Lifecycle tests; leak check that repeated open/close does not grow memory or file descriptors |
 | **5. Hardening** | Full isolation suite; footprint benchmark N=1/10/50; per-tenant memory quota; docs | The isolation suite is the bar for calling the mode tenant-isolated |
 
 Phase 2 may be developed alongside Phase 3.
@@ -712,7 +802,7 @@ Phase 2 may be developed alongside Phase 3.
 **Gate for the first shared deployment**, meaning `dev-mode` off with real
 tenants:
 
-- **all** of 3a–3f and Phase 4 are done;
+- **all** of 3a–3g and Phase 4 are done;
 - every supported operation uses the correct tenant's service: GC tracking,
   placement and label clients, AutoID dispatch, resource tags,
   `SET GLOBAL`, observability;
