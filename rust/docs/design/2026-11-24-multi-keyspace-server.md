@@ -1,6 +1,6 @@
 # Multi-keyspace tidb-server: one process, many tenants
 
-- Status: **Draft for review, revision 2**: addresses the review of `42b666f`. No code has been written yet.
+- Status: **Draft for review, revision 3**: addresses the reviews of `42b666f` and `7cbdef8ad3`. No code has been written yet.
 - Scope: the Rust SQL node (`rust/crates/tidb-server`), Next Generation kernel (`--features nextgen`) only.
 - Branch base: `hparser-integration` @ `73a0893eff`.
 
@@ -127,42 +127,96 @@ Bootstrap creates a plain, **passwordless** `root`, in Go and in Rust
 through the shared listener. That is deliberate: a passwordless account must
 never be reachable there.
 
-- **Provisioning is a separate operator step**, and a keyspace is admitted
-  only once it is done. It extends Go's `--keyspace-activate` mode, which
-  bootstraps a keyspace and exits:
+- **One admission tool, two modes.** Both modes extend Go's
+  `--keyspace-activate` mode, which bootstraps a keyspace and exits. The same
+  operations are available on the operator listener (§5.5). A keyspace is
+  admitted only after the tool has written a `tidb_multi_keyspace_provisioned`
+  row to `mysql.tidb`. At runtime open, the registry refuses (1045) a keyspace
+  without that row, or with a migration still in progress.
 
   ```sh
+  # Fresh keyspace: no user accounts besides the bootstrap root.
   tidb-server --keyspace-activate --keyspace-name ks1 --path <pd> \
-      --initial-admin-password-file /secure/ks1-root.pw   # new flag
+      --initial-admin-password-file /secure/ks1-root.pw
+  # Existing keyspace with unprefixed accounts.
+  tidb-server --keyspace-activate --keyspace-name ks1 --path <pd> --migrate-accounts
   ```
 
-  This bootstraps `ks1` if needed. In one transaction it then creates
-  `'ks1.root'@'%'` with that password, `ALL PRIVILEGES ... WITH GRANT OPTION`,
-  and writes a `tidb_multi_keyspace_provisioned` row to `mysql.tidb`. The same
-  operation is available on the operator listener (§5.5).
-- **At runtime open**, the registry refuses (1045) a keyspace that has no
-  provisioned row.
-- **Existing keyspaces** whose accounts are unprefixed (`app`) are migrated by
-  the same command with `--migrate-accounts`. It issues
-  `RENAME USER 'app'@'h' TO 'ks1.app'@'h'` for every non-internal account.
-  `RENAME USER` carries table, column and role grants, and the bootstrap
-  `root` is renamed only if it has a password.
-- **Rolling upgrade.** Switch the keyspace's existing single-keyspace nodes to
-  `deploy-mode = starter` first, so they apply Go's prefix policy. Then migrate
-  the accounts. Then add multi-keyspace nodes. Starter-mode single-keyspace
-  nodes accept both `app` (via `GetUsernameVariants`, `app` → `ks1.app`) and
-  `ks1.app`, so clients keep working throughout.
-- **Rollback.** Remove the multi-keyspace nodes. The prefixed accounts keep
-  working on Starter-mode single-keyspace nodes. Undoing the rename is optional
-  and uses the same tool in reverse.
-- **Test.** On a fresh keyspace:
-  - provision it, then log in as `ks1.root` with the provisioned password;
-  - `CREATE USER 'ks1.app'` and log in as it;
-  - check that `CREATE USER 'app'` and `CREATE USER 'ks2.app'` both fail
-    with Go's error;
-  - check that `ks1.root` cannot log in before provisioning;
-  - on an existing keyspace, run `--migrate-accounts` and check that its grants
-    survive.
+- **Provision mode (fresh keyspace).** It bootstraps `ks1` if needed and
+  creates `'ks1.root'@'%'` with the given password and
+  `ALL PRIVILEGES ON *.* WITH GRANT OPTION`. It refuses to run if any
+  non-internal account other than a passwordless bootstrap `root` exists;
+  those keyspaces must use migrate mode.
+
+- **Migrate mode (existing keyspace).** This is the only path for a keyspace
+  that already has accounts, so an existing administrator has exactly one
+  route:
+  1. **Plan.** Compute the rename set: every non-internal `'u'@'h'` becomes
+     `'ks1.u'@'h'`. For `root`:
+     - a **password-protected** `'root'@'h'` is renamed and keeps its own
+       credential and grants. `--initial-admin-password-file` is rejected in
+       this mode, so there is never a second, competing `ks1.root`;
+     - a **passwordless** `root` is not renamed. If it is the only
+       administrator, the tool stops and asks the operator to give it a
+       password first, then rerun.
+  2. **Preflight, before any write.** Every destination name must be free. If
+     any `'ks1.u'@'h'` already exists, the tool aborts with the full collision
+     list and changes nothing. It never merges accounts.
+  3. **Record the plan.** Store the plan as a
+     `tidb_multi_keyspace_migration` row in `mysql.tidb` with state
+     `in_progress`.
+  4. **Rename** each account with `RENAME USER`. That statement carries the
+     credential and table, column and role grants. Each step is idempotent: a
+     step whose source is gone and whose destination exists is skipped.
+  5. **Finish.** Only after every rename succeeds, set the migration row to
+     `done` and write the provisioned marker.
+
+  A rerun after an interruption resumes from the stored plan.
+
+- **Rolling migration needs a compatibility release first.** Go's handshake
+  maps a plain `app` to `ks1.app` in Starter mode
+  (`matchIdentityWithVariants`, `pkg/server/conn.go:910`), and its user DDL
+  enforces the prefix. Rust has the policy ported, but
+  `get_username_variants`, `validate_username` and `get_username_policy` have
+  **no production callers** (`rust/crates/tidb-keyspace/src/lib.rs:214`). So
+  switching today's Rust nodes to `deploy-mode = starter` would not keep `app`
+  logins working. The order is:
+  1. **Compatibility release (Phase 1b).** Port Go's Starter username handling
+     into the Rust handshake: `matchIdentityWithVariants` and
+     `checkUserVariantMismatch`. Also port it into `CREATE`/`ALTER`/`GRANT
+     USER`. This is Go parity work and has no multi-keyspace dependency.
+     Deploy it to every single-keyspace node of the keyspace, with
+     `deploy-mode = starter`.
+  2. Run migrate mode. Clients using `app` and `ks1.app` both keep working.
+  3. Add multi-keyspace nodes. These accept only `ks1.app`.
+- **Coordinated cutover**, for keyspaces whose nodes cannot take the
+  compatibility release: stop client traffic, migrate, and switch every client
+  to `ks1.app` before reopening. This is documented, but it is not the default
+  path.
+- **Rollback.** Remove the multi-keyspace nodes. Single-keyspace nodes on the
+  compatibility release keep accepting both `app` and `ks1.app`. Undoing the
+  rename (migrate mode with `--reverse`, same plan and preflight rules) is
+  needed only to roll the single-keyspace nodes back before the compatibility
+  release.
+- **Tests.**
+  - Fresh keyspace:
+    - provision it, then log in as `ks1.root` with the provisioned password;
+    - `CREATE USER 'ks1.app'` and log in as it;
+    - check that `CREATE USER 'app'` and `CREATE USER 'ks2.app'` both fail
+      with Go's error;
+    - check that nothing can log in before provisioning.
+  - Migration:
+    - a password-protected `root` keeps its password and grants as
+      `ks1.root`;
+    - a pre-existing destination account aborts the run with no writes;
+    - a run interrupted after some renames completes on retry, with the marker
+      written once;
+    - a passwordless-only `root` stops the run.
+  - Rolling path:
+    - on a single-keyspace Rust node with the compatibility release, a fresh
+      connection as plain `app` succeeds after migration;
+    - it succeeds again after rollback of the multi-keyspace nodes;
+    - it succeeds after a `--reverse` rollback.
 
 The mapping from prefix to keyspace is the identity function in v1, as in Go.
 An opaque alias, like Starter's random 15-character prefix, can be added later
@@ -610,13 +664,15 @@ playground. Later mitigations, only if the measurements call for them:
 
 ## 10. Plan
 
-Each phase is shippable. Phases 3a–3f are independent of each other and can run
+Each phase is shippable. Phase 1b is independent of Phase 1 and can run in
+parallel with it. Phases 3a–3f are independent of each other and can run
 in parallel once Phase 1 lands.
 
 | Phase | Deliverable | Gate |
 | --- | --- | --- |
 | **0** | This design; decisions on §11 | Owner sign-off |
 | **1. Extract the runtime** | `ProcessServices` + `KeyspaceRuntime::open/close` + `KeyspaceRegistry` with one preloaded runtime. Pure refactor; no routing, no behavior change | All default-mode gates green; baseline footprint numbers for N=1 |
+| **1b. Username-policy parity** | Port Go's Starter username handling into the Rust handshake and user DDL (§4.1): the prerequisite compatibility release for migrating existing keyspaces | Go-parity tests for variants, prefix mismatch and `CREATE USER` prefix; plain `app` login after migration on a single-keyspace node |
 | **2. Controlled demo** (behind `multi-keyspace.enable` **and** `dev-mode`) | Handshake split and registry lookup; TLS rule and operator listener (§5.4, §5.5); provisioning (§4.1); server-ID reservation (§6.6); pin-count lifecycle without idle close (§5.3); greeting plugin from config; allow-list, preload, max-keyspaces. **Pulled forward from 3d:** per-keyspace min-start-ts / GC tracking (§6.5), because GC is a data-loss risk even in a demo. **Unsupported operations are rejected** with `ER_NOT_SUPPORTED_YET` until their phase lands: placement and resource-group DDL (3b), `AUTO_ID_CACHE=1` tables (3f), IMPORT INTO / BR / external storage (3f), tenant HTTP status APIs | Two tenants on one node: data, auth, GC-safety and AutoID tests (§9) pass; every rejected operation has a test asserting the rejection. **Not for shared deployment.** |
 | **3a** | Keyspace identity reads + resource tags + username policy (§6.1) | Unit and integration tests; no empty-keyspace assertions firing |
 | **3b** | PD/infosync singletons into `RuntimeServices` (§6.2) | Resource-group, placement and label-rule SQL per tenant |
