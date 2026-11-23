@@ -912,3 +912,124 @@ fn account_statements_write_the_privilege_tables_like_go() {
         [["0"]]
     );
 }
+
+/// Go `TestStarterUsernamePolicyInSimpleExec`
+/// (`executor/test/simpletest/simple_test.go:43`): in Starter mode the
+/// account statements require new names to carry the keyspace prefix and
+/// resolve an unprefixed target to its prefixed account.
+#[test]
+fn starter_username_policy_in_simple_exec() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // The starter deploy mode exists only in the nextgen kernel.
+        return;
+    }
+    let restore_config = tidb_config::config_tree::config::restore_func();
+    let original_mode = tidb_config_deploymode::get();
+    tidb_config::config_tree::config::update_global(|config| {
+        config.keyspace_name = "SYSTEM".into();
+    });
+    tidb_config_deploymode::set(tidb_config_deploymode::Mode::Starter).unwrap();
+
+    let privs = tidb_privilege::PrivilegeRegistry::default();
+    let mut tk = bootstrap_session(&privs);
+    let rows = |session: &mut Session, sql: &str| row_text(session.run(sql));
+    let run = |session: &mut Session, sql: &str| {
+        session
+            .run(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    };
+    let contains_err = |session: &mut Session, sql: &str, want: &str| {
+        let message = session
+            .run(sql)
+            .expect_err(sql)
+            .to_mysql_error()
+            .message;
+        assert!(message.contains(want), "{sql}: {message}");
+    };
+    let need_prefix = "User name must start with `SYSTEM.`";
+
+    run(&mut tk, "create user if not exists `SYSTEM.r1`@`%`");
+    run(&mut tk, "create user if not exists `SYSTEM.u1`@`%`");
+
+    contains_err(&mut tk, "create user u2@'%' identified by 'pwd'", need_prefix);
+    contains_err(&mut tk, "create role r2", need_prefix);
+    run(&mut tk, "create role `SYSTEM.r2`");
+    assert_eq!(
+        rows(&mut tk, "select User from mysql.user where User='SYSTEM.r2' and Host='%'"),
+        [["SYSTEM.r2"]]
+    );
+    contains_err(&mut tk, "rename user `SYSTEM.u1`@`%` to u2@'%'", need_prefix);
+
+    run(&mut tk, "grant r1 to u1");
+    assert_eq!(
+        rows(
+            &mut tk,
+            "select TO_USER from mysql.role_edges where FROM_USER='SYSTEM.r1' and TO_USER='SYSTEM.u1' and TO_HOST='%'"
+        ),
+        [["SYSTEM.u1"]]
+    );
+
+    run(&mut tk, "set default role r1 to u1");
+    assert_eq!(
+        rows(
+            &mut tk,
+            "select USER, DEFAULT_ROLE_USER from mysql.default_roles where USER='SYSTEM.u1' and DEFAULT_ROLE_USER='SYSTEM.r1'"
+        ),
+        [["SYSTEM.u1", "SYSTEM.r1"]]
+    );
+
+    run(&mut tk, "set default role none to u1");
+    assert!(rows(&mut tk, "select USER from mysql.default_roles where USER='SYSTEM.u1'").is_empty());
+
+    run(&mut tk, "set default role all to u1");
+    assert_eq!(
+        rows(
+            &mut tk,
+            "select USER, DEFAULT_ROLE_USER from mysql.default_roles where USER='SYSTEM.u1' and DEFAULT_ROLE_USER='SYSTEM.r1'"
+        ),
+        [["SYSTEM.u1", "SYSTEM.r1"]]
+    );
+
+    run(&mut tk, "revoke r1 from u1");
+    assert!(rows(
+        &mut tk,
+        "select TO_USER from mysql.role_edges where FROM_USER='SYSTEM.r1' and TO_USER='SYSTEM.u1' and TO_HOST='%'"
+    )
+    .is_empty());
+    assert!(rows(&mut tk, "select USER from mysql.default_roles where USER='SYSTEM.u1'").is_empty());
+
+    run(&mut tk, "alter user u1 identified by 'pwd2'");
+    assert_eq!(
+        rows(&mut tk, "select authentication_string from mysql.user where user='SYSTEM.u1' and host='%'"),
+        [[tidb_privilege::encode_password("pwd2")]]
+    );
+
+    run(&mut tk, "create user if not exists `SYSTEM.keao.yang`@`%`");
+    run(&mut tk, "alter user `keao.yang`@`%` identified by 'pwd3'");
+    assert_eq!(
+        rows(
+            &mut tk,
+            "select authentication_string from mysql.user where user='SYSTEM.keao.yang' and host='%'"
+        ),
+        [[tidb_privilege::encode_password("pwd3")]]
+    );
+
+    run(&mut tk, "create user if not exists `SYSTEM.admin`@`%`");
+    run(&mut tk, "grant create user on *.* to `SYSTEM.admin`@`%`");
+    run(&mut tk, "create user if not exists `SYSTEM.u_sys`@`%`");
+    run(&mut tk, "grant system_user on *.* to `SYSTEM.u_sys`@`%`");
+    let mut admin_tk = authenticated_session(&privs, "SYSTEM.admin", "%");
+    contains_err(&mut admin_tk, "alter user u_sys identified by 'pwd4'", "SYSTEM_USER or SUPER");
+    assert_eq!(
+        rows(&mut tk, "select authentication_string from mysql.user where user='SYSTEM.u_sys' and host='%'"),
+        [[tidb_privilege::encode_password("")]]
+    );
+
+    run(&mut tk, "set sql_mode=''");
+    contains_err(&mut tk, "grant select on *.* to u_auto@'%'", need_prefix);
+    assert!(rows(&mut tk, "select User from mysql.user where User='u_auto' and Host='%'").is_empty());
+    run(&mut tk, "set sql_mode=default");
+
+    tidb_config_deploymode::set(original_mode).unwrap();
+    restore_config();
+}

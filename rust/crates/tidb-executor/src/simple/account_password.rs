@@ -204,8 +204,8 @@ pub trait AccountPasswordExec: super::account::AccountExec {
         if !alter.if_exists {
             let mut missing = Vec::new();
             for spec in specs {
-                let (user, host) = self.resolve_account(&spec.user)?;
-                if !self.user_exists(&user, &host)? {
+                let (mut user, host) = self.resolve_account(&spec.user)?;
+                if !self.user_exists_with_retry_variants(&mut user, &host)? {
                     // Go checks the caller's privileges before it reports an
                     // account as missing.
                     self.alter_user_admin_gate(
@@ -247,7 +247,11 @@ pub trait AccountPasswordExec: super::account::AccountExec {
                 Some(tidb_ast::AlterUserDualPassword::DiscardOld) => (false, true),
                 None => (false, false),
             };
-            let (user, host) = self.resolve_account(&spec.user)?;
+            let (mut user, host) = self.resolve_account(&spec.user)?;
+            // Go `userExistsInternalWithRetryVariants` reads the target row
+            // before the privilege gate and rewrites the account to the
+            // username-policy variant it finds, which the gate then names.
+            let exists = self.user_exists_with_retry_variants(&mut user, &host)?;
             let need_admin_check = self.alter_user_admin_gate(
                 &registry,
                 spec,
@@ -256,7 +260,6 @@ pub trait AccountPasswordExec: super::account::AccountExec {
                 has_other_stmt_options,
                 &effective,
             )?;
-            let exists = self.user_exists(&user, &host)?;
             let current_plugin = registry.plugin(&user, &host).unwrap_or_default();
             let current_auth_string = registry.auth_string(&user, &host).unwrap_or_default();
             if !exists {
