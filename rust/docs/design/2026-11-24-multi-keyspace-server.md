@@ -432,7 +432,10 @@ Tenants and operators get separate doors:
 
 ### 5.6 Session migration through a proxy
 
-A proxy in front of the SQL nodes, for example TiProxy, can move a client's
+**Decision (siddontang, 2026-11-24): the target proxy is TiProxy.** No new
+proxy and no direct TiDB-to-TiDB handoff in this design.
+
+A proxy in front of the SQL nodes (TiProxy) can move a client's
 session from one tidb-server to another without the client noticing. Typical
 reasons are rebalancing tenants, scaling in, draining a runtime (§5.3), or
 rolling restarts. The session is **encoded on the source node and restored on
