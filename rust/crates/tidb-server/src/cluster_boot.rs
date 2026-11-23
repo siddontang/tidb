@@ -124,6 +124,8 @@ pub(crate) fn run_cluster_session_node_with_spill(
     spill_storage: Arc<tidb_spill_storage::SpillStorage>,
     memory_arbitrator: Option<Arc<tidb_memory::MemArbitrator>>,
 ) -> Result<(), RunConfiguredNodeError> {
+    let multi_keyspace = crate::keyspace_registry::MultiKeyspaceDev::from_env(&config.global_config.keyspace_name)
+        .map(|dev| (dev, Arc::clone(&spill_storage), memory_arbitrator.clone()));
     let (runtime, authority) = KeyspaceRuntime::open(&config, spill_storage, memory_arbitrator)?;
     // Go `main`: `if deploymode.IsStarter() { externalWorkloadManager :=
     // initExternalWorkloadManager(ctx, storage); defer close... }`.
@@ -161,12 +163,28 @@ pub(crate) fn run_cluster_session_node_with_spill(
         let metrics_profile = Some(crate::node_status::metrics_profile_session(&factory));
         crate::node_status::setup_top_profiling(&factory);
         let keyspace_domain = Some(Arc::clone(&factory));
-        let node =
+        // Development multi-keyspace serving: the other allowed keyspaces
+        // open on their first connection (`crate::keyspace_registry`).
+        let registry = multi_keyspace.map(|(dev, spill_storage, memory_arbitrator)| {
+            Arc::new(crate::keyspace_registry::KeyspaceRegistry::new(
+                config.clone(),
+                (Arc::clone(&factory), Arc::clone(&users)),
+                spill_storage,
+                memory_arbitrator,
+                dev,
+            ))
+        });
+        let mut node =
             ConcurrentSqlNode::bind(&config, factory, Arc::clone(&users)).map_err(|error| {
                 tidb_session::domain::real_tikv_node::emit_connections_startup_failure(&error);
                 RunConfiguredNodeError::Node(Box::new(error))
             })?
             .with_auto_id_service(auto_id.clone());
+        if let Some(registry) = &registry {
+            let tls = node.tls_manager();
+            registry.set_tls(tls.clone(), tls.variables());
+            node = node.with_router(Arc::clone(registry) as Arc<dyn crate::keyspace_registry::ConnectionRouter<_>>);
+        }
         let _status_server = start_cluster_status(
             &config,
             node.tracker(),
@@ -215,11 +233,15 @@ pub(crate) fn run_cluster_session_node_with_spill(
             stack.stats_receipt.pseudo,
         );
         let outcome = node.run().map_err(|error| RunConfiguredNodeError::Node(Box::new(error)));
+        if let Some(registry) = &registry {
+            registry.close_extra_keyspaces();
+        }
         runtime.retire();
         // The status callback retains the factory. Its final drop joins
         // internal workers and flushes statistics while timestamp and
         // identity leases still protect those storage transactions.
         drop(_status_server);
+        drop(registry);
         runtime.release();
         outcome
     })

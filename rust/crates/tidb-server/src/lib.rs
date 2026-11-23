@@ -83,6 +83,7 @@ mod shutdown_signal;
 pub mod signal_exit;
 pub(crate) use tidb_session::domain::session_api;
 mod cluster_boot;
+mod keyspace_registry;
 mod keyspace_runtime;
 pub use cluster_boot::{realtikv_test_stack, run_cluster_session_node};
 pub use cluster_stack::ClusterStack;
