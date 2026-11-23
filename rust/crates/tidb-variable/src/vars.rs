@@ -2324,7 +2324,10 @@ pub fn global_system_variable_initial_value(def: &SysVarDef) -> String {
         tidb_vardef::global_sysvar_initial::GlobalSysvarEnvironment {
             store_is_tikv: false,
             in_test: tidb_intest::IN_TEST,
-            next_gen: false,
+            // Go `kerneltype.IsNextGen()`: a nextgen cluster bootstraps
+            // fair locking OFF (TiDB X's storage engine refuses lock-with-
+            // conflict) and the STRICT assertion level.
+            next_gen: tidb_config_kerneltype::is_next_gen(),
         },
     )
 }
@@ -2881,3 +2884,19 @@ impl SessionVars {
     }
 }
 
+
+#[cfg(test)]
+mod initial_value_tests {
+    /// Go `GlobalSystemVariableInitialValue`'s kernel-type cases: a nextgen
+    /// cluster bootstraps fair locking OFF and the STRICT assertion level, a
+    /// classic one fair locking ON and FAST.
+    #[test]
+    fn initial_values_follow_the_kernel_type() {
+        let initial = |name: &str| {
+            super::global_system_variable_initial_value(crate::sysvar::get_sys_var(name).expect("registered sysvar"))
+        };
+        let next_gen = tidb_config_kerneltype::is_next_gen();
+        assert_eq!(initial("tidb_pessimistic_txn_fair_locking"), if next_gen { "OFF" } else { "ON" });
+        assert_eq!(initial("tidb_txn_assertion_level"), if next_gen { "STRICT" } else { "FAST" });
+    }
+}
