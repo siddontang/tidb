@@ -855,6 +855,28 @@ playground. Later mitigations, only if the measurements call for them:
   - idle close and reopen;
   - keyspace disabled while connected;
   - a restart with preload.
+- **End-to-end harness: "move tenant A while tenant B stays put"** (proposed
+  by Sig-Codex; it is the release gate for Phases 3g and 3h). It extends Rust
+  TiProxy's live migration runner,
+  `tests/dataplane/integration/standalone-mig01.sh` @ `be937b9dcd`.
+  1. `A.app` and `B.app` connect through the same proxy port to the same
+     multi-keyspace process. Both tenants have the same table and primary key
+     with different row values. Each client prepares a binary-protocol
+     statement, with auto-reconnect and re-prepare disabled.
+  2. Drain only A. A's backend must change and B's must not. Both clients run
+     their original statement handles on their original sockets and read
+     their own tenant's row. This catches a no-op drain, a hidden reconnect
+     and a wrong-tenant route.
+  3. Repeat with A in a transaction:
+     - A stays on the source until commit, then migrates;
+     - its write lands exactly once in A and never in B, verified
+       independently;
+     - also cover the case where the only available destination serves B
+       only. The migration must be refused, and A keeps its source.
+
+  Topology, inputs, expected results, and per-PR versus nightly coverage for
+  both repositories are in Sig-Codex's harness plan
+  (Raft artifact in #Rust-TiDB-Multi-Tenants).
 - **Mixed fleet.** A multi-keyspace node and a single-keyspace **nextgen** node
   serve the same keyspace at the same time. Check:
   - DDL ownership handoff and schema version sync;
