@@ -272,3 +272,69 @@ fn observation_and_resource_tags_name_the_session_keyspace() {
     assert_eq!(tag.keyspace_name.as_deref(), Some(&b"ks_b"[..]));
 
 }
+
+/// The refusal a statement answered with (code and message), or `None`
+/// for a statement that ran.
+fn refusal(session: &mut Session, sql: &str) -> Option<(u16, String)> {
+    session.run(sql).err().map(|error| {
+        let error = error.to_mysql_error();
+        (error.code, error.message)
+    })
+}
+
+/// A multi-keyspace node refuses IMPORT INTO, its job statements, BR and
+/// PLAN REPLAYER with `ER_NOT_SUPPORTED_YET` (1235) before they reach the
+/// process-wide import store, DXF task managers, BRIE node or external
+/// storage (design §10 phase 2, until phase 3f moves them into each keyspace
+/// runtime). The counting import store sees no call, and no statement
+/// reports the missing task manager it would have consulted. A
+/// single-keyspace node runs the same statements as before: they reach the
+/// import store and the task manager.
+#[test]
+fn a_multi_keyspace_node_refuses_import_br_and_plan_replayer() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only (a classic store names no
+        // keyspace for the session to act for).
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
+    let store = MockStoreDomain::create().unwrap();
+    let mut session = store.new_session().unwrap();
+    session.run("use test").unwrap();
+    session.run("create table t (a int)").unwrap();
+    let import_store = std::sync::Arc::new(tidb_dxf_importinto::counting_store::CountingImportStore::default());
+    tidb_dxf_importinto::set_import_store(Some(import_store.clone()));
+    tidb_dxf_storage::set_task_manager(None);
+
+    let statements = [
+        "import into t from 's3://bucket/data.csv'",
+        "import into t from select a from t",
+        "show import jobs",
+        "show import job 1",
+        "cancel import job 1",
+        "backup database * to 'local:///tmp/br-multi-keyspace'",
+        "restore database * from 'local:///tmp/br-multi-keyspace'",
+        "plan replayer dump explain select a from t",
+    ];
+    tidb_keyspace::set_multi_keyspace_mode(true);
+    for sql in statements {
+        let (code, message) = refusal(&mut session, sql).unwrap_or_else(|| panic!("{sql} ran"));
+        assert_eq!(code, 1235, "{sql}: {message}");
+        assert!(message.ends_with("on a multi-keyspace node'"), "{sql}: {message}");
+    }
+    assert_eq!(import_store.calls(), 0);
+
+    // A single-keyspace node goes on to the task manager and the import store.
+    tidb_keyspace::set_multi_keyspace_mode(false);
+    for sql in statements {
+        if let Some((_, message)) = refusal(&mut session, sql) {
+            assert!(!message.contains("multi-keyspace"), "{sql}: {message}");
+        }
+    }
+    assert_eq!(
+        refusal(&mut session, "show import jobs").map(|(_, message)| message).as_deref(),
+        Some("task manager is not initialized")
+    );
+    assert!(import_store.calls() > 0);
+    tidb_dxf_importinto::set_import_store(None);
+}

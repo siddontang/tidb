@@ -1012,6 +1012,8 @@ pub trait AdminExec: crate::index_advisor::RecommendIndexExec {
             // See `crate::explain`'s module doc for every place
             // this tier's plan text diverges from Go's and why.
             tidb_ast::AdminStmt::Brie(stmt) => {
+                // The BRIE node and job queue are process-wide.
+                crate::multi_keyspace::refuse_on_multi_keyspace_node("BR")?;
                 crate::brie::require_brie_privilege(self, stmt.kind)?;
                 match stmt.kind {
                     tidb_ast::BrieKind::ShowBackupMetadata => {

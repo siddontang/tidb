@@ -122,10 +122,12 @@ impl Session {
 
 impl tidb_executor::show::exec::ShowExec for Session {
     fn fetch_show_import_jobs(&mut self, job_id: Option<i64>) -> Result<Vec<Vec<Datum>>, DriverError> {
+        tidb_executor::multi_keyspace::refuse_on_multi_keyspace_node("SHOW IMPORT JOB")?;
         tidb_executor::import_into::ImportIntoExec::show_import_jobs_rows(self, job_id)
     }
 
     fn fetch_show_import_groups(&mut self, group_key: &str) -> Result<Vec<Vec<Datum>>, DriverError> {
+        tidb_executor::multi_keyspace::refuse_on_multi_keyspace_node("SHOW IMPORT GROUP")?;
         tidb_executor::import_into::ImportIntoExec::show_import_groups_rows(self, group_key)
     }
 

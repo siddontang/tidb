@@ -8,6 +8,9 @@
 mod clean_up;
 mod collect_conflicts;
 mod conflict_resolution;
+/// A call-counting [`ImportStore`] for tests.
+#[doc(hidden)]
+pub mod counting_store;
 pub mod job;
 pub mod planner;
 pub mod proto;

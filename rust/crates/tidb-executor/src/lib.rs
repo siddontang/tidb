@@ -44,6 +44,7 @@
 //! `RuntimeStatsColl` when execution-info collection is enabled.
 
 pub mod executor_errors;
+pub mod multi_keyspace;
 mod expression_codec_fn;
 pub mod inspection_profile;
 pub mod admin_errors;

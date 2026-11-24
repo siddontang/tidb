@@ -108,6 +108,7 @@ pub trait ExecutorBuild: BuildSession {
             {
                 let Stmt::Admin(admin) = stmt else { unreachable!() };
                 let tidb_ast::AdminStmt::CancelImportJob(job_id) = &**admin else { unreachable!() };
+                crate::multi_keyspace::refuse_on_multi_keyspace_node("CANCEL IMPORT JOB")?;
                 crate::import_into::ImportIntoExec::cancel_import_job(self, *job_id).map(Some)
             }
             // Go master `CancelMaterializedViewJobExec`.
@@ -124,6 +125,7 @@ pub trait ExecutorBuild: BuildSession {
                 let tidb_ast::DmlStmt::ImportInto(import) = dml.as_ref() else {
                     unreachable!("ImportInto plan has an IMPORT statement")
                 };
+                crate::multi_keyspace::refuse_on_multi_keyspace_node("IMPORT INTO")?;
                 tidb_executor_importer::import_into_options::validate_import_into_options(import)?;
                 crate::import_into::ImportIntoExec::import_into_exec(self, plan, import).map(Some)
             }

@@ -123,6 +123,8 @@ pub trait PlanReplayerExec: PlanReplayerSession {
         &mut self,
         stmt: &tidb_ast::PlanReplayerStmt,
     ) -> Result<Option<StmtOutput>, DriverError> {
+        // The dump files live in the process-wide external storage.
+        crate::multi_keyspace::refuse_on_multi_keyspace_node("PLAN REPLAYER")?;
         match stmt {
             tidb_ast::PlanReplayerStmt::Capture { remove, sql_digest, plan_digest } => {
                 if *remove {
