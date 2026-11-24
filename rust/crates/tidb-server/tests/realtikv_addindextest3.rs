@@ -1591,7 +1591,7 @@ fn test_backend_ctx_concurrent_unregister() {
     let real_job = real_job.lock().unwrap().clone().expect("the add index job");
 
     let concurrency =
-        real_job.reorg_meta.as_ref().unwrap().read().get_concurrency(tidb_ddl::index::reorg_defaults()) as usize;
+        real_job.reorg_meta.as_ref().unwrap().read().get_concurrency(tidb_ddl::index::reorg_defaults(&tidb_vardef::snapshot::process())) as usize;
     let bd = tidb_ddl_ingest::backend_mgr::create_local_backend(store.tikv_store().clone(), &real_job, false, false, concurrency, 0)
         .unwrap();
     let ctx = tidb_gocontext::Context::background();
@@ -1685,7 +1685,7 @@ fn operator_backend(
     store: &crate::realtikvtest::RealTiKV,
     job: &tidb_model::Job,
 ) -> (Arc<tidb_ingestor_ingestctrl::local::Backend>, Arc<dyn tidb_ddl_ingest::backend::BackendCtx>) {
-    let concurrency = job.reorg_meta.as_ref().unwrap().read().get_concurrency(tidb_ddl::index::reorg_defaults()) as usize;
+    let concurrency = job.reorg_meta.as_ref().unwrap().read().get_concurrency(tidb_ddl::index::reorg_defaults(&tidb_vardef::snapshot::process())) as usize;
     let bd = tidb_ddl_ingest::backend_mgr::create_local_backend(store.tikv_store().clone(), job, false, false, concurrency, 0)
         .unwrap();
     let b_ctx = tidb_ddl_ingest::backend_mgr::BackendCtxBuilder::new(

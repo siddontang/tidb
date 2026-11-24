@@ -694,9 +694,15 @@ How the global statics are kept per keyspace (`tidb_vardef::snapshot`):
   snapshot its thread entered. A session enters its own while its store half
   is lent (`Session::node_conn`), so every caller -- a connection, a pooled or
   internal session -- runs its statements under its keyspace's values and
-  gets its own scope back afterwards; a DDL step enters the snapshot its
-  domain gave the DDL's session pool. There is no process-wide registry of
-  snapshots.
+  gets its own scope back afterwards; a DDL job enters the snapshot its
+  domain gave the DDL's session pool for all of its steps and its
+  reorganization. A thread spawned below a session or a DDL job does not
+  inherit the scope by itself: it is handed the snapshot explicitly (the
+  reorg scan workers' `ScanContext::vardef`, the job-config update and DXF
+  modify loops) or runs under `snapshot::inherit` (the reorganization's own
+  thread). On a multi-keyspace node, debug builds assert that `current()`
+  runs on a thread that entered a snapshot. There is no process-wide
+  registry of snapshots.
 - *Per keyspace: not yet* marks a global static that other code still
   writes directly (MDL, the DDL error limit, the analyze defaults, the
   schema validator's delta count, the cloud storage URI); it stays

@@ -129,6 +129,9 @@ pub(crate) fn run_cluster_session_node_with_spill(
     // Before the first runtime opens: each runtime's username policy then
     // prefixes its tenant's accounts (design §6.1).
     tidb_keyspace::set_multi_keyspace_mode(multi_keyspace.is_some());
+    // A thread that reads the vardef snapshot must carry its keyspace's
+    // (design §6.3); debug builds assert it on a multi-keyspace node.
+    tidb_vardef::snapshot::require_entered_scope(multi_keyspace.is_some());
     // On a multi-keyspace node the configured keyspace's open is that
     // tenant's (design §6.1).
     let tenant = multi_keyspace

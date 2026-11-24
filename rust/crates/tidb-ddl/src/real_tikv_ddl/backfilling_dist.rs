@@ -86,6 +86,15 @@ fn get_tbl_info<S: StoreClient>(
     )
     .map_err(|e| Arc::new(e) as Error)
 }
+/// The vardef values a DXF step executor's unset reorg fields fall back to:
+/// the process's. Step executors run where the DXF loop runs -- a
+/// single-keyspace node, or (nextgen) the SYSTEM keyspace's nodes -- and a
+/// multi-keyspace node never runs one: its keyspaces are user keyspaces,
+/// which skip the DXF loop (multi-keyspace design §5.5, §6.3).
+pub(super) fn executor_vardef() -> Arc<tidb_vardef::VardefSnapshot> {
+    tidb_vardef::snapshot::process()
+}
+
 pub(super) fn reorg_for_task(meta: &BackfillTaskMeta, table: tidb_model::TableInfo) -> AddIndexReorg {
     let physical_ids = table.get_partition_info().map_or_else(
         || vec![table.id],
@@ -106,8 +115,8 @@ pub(super) fn reorg_for_task(meta: &BackfillTaskMeta, table: tidb_model::TableIn
         index_ids: meta.ele_ids.clone().unwrap_or_default(),
         merging: meta.merge_temp_index,
         physical_ids,
-        batch_size: crate::cluster_ddl::add_index::job_batch_size(&meta.job),
-        concurrency: crate::cluster_ddl::add_index::job_concurrency(&meta.job),
+        batch_size: crate::cluster_ddl::add_index::job_batch_size(&meta.job, &executor_vardef()),
+        concurrency: crate::cluster_ddl::add_index::job_concurrency(&meta.job, &executor_vardef()),
         session_vars: tidb_ddl_build::session_pool::ReorgSessionVars::of_job(&meta.job),
         row_count: 0,
         column: None,
@@ -940,7 +949,7 @@ impl<S: StoreClient> StepExecutor for CloudImportStepExecutor<S> {
             &self.job,
             self.indexes.iter().any(|index| index.unique),
             false,
-            crate::cluster_ddl::add_index::job_concurrency(&self.job),
+            crate::cluster_ddl::add_index::job_concurrency(&self.job, &executor_vardef()),
             concurrency,
         )?);
         Ok(())
@@ -1298,6 +1307,7 @@ fn check_duplicate_for_unique_index<S: StoreClient>(
     opener: &Arc<RealOptimisticTransactionOpener<S>>,
     reorg: &AddIndexReorg,
     job: &Job,
+    vardef: &tidb_vardef::VardefSnapshot,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ctx = Context::background();
     let mut backend = None;
@@ -1322,7 +1332,7 @@ fn check_duplicate_for_unique_index<S: StoreClient>(
                         job,
                         true,
                         true,
-                        crate::cluster_ddl::add_index::job_concurrency(job),
+                        crate::cluster_ddl::add_index::job_concurrency(job, vardef),
                         0,
                     )?);
                 }
@@ -1570,6 +1580,7 @@ impl<S: StoreClient> ReadIndexStepExecutor<S> {
             reorg: Arc::new(reorg),
             physical_id: sm.physical_table_id,
             warnings: Arc::default(),
+            vardef: executor_vardef(),
         });
         let pipe = super::operators::new_write_index_to_external_storage_pipeline(
             wctx,
@@ -1642,7 +1653,7 @@ impl<S: StoreClient> StepExecutor for ReadIndexStepExecutor<S> {
                 &meta.job,
                 unique,
                 false,
-                crate::cluster_ddl::add_index::job_concurrency(&meta.job),
+                crate::cluster_ddl::add_index::job_concurrency(&meta.job, &executor_vardef()),
                 0,
             )?);
         }
@@ -1747,6 +1758,7 @@ impl<S: StoreClient> StepExecutor for ReadIndexStepExecutor<S> {
                 reorg: Arc::new(reorg.clone()),
                 physical_id: sm.physical_table_id,
                 warnings: Arc::default(),
+                vardef: executor_vardef(),
             });
             // Go `buildLocalStorePipeline`.
             let pipe = super::operators::new_add_index_ingest_pipeline(
@@ -1846,7 +1858,7 @@ fn modify_read_index_task_meta(
     if let (Some(old), Some(new)) = (meta.job.reorg_meta.as_ref(), new.job.reorg_meta.as_ref()) {
         let old = old.read();
         let new = new.read();
-        let defaults = crate::index::reorg_defaults();
+        let defaults = crate::index::reorg_defaults(&executor_vardef());
         let batch_size = new.get_batch_size(defaults);
         if old.get_batch_size(defaults) != batch_size {
             old.set_batch_size(batch_size);
@@ -2043,6 +2055,9 @@ pub(super) fn execute_dist_task<S: StoreClient>(
     step_cancelled: &AtomicBool,
 ) -> Result<ReorgResult, ClusterDdlError> {
     let ctx = Context::background();
+    // The values of the keyspace whose DDL runs this step; the modify loop
+    // runs on a thread of its own.
+    let vardef = tidb_vardef::snapshot::current();
     let builder = crate::index::TaskKeyBuilder::new().set_merge_temp_index(reorg.merging);
     // The task belongs to the keyspace of the store this DDL runs on.
     let keyspace = opener.store().get_keyspace();
@@ -2068,7 +2083,7 @@ pub(super) fn execute_dist_task<S: StoreClient>(
             let reorg_meta = task_meta.job.reorg_meta.as_ref().expect("a backfill task's job has reorg meta").read();
             last = (
                 task.base.required_slots as i64,
-                reorg_meta.get_batch_size(crate::index::reorg_defaults()),
+                reorg_meta.get_batch_size(crate::index::reorg_defaults(&vardef)),
                 reorg_meta.get_max_write_speed(),
             );
             drop(reorg_meta);
@@ -2097,7 +2112,7 @@ pub(super) fn execute_dist_task<S: StoreClient>(
             let config = job.reorg_meta.as_ref().unwrap().read();
             last = (
                 required_slots as i64,
-                config.get_batch_size(crate::index::reorg_defaults()),
+                config.get_batch_size(crate::index::reorg_defaults(&vardef)),
                 config.get_max_write_speed(),
             );
             tidb_dxf_handle::submit_task_with_extra_params(
@@ -2128,6 +2143,7 @@ pub(super) fn execute_dist_task<S: StoreClient>(
         scope.spawn(|| {
             crate::index::modify_task_param_loop(
                 &ctx,
+                &vardef,
                 &sys_tbl_mgr,
                 manager.as_ref(),
                 &done,
@@ -2138,7 +2154,7 @@ pub(super) fn execute_dist_task<S: StoreClient>(
                 last.2,
             );
         });
-        let result = wait_dist_task(opener, sess_pool, reorg, job, check_owner, step_cancelled, &ctx, &key, &manager, &task);
+        let result = wait_dist_task(opener, sess_pool, reorg, job, check_owner, step_cancelled, &ctx, &key, &manager, &task, &vardef);
         drop(done_tx);
         result
     })
@@ -2158,6 +2174,7 @@ fn wait_dist_task<S: StoreClient>(
     key: &str,
     manager: &Arc<tidb_dxf_storage::TaskManager>,
     task: &Task,
+    vardef: &tidb_vardef::VardefSnapshot,
 ) -> Result<ReorgResult, ClusterDdlError> {
     loop {
         if !reorg_runnable(step_cancelled, check_owner)? {
@@ -2207,7 +2224,7 @@ fn wait_dist_task<S: StoreClient>(
                     // remote duplicates fail the job.
                     let cloud = job.reorg_meta.as_ref().is_some_and(|m| m.read().use_cloud_storage);
                     if !cloud && !reorg.merging {
-                        if let Err(error) = check_duplicate_for_unique_index(opener, reorg, job) {
+                        if let Err(error) = check_duplicate_for_unique_index(opener, reorg, job, vardef) {
                             let mut cause = error.as_ref() as &(dyn std::error::Error + 'static);
                             while let Some(source) = cause.source() {
                                 cause = source;

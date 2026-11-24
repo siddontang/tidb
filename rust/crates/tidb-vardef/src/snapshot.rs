@@ -197,15 +197,69 @@ pub fn enter(snapshot: Arc<VardefSnapshot>) -> EnteredVardef {
     }
 }
 
+/// Whether [`current`] must find an entered snapshot (debug builds): set
+/// on a multi-keyspace node, where a thread that never entered one cannot
+/// tell which keyspace it works for.
+static REQUIRE_ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Makes [`current`] debug-assert that its thread entered a snapshot: a
+/// multi-keyspace node sets it, so a thread or task spawned below a session
+/// or a DDL step without carrying its snapshot (see [`inherit`]) is caught
+/// instead of silently reading the configured keyspace's values.
+pub fn require_entered_scope(required: bool) {
+    REQUIRE_ENTERED.store(required, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// The snapshot this thread entered, else the process-backed one.
+///
+/// A reader that runs on a thread of its own (a worker pool, a scoped
+/// helper thread) should be handed its keyspace's snapshot instead, or run
+/// under [`inherit`].
 pub fn current() -> Arc<VardefSnapshot> {
-    CURRENT.with(|current| current.borrow().clone()).unwrap_or_else(process)
+    let entered = CURRENT.with(|current| current.borrow().clone());
+    debug_assert!(
+        entered.is_some() || !REQUIRE_ENTERED.load(std::sync::atomic::Ordering::Relaxed),
+        "vardef snapshot read on a thread that entered none (multi-keyspace node): \
+         carry the keyspace's snapshot to the thread"
+    );
+    entered.unwrap_or_else(process)
+}
+
+/// The snapshot this thread entered, if any: what a thread it spawns
+/// inherits.
+pub fn entered() -> Option<Arc<VardefSnapshot>> {
+    CURRENT.with(|current| current.borrow().clone())
+}
+
+/// `f`, to run on another thread under the snapshot the calling thread
+/// entered (none, if it entered none): the way a session or DDL step hands
+/// its keyspace's values to a thread it spawns.
+pub fn inherit<F: FnOnce() -> R, R>(f: F) -> impl FnOnce() -> R {
+    let snapshot = entered();
+    move || {
+        let _entered = snapshot.map(enter);
+        f()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering::SeqCst;
+
+    /// A spawned thread reads the spawning thread's keyspace under
+    /// [`inherit`]; a thread that entered nothing hands nothing on.
+    #[test]
+    fn a_spawned_thread_inherits_the_entered_snapshot() {
+        let tenant = Arc::new(VardefSnapshot::per_keyspace());
+        tenant.ddl_reorg_batch_size().store(77, SeqCst);
+        let _entered = enter(Arc::clone(&tenant));
+        let read = std::thread::spawn(inherit(|| current().ddl_reorg_batch_size().load(SeqCst))).join().unwrap();
+        assert_eq!(read, 77);
+        drop(_entered);
+        let inherited = std::thread::spawn(inherit(|| entered().is_some())).join().unwrap();
+        assert!(!inherited);
+    }
 
     /// The snapshot keeps exactly the classified global statics whose only
     /// writers are their `SetGlobal` hooks; the other global statics are

@@ -89,8 +89,23 @@ pub struct ReorgStage(
 /// dependencies without turning a live value into a stale snapshot.
 #[derive(Clone, Copy)]
 pub struct DDLReorgProcessDefaults {
-    worker_count: fn() -> i64,
-    batch_size: fn() -> i64,
+    worker_count: DefaultValue,
+    batch_size: DefaultValue,
+}
+
+#[derive(Clone, Copy)]
+enum DefaultValue {
+    Live(fn() -> i64),
+    Read(i64),
+}
+
+impl DefaultValue {
+    fn get(self) -> i64 {
+        match self {
+            Self::Live(read) => read(),
+            Self::Read(value) => value,
+        }
+    }
 }
 
 impl DDLReorgProcessDefaults {
@@ -98,17 +113,27 @@ impl DDLReorgProcessDefaults {
     #[must_use]
     pub const fn new(worker_count: fn() -> i64, batch_size: fn() -> i64) -> Self {
         Self {
-            worker_count,
-            batch_size,
+            worker_count: DefaultValue::Live(worker_count),
+            batch_size: DefaultValue::Live(batch_size),
+        }
+    }
+
+    /// The defaults a caller read from its runtime variables just before the
+    /// getter call (a keyspace's own values, which no `fn` pointer reaches).
+    #[must_use]
+    pub const fn of_values(worker_count: i64, batch_size: i64) -> Self {
+        Self {
+            worker_count: DefaultValue::Read(worker_count),
+            batch_size: DefaultValue::Read(batch_size),
         }
     }
 
     fn worker_count(self) -> i64 {
-        (self.worker_count)()
+        self.worker_count.get()
     }
 
     fn batch_size(self) -> i64 {
-        (self.batch_size)()
+        self.batch_size.get()
     }
 }
 

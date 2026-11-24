@@ -88,7 +88,7 @@ fn test_alter_job_on_dxf() {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 *batch_size_after_alter.lock().unwrap() =
-                    Some(reorg_meta.read().get_batch_size(tidb_ddl::index::reorg_defaults()));
+                    Some(reorg_meta.read().get_batch_size(tidb_ddl::index::reorg_defaults(&tidb_vardef::snapshot::process())));
             });
         })
     };
@@ -686,7 +686,7 @@ fn test_alter_job_on_dxf_with_global_sort() {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 *batch_size_after_alter.lock().unwrap() =
-                    Some(reorg_meta.read().get_batch_size(tidb_ddl::index::reorg_defaults()));
+                    Some(reorg_meta.read().get_batch_size(tidb_ddl::index::reorg_defaults(&tidb_vardef::snapshot::process())));
             });
         })
     };

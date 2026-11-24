@@ -842,8 +842,8 @@ pub(super) fn reorg_sub_job(job: &Job) -> Option<i32> {
 use tidb_ddl_build::session_pool::ReorgSessionVars;
 
 
-pub(crate) fn job_batch_size(job: &Job) -> usize {
-    let defaults = crate::index::reorg_defaults();
+pub(crate) fn job_batch_size(job: &Job, vardef: &tidb_vardef::VardefSnapshot) -> usize {
+    let defaults = crate::index::reorg_defaults(vardef);
     job.reorg_meta
         .as_ref()
         .map_or(
@@ -854,8 +854,8 @@ pub(crate) fn job_batch_size(job: &Job) -> usize {
 }
 
 /// Go `ReorgMeta.GetConcurrency`.
-pub(crate) fn job_concurrency(job: &Job) -> usize {
-    let defaults = crate::index::reorg_defaults();
+pub(crate) fn job_concurrency(job: &Job, vardef: &tidb_vardef::VardefSnapshot) -> usize {
+    let defaults = crate::index::reorg_defaults(vardef);
     job.reorg_meta
         .as_ref()
         .map_or(
@@ -1842,8 +1842,8 @@ pub(super) fn do_reorg_work_for_create_index(
             index_ids: indexes.iter().map(|index| index.read().id).collect(),
             merging,
             physical_ids: if merging { merge_physical_ids(info, indexes) } else { physical_ids(info) },
-            batch_size: job_batch_size(&active.job),
-            concurrency: job_concurrency(&active.job),
+            batch_size: job_batch_size(&active.job, &tidb_vardef::snapshot::current()),
+            concurrency: job_concurrency(&active.job, &tidb_vardef::snapshot::current()),
             session_vars: ReorgSessionVars::of_job(&active.job),
             row_count: active.job.row_count,
             column: None,

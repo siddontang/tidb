@@ -60,13 +60,14 @@ pub static UPDATE_DDL_JOB_REORG_CFG_INTERVAL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(2000);
 
 /// Go `ReorgMeta.GetConcurrency` / `GetBatchSize` over the job's reorg meta:
-/// an unset value falls back to the global `vardef` counters -- the
-/// keyspace's the running DDL entered (multi-keyspace design §6.3).
-pub fn reorg_defaults() -> tidb_model::DDLReorgProcessDefaults {
+/// an unset value falls back to the global `vardef` counters -- those of
+/// the keyspace whose DDL runs the reorganization (multi-keyspace design
+/// §6.3), handed to every thread the reorganization spawns.
+pub fn reorg_defaults(vardef: &tidb_vardef::VardefSnapshot) -> tidb_model::DDLReorgProcessDefaults {
     use std::sync::atomic::Ordering::SeqCst;
-    tidb_model::DDLReorgProcessDefaults::new(
-        || i64::from(tidb_vardef::snapshot::current().ddl_reorg_worker_counter().load(SeqCst)),
-        || i64::from(tidb_vardef::snapshot::current().ddl_reorg_batch_size().load(SeqCst)),
+    tidb_model::DDLReorgProcessDefaults::of_values(
+        i64::from(vardef.ddl_reorg_worker_counter().load(SeqCst)),
+        i64::from(vardef.ddl_reorg_batch_size().load(SeqCst)),
     )
 }
 
@@ -80,6 +81,7 @@ pub fn reorg_defaults() -> tidb_model::DDLReorgProcessDefaults {
 #[allow(clippy::too_many_arguments)]
 pub fn modify_task_param_loop(
     ctx: &tidb_gocontext::Context,
+    vardef: &tidb_vardef::VardefSnapshot,
     sys_tbl_mgr: &dyn tidb_ddl_systable::Manager,
     task_manager: &dyn tidb_dxf_storage::Manager,
     done: &crossbeam_channel::Receiver<()>,
@@ -118,7 +120,7 @@ pub fn modify_task_param_loop(
         let reorg_meta = latest_job.reorg_meta.as_ref().expect("a DXF job has reorg meta").read();
 
         let mut modifies = Vec::with_capacity(3);
-        let worker_cnt_limit = reorg_meta.get_concurrency(reorg_defaults());
+        let worker_cnt_limit = reorg_meta.get_concurrency(reorg_defaults(vardef));
         let required_slots = match adjust_concurrency(ctx, task_manager, worker_cnt_limit) {
             Ok(slots) => slots,
             Err(error) => {
@@ -132,7 +134,7 @@ pub fn modify_task_param_loop(
                 to: required_slots,
             });
         }
-        let batch_size = reorg_meta.get_batch_size(reorg_defaults());
+        let batch_size = reorg_meta.get_batch_size(reorg_defaults(vardef));
         if batch_size != last_batch_size {
             modifies.push(tidb_dxf::Modification { tp: tidb_dxf::MODIFY_BATCH_SIZE, to: batch_size });
         }
@@ -448,7 +450,7 @@ mod tests {
             } else {
                 std::mem::forget(done_tx);
             }
-            modify_task_param_loop(&tidb_gocontext::Context::background(), &script, &script, &done, 1, 1, 1, 2, 3);
+            modify_task_param_loop(&tidb_gocontext::Context::background(), &tidb_vardef::snapshot::process(), &script, &script, &done, 1, 1, 1, 2, 3);
             assert!(script.satisfied());
         };
         // return on done

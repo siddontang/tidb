@@ -967,3 +967,72 @@ fn test_dist_task_without_fast_reorg_is_refused() {
     tk.must_exec("set global tidb_ddl_enable_fast_reorg = on;");
     tk.must_exec("set global tidb_enable_dist_task = off;");
 }
+
+/// Multi-keyspace design §6.3: a reorg setting the job left unset falls
+/// back to the job's keyspace's value on the ingest scan workers, which run
+/// on threads of their own. A keyspace that owns its vardef values sets
+/// `tidb_ddl_reorg_batch_size` to 32 (the process keeps 256); its ADD INDEX
+/// job's stored batch size and concurrency are cleared before the first
+/// step, as a job from an older node leaves them. The scan then fetches its
+/// 100 rows in chunks of 32 (several `beforeGetChunk` calls); the
+/// configured keyspace's identical job fetches them in one chunk of 256.
+#[test]
+fn an_unset_reorg_batch_size_reads_the_job_keyspace_on_the_scan_workers() {
+    use tidb_session::domain::configured_user_store::ConfiguredUserStore;
+    use tidb_session::domain::mock_store::MockStoreDomain;
+    if tidb_config_kerneltype::is_next_gen() {
+        // Nextgen runs ADD INDEX as a distributed task, on the SYSTEM
+        // keyspace's nodes.
+        return;
+    }
+    let _serial = serial();
+    let _backend = inject_mock_backend_ctx();
+    let _clear = tidb_failpoint::enable_call_for_test("github.com/pingcap/tidb/pkg/ddl/beforeRunOneJobStep", |arg| {
+        let job = arg.downcast_mut::<tidb_model::Job>().unwrap();
+        if job.query.to_utf8_lossy_go().contains("add index") {
+            if let Some(meta) = &job.reorg_meta {
+                meta.read().set_batch_size(0);
+                meta.read().set_concurrency(0);
+            }
+        }
+    });
+    let chunks = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&chunks);
+    let _count = tidb_failpoint::enable_call_for_test("github.com/pingcap/tidb/pkg/ddl/beforeGetChunk", move |_| {
+        counted.fetch_add(1, Ordering::SeqCst);
+    });
+    assert_eq!(tidb_vardef::snapshot::process().ddl_reorg_batch_size().load(Ordering::SeqCst), 256);
+    let users = ConfiguredUserStore::parse("root\t%\tmysql_native_password\t\n")
+        .unwrap()
+        .with_global_vars(tidb_domain::global_sysvars::GlobalSysvars::new().with_keyspace_vardef());
+    let tenant = MockStoreDomain::create_with_users(Arc::new(users)).unwrap();
+    let configured = MockStoreDomain::create().unwrap();
+    let add_index = |store: &Arc<MockStoreDomain>| {
+        let mut tk = TestKit::from_session(store.new_session().unwrap());
+        tk.must_exec("set global tidb_enable_dist_task = 0");
+        tk.must_exec("use test");
+        tk.must_exec("create table t (a int primary key, b int)");
+        let values: Vec<String> = (0..100).map(|i| format!("({i}, {i})")).collect();
+        tk.must_exec(&format!("insert into t values {}", values.join(",")));
+        chunks.store(0, Ordering::SeqCst);
+        // The scan workers see the job's batch size unset.
+        let unset = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&unset);
+        let _unset = tidb_failpoint::enable_call_for_test("github.com/pingcap/tidb/pkg/ddl/scanRecordExec", move |arg| {
+            let meta = arg.downcast_mut::<tidb_model::GoShared<tidb_model::DDLReorgMeta>>().unwrap();
+            if meta.read().get_batch_size(tidb_model::DDLReorgProcessDefaults::of_values(-1, -1)) == -1 {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        tk.must_exec("alter table t add index idx(b)");
+        assert_last_n_ddl_use_ingest(&mut tk, 1);
+        assert!(unset.load(Ordering::SeqCst) > 0, "the scan saw the job's batch size unset");
+        chunks.load(Ordering::SeqCst)
+    };
+    TestKit::from_session(tenant.new_session().unwrap()).must_exec("set global tidb_ddl_reorg_batch_size = 32");
+    assert_eq!(tidb_vardef::snapshot::process().ddl_reorg_batch_size().load(Ordering::SeqCst), 256, "the process value is untouched");
+    let tenant_chunks = add_index(&tenant);
+    let configured_chunks = add_index(&configured);
+    assert!(tenant_chunks >= 4, "the tenant's batch size of 32: {tenant_chunks} chunks");
+    assert!(configured_chunks <= 2, "the process batch size of 256: {configured_chunks} chunks");
+}

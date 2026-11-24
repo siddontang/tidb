@@ -1003,6 +1003,11 @@ pub fn run_persisted_ddl_job<S: StoreClient>(
     let sess_pool = backfiller.session_pool().ok_or_else(||
         ClusterDdlError::NotCommitted("the DDL worker has no session pool".to_owned()))?;
     let vardef = sess_pool.vardef();
+    // The whole job -- its schema steps and the reorganization they hand
+    // back (`run_add_index_reorg`, which also spawns threads that inherit
+    // it) -- reads its keyspace's vardef values (multi-keyspace design
+    // §6.3).
+    let _vardef = tidb_vardef::snapshot::enter(vardef.clone().unwrap_or_else(tidb_vardef::snapshot::process));
     let worker = crate::cluster_ddl::DdlStepWorker {
         sess_pool,
         step_buffer: MutationBuffer::new(),

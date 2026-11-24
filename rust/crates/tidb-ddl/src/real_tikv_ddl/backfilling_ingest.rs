@@ -152,10 +152,14 @@ pub(super) fn add_index_with_local_ingest<S: StoreClient>(
     // Go `reorgInfo.UpdateConfigFromSysTbl`: the job's reorg meta takes the
     // running job's alterable config.
     let update_pool = Arc::clone(&sess_pool);
+    // The values of the keyspace whose DDL runs this reorganization (design
+    // §6.3), carried to the config-update thread and the scan workers.
+    let vardef = tidb_vardef::snapshot::current();
+    let update_vardef = Arc::clone(&vardef);
     let update_config = move || match super::add_index_reorg::latest_job(update_pool.as_ref(), job.id) {
         Ok(Some(latest)) if latest.state == tidb_model::JobState::RUNNING && latest.is_alterable() => {
             if let (Some(meta), Some(latest_meta)) = (job.reorg_meta.as_ref(), latest.reorg_meta.as_ref()) {
-                let defaults = crate::index::reorg_defaults();
+                let defaults = crate::index::reorg_defaults(&update_vardef);
                 let latest_meta = latest_meta.read();
                 let meta = meta.read();
                 meta.set_concurrency(latest_meta.get_concurrency(defaults));
@@ -185,6 +189,7 @@ pub(super) fn add_index_with_local_ingest<S: StoreClient>(
         reorg: Arc::new(reorg.clone()),
         physical_id: handle.physical_id,
         warnings: Arc::default(),
+        vardef,
     });
     let result = (|| {
         let engines = bc.register(&reorg.index_ids, &uniques, &reorg.table)?;
@@ -204,7 +209,7 @@ pub(super) fn add_index_with_local_ingest<S: StoreClient>(
         let result = execute_and_close_pipeline(
             &wctx,
             &pipe,
-            Some((job, &update_config)),
+            Some((job, &update_config, &scan.vardef)),
             Some(&bc),
             avg_row_size,
             check_owner,
@@ -277,7 +282,7 @@ pub(super) fn tune_pipeline(
 pub(super) fn execute_and_close_pipeline(
     ctx: &Arc<Context>,
     pipe: &Arc<AsyncPipeline>,
-    reorg_info: Option<(&tidb_model::Job, &(dyn Fn() + Sync))>,
+    reorg_info: Option<(&tidb_model::Job, &(dyn Fn() + Sync), &tidb_vardef::VardefSnapshot)>,
     bc: Option<&Arc<dyn BackendCtx>>,
     avg_row_size: usize,
     check_owner: &(dyn Fn() -> Result<(), String> + Sync),
@@ -297,10 +302,10 @@ pub(super) fn execute_and_close_pipeline(
                 return;
             }
         });
-        if let (Some((job, update_config)), Some(bc)) = (reorg_info, bc) {
+        if let (Some((job, update_config, vardef)), Some(bc)) = (reorg_info, bc) {
             let adjust_pipe = Arc::clone(pipe);
             scope.spawn(move || {
-                adjust_worker_cnt_and_max_write_speed(&done_rx, &adjust_pipe, bc, avg_row_size, job, update_config)
+                adjust_worker_cnt_and_max_write_speed(&done_rx, &adjust_pipe, bc, avg_row_size, job, update_config, vardef)
             });
         }
         let result = pipe.close();
@@ -328,6 +333,7 @@ fn adjust_worker_cnt_and_max_write_speed(
     avg_row_size: usize,
     job: &tidb_model::Job,
     update_config: &(dyn Fn() + Sync),
+    vardef: &tidb_vardef::VardefSnapshot,
 ) {
     loop {
         let interval = Duration::from_millis(
@@ -358,7 +364,7 @@ fn adjust_worker_cnt_and_max_write_speed(
                 );
             }
         }
-        let concurrency = crate::cluster_ddl::add_index::job_concurrency(job);
+        let concurrency = crate::cluster_ddl::add_index::job_concurrency(job, vardef);
         let (Some(reader), Some(writer)) = pipe.get_reader_and_writer() else {
             tidb_ddl_logutil::ddl_ingest_logger().error(
                 "failed to get local ingest mode reader or writer",

@@ -50,6 +50,10 @@ pub struct ScanContext<S: StoreClient> {
     pub physical_id: i64,
     /// The scan's decode warnings, each code's first one and its count.
     pub warnings: Arc<Mutex<Vec<(u16, String, i64)>>>,
+    /// The vardef values of the keyspace whose DDL runs the scan (design
+    /// §6.3): an unset reorg batch size falls back to them on the scan's
+    /// worker threads, which entered no snapshot.
+    pub vardef: Arc<tidb_vardef::VardefSnapshot>,
 }
 
 impl<S: StoreClient> ScanContext<S> {
@@ -77,6 +81,7 @@ impl<S: StoreClient> ScanContext<S> {
             reorg: Arc::new(super::dist::reorg_for_task(&meta, table)),
             physical_id,
             warnings: Arc::default(),
+            vardef: super::dist::executor_vardef(),
         })
     }
 }
@@ -465,7 +470,7 @@ impl<S: StoreClient + 'static> TableScanWorker<S> {
     /// size, which `TaskMetaModified` updates in place.
     fn batch_size(&self) -> usize {
         self.reorg_meta.as_ref().map_or(self.hint_batch_size, |meta| {
-            meta.read().get_batch_size(crate::index::reorg_defaults()).max(1) as usize
+            meta.read().get_batch_size(crate::index::reorg_defaults(&self.scan.vardef)).max(1) as usize
         })
         .max(1)
     }
