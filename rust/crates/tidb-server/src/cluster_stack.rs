@@ -804,6 +804,9 @@ fn new_cluster_domain(
         Arc::clone(&node_auto_ids),
     )
     .map_err(|error| RunConfiguredNodeError::Engine(SqlQueryError::unknown(error.to_string())))?;
+    // The schema validator keeps as many deltas as its keyspace's
+    // `tidb_max_delta_schema_count` says (multi-keyspace design §6.3).
+    schema_validator.set_vardef(users.global_vars().vardef());
     // Statistics always resolve targets from this published catalog, so the
     // reload loop follows DDL-added tables and changed column types instead of
     // freezing the boot image.

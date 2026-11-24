@@ -4200,6 +4200,8 @@ impl tidb_planner::plan_builder::stmt_build::SessionPlanContext for Session {
             // Go `vardef.PersistAnalyzeOptions` / `vardef.AnalyzeColumnOptions`:
             // the session's keyspace's, set by the global variables' hooks.
             persist_analyze_options: vars.vardef().persist_analyze_options().load(std::sync::atomic::Ordering::SeqCst),
+            default_num_buckets: vars.vardef().analyze_default_num_buckets().load(std::sync::atomic::Ordering::SeqCst),
+            default_num_topn: vars.vardef().analyze_default_num_top_n().load(std::sync::atomic::Ordering::SeqCst),
             analyze_column_options: {
                 let value = vars
                     .vardef()

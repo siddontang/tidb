@@ -190,6 +190,7 @@ fn analyze_options_of(opts: &AnalyzeOpts) -> crate::analyze::AnalyzeOptions {
         num_topn: get(AnalyzeOptionType::NumTopN) as isize,
         num_samples: num_samples as usize,
         sample_rate: (num_samples == 0 && sample_rate >= 0.0).then_some(sample_rate),
+        defaults: tidb_stats::builder::AnalyzeDefaults::current(),
     }
 }
 

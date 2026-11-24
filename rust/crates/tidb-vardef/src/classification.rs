@@ -70,7 +70,7 @@ pub struct ProcessStatic {
 
 /// Every static `lib.rs` declares, in declaration order.
 pub const PROCESS_STATICS: &[ProcessStatic] = &[
-    ProcessStatic { name: "ENABLE_MDL", sysvar: Some("tidb_enable_metadata_lock"), scope: StaticScope::Global, governs: "metadata locking of the keyspace's DDL (its meta key)" },
+    ProcessStatic { name: "ENABLE_MDL", sysvar: Some("tidb_enable_metadata_lock"), scope: StaticScope::Instance, governs: "metadata locking on a classic node (next-generation kernels, every multi-keyspace node among them, always lock)" },
     ProcessStatic { name: "DDL_FLASHBACK_CONCURRENCY", sysvar: Some("tidb_ddl_flashback_concurrency"), scope: StaticScope::Global, governs: "the keyspace's DDL jobs" },
     ProcessStatic { name: "DDL_REORG_WORKER_COUNTER", sysvar: Some("tidb_ddl_reorg_worker_cnt"), scope: StaticScope::Global, governs: "the keyspace's DDL jobs" },
     ProcessStatic { name: "DDL_REORG_BATCH_SIZE", sysvar: Some("tidb_ddl_reorg_batch_size"), scope: StaticScope::Global, governs: "the keyspace's DDL jobs" },

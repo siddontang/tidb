@@ -272,3 +272,71 @@ fn password_policy_follows_the_keyspace() {
     assert_eq!(code(&configured, "create user 'pw2'@'%' identified by 'Aa1!aaaaaaaa'"), Ok(()));
     assert_eq!(code(&configured, reuse), Ok(()));
 }
+
+/// Analyze defaults (3c): `tidb_analyze_default_num_buckets` / `_topn` are
+/// the keyspace's. A tenant at 4 buckets and 1 TopN value keeps at most one
+/// TopN value for a 300-value column; the configured keyspace, at the
+/// defaults (256 / 100), keeps more; the process statics are untouched.
+#[test]
+fn analyze_takes_the_keyspace_default_sizes() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let users = ConfiguredUserStore::parse("root\t%\tmysql_native_password\t\n")
+        .unwrap()
+        .with_global_vars(tidb_domain::global_sysvars::GlobalSysvars::new().with_keyspace_vardef());
+    let tenant = MockStoreDomain::create_with_users(Arc::new(users)).unwrap();
+    let configured = MockStoreDomain::create().unwrap();
+    let defaults = (
+        tidb_vardef::ANALYZE_DEFAULT_NUM_BUCKETS.load(SeqCst),
+        tidb_vardef::ANALYZE_DEFAULT_NUM_TOP_N.load(SeqCst),
+    );
+    let mut admin = tenant.new_session().unwrap();
+    for sql in ["set global tidb_analyze_default_num_buckets = 4", "set global tidb_analyze_default_num_topn = 1"] {
+        admin.run(sql).unwrap();
+    }
+    assert_eq!(
+        (tidb_vardef::ANALYZE_DEFAULT_NUM_BUCKETS.load(SeqCst), tidb_vardef::ANALYZE_DEFAULT_NUM_TOP_N.load(SeqCst)),
+        defaults,
+        "the process values are untouched"
+    );
+    let top_n = |store: &Arc<MockStoreDomain>| {
+        let mut session = store.new_session().unwrap();
+        session.run("use test").unwrap();
+        session.run("create table an (a int, key ia (a))").unwrap();
+        // 300 values, the first ten repeated so TopN has candidates.
+        let values: Vec<String> = (0..300).chain(0..10).chain(0..10).map(|i| format!("({i})")).collect();
+        session.run(&format!("insert into an values {}", values.join(","))).unwrap();
+        session.run("analyze table an").unwrap();
+        let rows = crate::tests_support::row_text(session.run(
+            "select count(*) from mysql.stats_top_n t join information_schema.tables i \
+             on t.table_id = i.tidb_table_id where i.table_schema = 'test' and i.table_name = 'an' and t.is_index = 0",
+        ));
+        rows[0][0].parse::<u64>().unwrap()
+    };
+    let tenant_top_n = top_n(&tenant);
+    let configured_top_n = top_n(&configured);
+    assert!(tenant_top_n <= 1, "the tenant keeps 1 TopN value: {tenant_top_n}");
+    assert!(configured_top_n > 1, "the configured keyspace keeps up to 100: {configured_top_n}");
+}
+
+/// DDL error limit (3c): `tidb_ddl_error_count_limit` is the keyspace's. A
+/// tenant's DDL refreshes its own value; the process value (what the
+/// configured keyspace's DDL reads) is untouched.
+#[test]
+fn ddl_error_count_limit_is_the_keyspace_s() {
+    let users = ConfiguredUserStore::parse("root\t%\tmysql_native_password\t\n")
+        .unwrap()
+        .with_global_vars(tidb_domain::global_sysvars::GlobalSysvars::new().with_keyspace_vardef());
+    let tenant = MockStoreDomain::create_with_users(Arc::new(users)).unwrap();
+    let process = tidb_vardef::ddl_error_count_limit();
+    let mut session = tenant.new_session().unwrap();
+    session.run("set global tidb_ddl_error_count_limit = 7").unwrap();
+    session.run("use test").unwrap();
+    // The job refreshes the limit from the keyspace's table on every step.
+    session.run("create table el (a int)").unwrap();
+    session.run("alter table el add column b int").unwrap();
+    assert_eq!(tidb_vardef::ddl_error_count_limit(), process, "the process value is untouched");
+    assert_eq!(
+        crate::tests_support::row_text(session.run("select @@global.tidb_ddl_error_count_limit")),
+        [["7"]]
+    );
+}

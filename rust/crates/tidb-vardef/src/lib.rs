@@ -83,14 +83,17 @@ pub fn set_ddl_reorg_batch_size(cnt: i32) {
 
 static DDL_ERROR_COUNT_LIMIT: AtomicI64 = AtomicI64::new(defaults::DEF_TIDB_DDL_ERROR_COUNT_LIMIT);
 
-/// Go `GetDDLErrorCountLimit`, retained when a worker cannot refresh globals.
+/// Go `GetDDLErrorCountLimit`, retained when a worker cannot refresh
+/// globals: the value of the keyspace whose DDL the thread runs
+/// ([`snapshot::current`], multi-keyspace design §6.3).
 pub fn ddl_error_count_limit() -> i64 {
-    DDL_ERROR_COUNT_LIMIT.load(Ordering::SeqCst)
+    snapshot::current().ddl_error_count_limit().load(Ordering::SeqCst)
 }
 
-/// Go `SetDDLErrorCountLimit`; validation belongs to the sysvar registry.
+/// Go `SetDDLErrorCountLimit` for the keyspace whose DDL the thread runs;
+/// validation belongs to the sysvar registry.
 pub fn set_ddl_error_count_limit(limit: i64) {
-    DDL_ERROR_COUNT_LIMIT.store(limit, Ordering::SeqCst);
+    snapshot::current().ddl_error_count_limit().store(limit, Ordering::SeqCst);
 }
 
 /// Go `vardef.MaxAutoAnalyzeTime`: the seconds an auto-analyze job may run

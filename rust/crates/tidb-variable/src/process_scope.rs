@@ -95,15 +95,15 @@ pub const HOOK_DESTINATIONS: &[HookDestination] = &[
     HookDestination { sysvar: "tidb_accelerate_user_creation_update", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
     HookDestination { sysvar: "tidb_advancer_check_point_lag_limit", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
     HookDestination { sysvar: "tidb_analyze_column_options", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
-    HookDestination { sysvar: "tidb_analyze_default_num_buckets", scope: HookScope::Process, writes: "the process vardef static `ANALYZE_DEFAULT_NUM_BUCKETS` (not yet per keyspace)" },
-    HookDestination { sysvar: "tidb_analyze_default_num_topn", scope: HookScope::Process, writes: "the process vardef static `ANALYZE_DEFAULT_NUM_TOP_N` (not yet per keyspace)" },
+    HookDestination { sysvar: "tidb_analyze_default_num_buckets", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
+    HookDestination { sysvar: "tidb_analyze_default_num_topn", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
     HookDestination { sysvar: "tidb_auto_analyze_concurrency", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
     HookDestination { sysvar: "tidb_cb_pd_metadata_error_rate_threshold_ratio", scope: HookScope::Process, writes: "the process vardef static `CIRCUIT_BREAKER_PD_METADATA_ERROR_RATE_THRESHOLD_RATIO`" },
     HookDestination { sysvar: "tidb_check_mb4_value_in_utf8", scope: HookScope::Process, writes: "the process configuration" },
     HookDestination { sysvar: "tidb_committer_concurrency", scope: HookScope::Process, writes: "the process TiKV client" },
     HookDestination { sysvar: "tidb_ddl_disk_quota", scope: HookScope::Process, writes: "the process vardef static `DDL_DISK_QUOTA`" },
     HookDestination { sysvar: "tidb_ddl_enable_fast_reorg", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
-    HookDestination { sysvar: "tidb_ddl_error_count_limit", scope: HookScope::Process, writes: "the process vardef static `DDL_ERROR_COUNT_LIMIT` (not yet per keyspace)" },
+    HookDestination { sysvar: "tidb_ddl_error_count_limit", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
     HookDestination { sysvar: "tidb_ddl_flashback_concurrency", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
     HookDestination { sysvar: "tidb_ddl_reorg_batch_size", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
     HookDestination { sysvar: "tidb_ddl_reorg_max_write_speed", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
@@ -148,7 +148,7 @@ pub const HOOK_DESTINATIONS: &[HookDestination] = &[
     HookDestination { sysvar: "tidb_log_file_max_days", scope: HookScope::Process, writes: "the process configuration" },
     HookDestination { sysvar: "tidb_low_resolution_tso_update_interval", scope: HookScope::Process, writes: "the process vardef static `LOW_RESOLUTION_TSO_UPDATE_INTERVAL`" },
     HookDestination { sysvar: "tidb_max_auto_analyze_time", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
-    HookDestination { sysvar: "tidb_max_delta_schema_count", scope: HookScope::Process, writes: "the process vardef static `MAX_DELTA_SCHEMA_COUNT` (not yet per keyspace)" },
+    HookDestination { sysvar: "tidb_max_delta_schema_count", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
     HookDestination { sysvar: "tidb_mem_arbitrator_mode", scope: HookScope::Process, writes: "the process memory tuner and arbitrator" },
     HookDestination { sysvar: "tidb_mem_arbitrator_soft_limit", scope: HookScope::Process, writes: "the process memory tuner and arbitrator" },
     HookDestination { sysvar: "tidb_mem_oom_action", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
@@ -285,8 +285,9 @@ mod tests {
         // The PD cluster's state: PD keeps one external timestamp per
         // cluster, not per keyspace.
         assert!(is_process_variable("tidb_external_ts"));
-        // A vardef global static not yet kept per keyspace.
-        assert!(is_process_variable("tidb_ddl_error_count_limit"));
+        // A vardef global static not kept per keyspace (metadata locking:
+        // every multi-keyspace node is next-generation and always locks).
+        assert!(is_process_variable("tidb_enable_metadata_lock"));
         assert!(is_process_variable("tidb_cloud_storage_uri"));
         // Go `ScopeInstance` alone.
         assert!(is_process_variable("tidb_general_log"));

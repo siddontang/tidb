@@ -228,8 +228,7 @@ impl ValidatorState {
     /// which keeps the queue short without losing coverage. The first entry
     /// is deliberately never merged away, so the queue keeps reaching as far
     /// back as it can.
-    fn enqueue(&mut self, schema_version: i64, change: Option<&RelatedSchemaChange>) {
-        let max_cnt = tidb_vardef::get_max_delta_schema_count();
+    fn enqueue(&mut self, schema_version: i64, change: Option<&RelatedSchemaChange>, max_cnt: i64) {
         if max_cnt <= 0 {
             return;
         }
@@ -261,6 +260,10 @@ impl ValidatorState {
 #[derive(Debug)]
 pub struct SchemaValidator {
     state: RwLock<ValidatorState>,
+    /// The values of the keyspace whose schema this validator follows
+    /// (`tidb_max_delta_schema_count`, multi-keyspace design §6.3): the
+    /// process's until its domain hands it its own.
+    vardef: RwLock<std::sync::Arc<tidb_vardef::VardefSnapshot>>,
 }
 
 impl SchemaValidator {
@@ -280,7 +283,22 @@ impl SchemaValidator {
                 ),
                 mdl_enabled: false,
             }),
+            vardef: RwLock::new(tidb_vardef::snapshot::process()),
         }
+    }
+
+    /// Go `vardef.GetMaxDeltaSchemaCount`, for this validator's keyspace.
+    fn max_delta_schema_count(&self) -> i64 {
+        self.vardef
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .max_delta_schema_count()
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Follows `vardef`'s `tidb_max_delta_schema_count` (its keyspace's).
+    pub fn set_vardef(&self, vardef: std::sync::Arc<tidb_vardef::VardefSnapshot>) {
+        *self.vardef.write().unwrap_or_else(std::sync::PoisonError::into_inner) = vardef;
     }
 
     /// The schema lease this validator was built with: the domain's
@@ -360,6 +378,7 @@ impl Validator for SchemaValidator {
         curr_ver: i64,
         change: Option<&RelatedSchemaChange>,
     ) {
+        let max_cnt = self.max_delta_schema_count();
         let mut state = self.write();
         if !state.is_started {
             return;
@@ -374,7 +393,7 @@ impl Validator for SchemaValidator {
             .saturating_sub(NANOS_PER_MILLI);
 
         if curr_ver != old_ver {
-            state.enqueue(curr_ver, change);
+            state.enqueue(curr_ver, change, max_cnt);
         }
     }
 
@@ -497,7 +516,8 @@ mod tests {
         }
 
         fn enqueue(&self, schema_version: i64, change: Option<&RelatedSchemaChange>) {
-            self.write().enqueue(schema_version, change);
+            let max_cnt = self.max_delta_schema_count();
+            self.write().enqueue(schema_version, change, max_cnt);
         }
     }
 
@@ -728,6 +748,27 @@ mod tests {
         ret.push(delta(16, &[3], &[3]));
         ret.push(delta(17, &[4], &[4]));
         assert_eq!(ret[1..], validator.delta_schema_infos()[..]);
+    }
+
+    /// Multi-keyspace design §6.3: a validator keeps as many deltas as its
+    /// keyspace's `tidb_max_delta_schema_count` says, whatever the process
+    /// value: a keyspace at 0 keeps none, the process (10 here) keeps them.
+    #[test]
+    fn the_delta_count_is_the_keyspace_s() {
+        let _serialised = serialised();
+        tidb_vardef::set_max_delta_schema_count(10);
+        let tenant = std::sync::Arc::new(tidb_vardef::VardefSnapshot::per_keyspace());
+        tenant.max_delta_schema_count().store(0, std::sync::atomic::Ordering::SeqCst);
+        let keyspace = SchemaValidator::new(LEASE);
+        keyspace.set_vardef(tenant);
+        let process = SchemaValidator::new(LEASE);
+        for validator in [&keyspace, &process] {
+            validator.enqueue(1, Some(&change(&[11], &[11])));
+            validator.enqueue(2, Some(&change(&[12], &[12])));
+        }
+        assert!(keyspace.delta_schema_infos().is_empty());
+        assert_eq!(process.delta_schema_infos().len(), 2);
+        tidb_vardef::set_max_delta_schema_count(DEF_TIDB_MAX_DELTA_SCHEMA_COUNT);
     }
 
     // Go `subTestEnqueueActionType`.

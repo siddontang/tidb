@@ -157,6 +157,10 @@ vardef_snapshot! {
     advancer_check_point_lag_limit: AtomicI64 = ADVANCER_CHECK_POINT_LAG_LIMIT (AtomicI64::new(defaults::DEF_TIDB_ADVANCER_CHECK_POINT_LAG_LIMIT));
     enable_local_txn: AtomicBool = ENABLE_LOCAL_TXN (AtomicBool::new(defaults::DEF_TIDB_ENABLE_LOCAL_TXN));
     ddl_reorg_max_write_speed: std::sync::atomic::AtomicI64 = DDL_REORG_MAX_WRITE_SPEED (std::sync::atomic::AtomicI64::new(defaults::DEF_TIDB_DDL_REORG_MAX_WRITE_SPEED));
+    ddl_error_count_limit: AtomicI64 = DDL_ERROR_COUNT_LIMIT (AtomicI64::new(defaults::DEF_TIDB_DDL_ERROR_COUNT_LIMIT));
+    max_delta_schema_count: AtomicI64 = MAX_DELTA_SCHEMA_COUNT (AtomicI64::new(defaults::DEF_TIDB_MAX_DELTA_SCHEMA_COUNT));
+    analyze_default_num_buckets: AtomicU64 = ANALYZE_DEFAULT_NUM_BUCKETS (AtomicU64::new(defaults::DEF_TIDB_ANALYZE_DEFAULT_NUM_BUCKETS as u64));
+    analyze_default_num_top_n: AtomicU64 = ANALYZE_DEFAULT_NUM_TOP_N (AtomicU64::new(defaults::DEF_TIDB_ANALYZE_DEFAULT_NUM_TOP_N as u64));
 }
 
 /// The process-backed snapshot.

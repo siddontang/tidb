@@ -131,8 +131,9 @@ set_global! {
         vd.table_cache_lease().store(v, SeqCst);
     };
     // Go: `SetMaxDeltaSchemaCount(TidbOptInt64(val, Def))`.
-    set_tidb_max_delta_schema_count => |vd, s| tidb_vardef::set_max_delta_schema_count(
+    set_tidb_max_delta_schema_count => |vd, s| vd.max_delta_schema_count().store(
         crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_MAX_DELTA_SCHEMA_COUNT),
+        SeqCst,
     );
     // Go `tidbOptPositiveInt32(val, Def...)` for the three DDL knobs.
     set_tidb_ddl_flashback_concurrency => |vd, s| vd.ddl_flashback_concurrency().store(
@@ -150,8 +151,9 @@ set_global! {
             .unwrap_or(tidb_vardef::defaults::DEF_TIDB_DDL_REORG_BATCH_SIZE as i32),
         SeqCst,
     );
-    set_tidb_ddl_error_count_limit => |vd, s| tidb_vardef::set_ddl_error_count_limit(
+    set_tidb_ddl_error_count_limit => |vd, s| vd.ddl_error_count_limit().store(
         s.parse::<i64>().unwrap_or(tidb_vardef::defaults::DEF_TIDB_DDL_ERROR_COUNT_LIMIT),
+        SeqCst,
     );
 }
 
@@ -386,10 +388,10 @@ set_global! {
     // Go `TiDBAnalyzeDefaultNumBuckets` / `TopN`: `strconv.ParseUint` then
     // `Store`; the registry's unsigned type has validated the value.
     set_tidb_analyze_default_num_buckets => |vd, s| if let Ok(v) = s.parse::<u64>() {
-        tidb_vardef::ANALYZE_DEFAULT_NUM_BUCKETS.store(v, SeqCst);
+        vd.analyze_default_num_buckets().store(v, SeqCst);
     };
     set_tidb_analyze_default_num_top_n => |vd, s| if let Ok(v) = s.parse::<u64>() {
-        tidb_vardef::ANALYZE_DEFAULT_NUM_TOP_N.store(v, SeqCst);
+        vd.analyze_default_num_top_n().store(v, SeqCst);
     };
     set_tidb_enable_auto_analyze_priority_queue => |vd, s| {
         vd.enable_auto_analyze_priority_queue().store(on(s), SeqCst);
@@ -406,8 +408,8 @@ set_global! {
 }
 
 get_global! { |vd|
-    get_tidb_analyze_default_num_buckets => tidb_vardef::ANALYZE_DEFAULT_NUM_BUCKETS.load(SeqCst).to_string();
-    get_tidb_analyze_default_num_top_n => tidb_vardef::ANALYZE_DEFAULT_NUM_TOP_N.load(SeqCst).to_string();
+    get_tidb_analyze_default_num_buckets => vd.analyze_default_num_buckets().load(SeqCst).to_string();
+    get_tidb_analyze_default_num_top_n => vd.analyze_default_num_top_n().load(SeqCst).to_string();
     get_tidb_enable_auto_analyze_priority_queue => on_off(vd.enable_auto_analyze_priority_queue().load(SeqCst));
     get_tidb_committer_concurrency => tidb_tikvutil::COMMITTER_CONCURRENCY.load(SeqCst).to_string();
     get_tidb_enable_metadata_lock => on_off(tidb_vardef::is_mdl_enabled(tidb_config_kerneltype::is_next_gen()));

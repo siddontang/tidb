@@ -222,13 +222,46 @@ pub struct BuildOptions {
     pub num_buckets: isize,
     /// `WITH m TOPN`, or the session default.
     pub num_topn: isize,
+    /// Go `vardef.AnalyzeDefaultNumBuckets` / `AnalyzeDefaultNumTopN` of the
+    /// keyspace the statistics are built for (multi-keyspace design §6.3):
+    /// a size equal to its default keeps the pruning heuristics on.
+    pub defaults: AnalyzeDefaults,
+}
+
+/// A keyspace's `tidb_analyze_default_num_buckets` / `_topn`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnalyzeDefaults {
+    /// Go `vardef.AnalyzeDefaultNumBuckets`.
+    pub num_buckets: u64,
+    /// Go `vardef.AnalyzeDefaultNumTopN`.
+    pub num_topn: u64,
+}
+
+impl AnalyzeDefaults {
+    /// The values of the keyspace the thread works for
+    /// ([`tidb_vardef::snapshot::current`]).
+    #[must_use]
+    pub fn current() -> Self {
+        Self::of(&tidb_vardef::snapshot::current())
+    }
+
+    /// The values of `vardef`'s keyspace.
+    #[must_use]
+    pub fn of(vardef: &tidb_vardef::VardefSnapshot) -> Self {
+        Self {
+            num_buckets: vardef.analyze_default_num_buckets().load(Ordering::SeqCst),
+            num_topn: vardef.analyze_default_num_top_n().load(Ordering::SeqCst),
+        }
+    }
 }
 
 impl Default for BuildOptions {
     fn default() -> Self {
+        let defaults = AnalyzeDefaults::current();
         Self {
-            num_buckets: tidb_vardef::ANALYZE_DEFAULT_NUM_BUCKETS.load(Ordering::SeqCst) as isize,
-            num_topn: tidb_vardef::ANALYZE_DEFAULT_NUM_TOP_N.load(Ordering::SeqCst) as isize,
+            num_buckets: defaults.num_buckets as isize,
+            num_topn: defaults.num_topn as isize,
+            defaults,
         }
     }
 }
@@ -491,7 +524,7 @@ pub fn try_build_hist_and_topn_tracked<E>(
     let num_topn = options.num_topn;
     let allow_pruning = is_analyze_default_value(
         num_topn,
-        tidb_vardef::ANALYZE_DEFAULT_NUM_TOP_N.load(Ordering::SeqCst),
+        options.defaults.num_topn,
     );
     let policy = TopNPolicy {
         num_topn,
@@ -623,7 +656,7 @@ pub fn try_build_hist_and_topn_tracked<E>(
         if len_topn < num_topn as i64
             && is_analyze_default_value(
                 options.num_buckets,
-                tidb_vardef::ANALYZE_DEFAULT_NUM_BUCKETS.load(Ordering::SeqCst),
+                options.defaults.num_buckets,
             )
         {
             num_buckets = (remaining_ndv / BUCKET_NDV_DIVISOR).max(1).min(num_buckets);

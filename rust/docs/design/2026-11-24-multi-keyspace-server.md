@@ -745,13 +745,13 @@ operator listener exists, Op means node config.
 | Item | Lives in | Changed by | Status | Evidence | Fix phase |
 | --- | --- | --- | --- | --- | --- |
 | Schema meta (meta keys, schema version, global IDs) | TS | SQL (DDL) | Isolated: the store is opened with the keyspace's API v2 codec. `GLOBAL_ID_MUTEX` is a process lock (contention only). | `tidb-server/src/cluster_stack.rs:114`; `tidb-txnkv/src/driver/tikv_store.rs:158`; `tidb-meta/src/transaction.rs:52` | — |
-| Infoschema cache, schema lease, schema-version sync | RT | SQL (DDL) | Isolated: one loader per runtime; schema sync on the tenant's etcd. `MAX_DELTA_SCHEMA_COUNT` is still a process static. | `cluster_stack.rs:799,970` | 3c |
+| Infoschema cache, schema lease, schema-version sync | RT | SQL (DDL) | Isolated: one loader per runtime; schema sync on the tenant's etcd; the validator keeps its keyspace's `tidb_max_delta_schema_count` of deltas. | `cluster_stack.rs:799,970` | — |
 | DDL job queue and history, DDL owner | TS + tenant etcd | SQL | Isolated: owner managers are keyed by keyspace. A job's reorganization reads its keyspace's vardef values on every thread it spawns. | `tidb-ddl/src/owner_mgr.rs:16`; `tidb-ddl/src/real_tikv_ddl.rs` (job scope) | — |
 | `JOB_CTX_MAP` (reorg contexts by job ID) | P | — | Shared: job IDs collide across tenants. | `tidb-ddl/src/job_ctx.rs:130` | 3d |
 | `JOB_VER_IN_USE`, `GLOBAL_INDEX_V1_SUPPORTED` | P | Each tenant's DDL version check | Shared: the last tenant's DDL worker sets the value for every tenant. | `tidb-model/src/job_enums.rs:210`; `tidb-model/src/index.rs:84`; `tidb-ddl/src/worker.rs:700,784` | 3d (§6.4) |
-| MDL (`mysql.tidb_mdl_info`, schema pins) | TS + RT | — | Isolated: pins per domain. `ENABLE_MDL` is still a process static. | vardef appendix | 3c |
+| MDL (`mysql.tidb_mdl_info`, schema pins) | TS + RT | — | Isolated: pins per domain. Next-generation kernels always lock, so `ENABLE_MDL` is an instance setting. | vardef appendix | — |
 | Accounts (`mysql.user`, `db`, `tables_priv`, roles, `global_priv`, password history) | TS | SQL | Isolated: privileges per domain, privilege watch on the tenant's etcd, username policy per runtime. Users without a prefix route to the configured keyspace. | `tidb-server/src/keyspace_registry.rs` (`route`) | Prefix-less users: Phase 2 (Q2) |
-| `mysql.global_variables` and the sysvar cache | TS + RT | SQL (keyspace variables); Op (process variables) | 50 of 56 global statics are kept per keyspace; a tenant's `SET GLOBAL` of a process variable is refused. | `tidb-server/src/keyspace_runtime.rs`; §6.3 appendices | The remaining "not yet" statics: 3c |
+| `mysql.global_variables` and the sysvar cache | TS + RT | SQL (keyspace variables); Op (process variables) | 54 of 55 global statics are kept per keyspace (the cloud storage URI is a process variable); a tenant's `SET GLOBAL` of a process variable is refused. | `tidb-server/src/keyspace_runtime.rs`; §6.3 appendices | — |
 | `tidb_external_ts` | PD (whole cluster) | Op | Shared by design: PD keeps one external timestamp per cluster. A process variable; tenants read it. | commit `a18dec47b5` | — |
 | Bindings (`mysql.bind_info`, cache) | TS + RT | SQL | Isolated: binding handle per domain. | `cluster_stack.rs:256` | — |
 | Statistics (`mysql.stats_*`, cache, owner, auto-analyze queue) | TS + RT | SQL (ANALYZE) | Isolated per domain; auto-analyze reads its keyspace's settings. | `cluster_stack.rs:810,944` | — |
@@ -912,9 +912,11 @@ How the global statics are kept per keyspace (`tidb_vardef::snapshot`):
   runs on a thread that entered a snapshot. There is no process-wide
   registry of snapshots.
 - *Per keyspace: not yet* marks a global static that other code still
-  writes directly (MDL, the DDL error limit, the analyze defaults, the
-  schema validator's delta count, the cloud storage URI); it stays
-  process-wide until its writers move.
+  writes directly; only the cloud storage URI remains, which is a process
+  variable (§6.10, phase 3f). The DDL error limit, the analyze default
+  sizes and the schema validator's delta count are kept per keyspace;
+  metadata locking is an instance setting, since next-generation kernels
+  (every multi-keyspace node) always lock.
 - A tenant's `SET GLOBAL` / `SET INSTANCE` of an *instance* variable (and of
   a variable Go scopes to the instance alone) is refused with
   `ER_SPECIFIC_ACCESS_DENIED_ERROR` (`RESTRICTED_VARIABLES_ADMIN`) in
@@ -922,23 +924,23 @@ How the global statics are kept per keyspace (`tidb_vardef::snapshot`):
 
 <!-- BEGIN generated: vardef classification -->
 
-92 statics: 56 global (50 kept per keyspace so far), 29 instance, 7 internal.
+92 statics: 55 global (54 kept per keyspace so far), 30 instance, 7 internal.
 
 | Static | System variable | Registry scope | Class | Per keyspace | Governs |
 | --- | --- | --- | --- | --- | --- |
-| `ENABLE_MDL` | `tidb_enable_metadata_lock` | GLOBAL | global | not yet | metadata locking of the keyspace's DDL (its meta key) |
+| `ENABLE_MDL` | `tidb_enable_metadata_lock` | GLOBAL | instance | -- | metadata locking on a classic node (next-generation kernels, every multi-keyspace node among them, always lock) |
 | `DDL_FLASHBACK_CONCURRENCY` | `tidb_ddl_flashback_concurrency` | GLOBAL | global | yes | the keyspace's DDL jobs |
 | `DDL_REORG_WORKER_COUNTER` | `tidb_ddl_reorg_worker_cnt` | GLOBAL \| SESSION | global | yes | the keyspace's DDL jobs |
 | `DDL_REORG_BATCH_SIZE` | `tidb_ddl_reorg_batch_size` | GLOBAL \| SESSION | global | yes | the keyspace's DDL jobs |
-| `DDL_ERROR_COUNT_LIMIT` | `tidb_ddl_error_count_limit` | GLOBAL | global | not yet | the keyspace's DDL jobs |
+| `DDL_ERROR_COUNT_LIMIT` | `tidb_ddl_error_count_limit` | GLOBAL | global | yes | the keyspace's DDL jobs |
 | `MAX_AUTO_ANALYZE_TIME` | `tidb_max_auto_analyze_time` | GLOBAL | global | yes | the keyspace's auto-analyze |
 | `ENABLE_WORKLOAD_BASED_LEARNING` | -- | -- | internal | -- | no system variable |
 | `WORKLOAD_BASED_LEARNING_INTERVAL` | -- | -- | internal | -- | no system variable |
 | `ENABLE_FAST_CREATE_TABLE` | `tidb_enable_fast_create_table` | GLOBAL | global | yes | the keyspace's DDL submission |
 | `IS_SAND_BOX_MODE_ENABLED` | -- | -- | internal | -- | process config (`security.disconnect-on-expired-password`) |
 | `TABLE_CACHE_LEASE` | `tidb_table_cache_lease` | GLOBAL | global | yes | the keyspace's cached tables |
-| `ANALYZE_DEFAULT_NUM_BUCKETS` | `tidb_analyze_default_num_buckets` | GLOBAL | global | not yet | the keyspace's statistics |
-| `ANALYZE_DEFAULT_NUM_TOP_N` | `tidb_analyze_default_num_topn` | GLOBAL | global | not yet | the keyspace's statistics |
+| `ANALYZE_DEFAULT_NUM_BUCKETS` | `tidb_analyze_default_num_buckets` | GLOBAL | global | yes | the keyspace's statistics |
+| `ANALYZE_DEFAULT_NUM_TOP_N` | `tidb_analyze_default_num_topn` | GLOBAL | global | yes | the keyspace's statistics |
 | `STATS_CACHE_MEM_QUOTA` | `tidb_stats_cache_mem_quota` | GLOBAL \| INSTANCE | instance | -- | process memory |
 | `MEMORY_USAGE_ALARM_RATIO` | `tidb_memory_usage_alarm_ratio` | GLOBAL | instance | -- | process memory |
 | `FORCE_PRIORITY` | `tidb_force_priority` | INSTANCE | instance | -- | Go `ScopeInstance` |
@@ -947,7 +949,7 @@ How the global statics are kept per keyspace (`tidb_vardef::snapshot`):
 | `CONNECT_ATTRS_SIZE` | `performance_schema_session_connect_attrs_size` | GLOBAL | global | yes | the keyspace's connections |
 | `CONNECT_ATTRS_LONGEST_SEEN` | -- | -- | internal | -- | status counter |
 | `CONNECT_ATTRS_LOST` | -- | -- | internal | -- | status counter |
-| `MAX_DELTA_SCHEMA_COUNT` | `tidb_max_delta_schema_count` | GLOBAL | global | not yet | the keyspace's schema validator |
+| `MAX_DELTA_SCHEMA_COUNT` | `tidb_max_delta_schema_count` | GLOBAL | global | yes | the keyspace's schema validator |
 | `ENABLE_ROW_LEVEL_CHECKSUM` | `tidb_enable_row_level_checksum` | GLOBAL | global | yes | the keyspace's row encoding |
 | `ENABLE_FOREIGN_KEY` | `tidb_enable_foreign_key` | GLOBAL | global | yes | the keyspace's DDL policy |
 | `ENABLE_CHECK_CONSTRAINT` | `tidb_enable_check_constraint` | GLOBAL | global | yes | the keyspace's DDL policy |
@@ -1046,7 +1048,7 @@ the cluster's value and cannot set it, and its cache rebuild never writes it.
 
 <!-- BEGIN generated: set-global hook destinations -->
 
-145 variables with a `SetGlobal` hook: 51 keyspace, 94 process.
+145 variables with a `SetGlobal` hook: 55 keyspace, 90 process.
 
 | System variable | Registry scope | Hook writes | Class |
 | --- | --- | --- | --- |
@@ -1083,15 +1085,15 @@ the cluster's value and cannot set it, and its cache rebuild never writes it.
 | `tidb_accelerate_user_creation_update` | GLOBAL | the keyspace vardef snapshot | keyspace |
 | `tidb_advancer_check_point_lag_limit` | GLOBAL | the keyspace vardef snapshot | keyspace |
 | `tidb_analyze_column_options` | GLOBAL | the keyspace vardef snapshot | keyspace |
-| `tidb_analyze_default_num_buckets` | GLOBAL | the process vardef static `ANALYZE_DEFAULT_NUM_BUCKETS` (not yet per keyspace) | process |
-| `tidb_analyze_default_num_topn` | GLOBAL | the process vardef static `ANALYZE_DEFAULT_NUM_TOP_N` (not yet per keyspace) | process |
+| `tidb_analyze_default_num_buckets` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_analyze_default_num_topn` | GLOBAL | the keyspace vardef snapshot | keyspace |
 | `tidb_auto_analyze_concurrency` | GLOBAL | the keyspace vardef snapshot | keyspace |
 | `tidb_cb_pd_metadata_error_rate_threshold_ratio` | GLOBAL | the process vardef static `CIRCUIT_BREAKER_PD_METADATA_ERROR_RATE_THRESHOLD_RATIO` | process |
 | `tidb_check_mb4_value_in_utf8` | INSTANCE | the process configuration | process |
 | `tidb_committer_concurrency` | GLOBAL | the process TiKV client | process |
 | `tidb_ddl_disk_quota` | GLOBAL | the process vardef static `DDL_DISK_QUOTA` | process |
 | `tidb_ddl_enable_fast_reorg` | GLOBAL | the keyspace vardef snapshot | keyspace |
-| `tidb_ddl_error_count_limit` | GLOBAL | the process vardef static `DDL_ERROR_COUNT_LIMIT` (not yet per keyspace) | process |
+| `tidb_ddl_error_count_limit` | GLOBAL | the keyspace vardef snapshot | keyspace |
 | `tidb_ddl_flashback_concurrency` | GLOBAL | the keyspace vardef snapshot | keyspace |
 | `tidb_ddl_reorg_batch_size` | GLOBAL \| SESSION | the keyspace vardef snapshot | keyspace |
 | `tidb_ddl_reorg_max_write_speed` | GLOBAL | the keyspace vardef snapshot | keyspace |
@@ -1136,7 +1138,7 @@ the cluster's value and cannot set it, and its cache rebuild never writes it.
 | `tidb_log_file_max_days` | INSTANCE | the process configuration | process |
 | `tidb_low_resolution_tso_update_interval` | GLOBAL | the process vardef static `LOW_RESOLUTION_TSO_UPDATE_INTERVAL` | process |
 | `tidb_max_auto_analyze_time` | GLOBAL | the keyspace vardef snapshot | keyspace |
-| `tidb_max_delta_schema_count` | GLOBAL | the process vardef static `MAX_DELTA_SCHEMA_COUNT` (not yet per keyspace) | process |
+| `tidb_max_delta_schema_count` | GLOBAL | the keyspace vardef snapshot | keyspace |
 | `tidb_mem_arbitrator_mode` | GLOBAL | the process memory tuner and arbitrator | process |
 | `tidb_mem_arbitrator_soft_limit` | GLOBAL | the process memory tuner and arbitrator | process |
 | `tidb_mem_oom_action` | GLOBAL | the keyspace vardef snapshot | keyspace |

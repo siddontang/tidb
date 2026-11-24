@@ -128,17 +128,19 @@ pub struct AnalyzeOptions {
     pub num_samples: usize,
     /// `WITH r SAMPLERATE`; `None` derives it from the table's row count.
     pub sample_rate: Option<f64>,
+    /// The statement's keyspace's defaults for the two sizes.
+    pub defaults: tidb_stats::builder::AnalyzeDefaults,
 }
 
 impl Default for AnalyzeOptions {
     fn default() -> Self {
+        let defaults = tidb_stats::builder::AnalyzeDefaults::current();
         Self {
-            num_buckets: tidb_vardef::ANALYZE_DEFAULT_NUM_BUCKETS
-                .load(std::sync::atomic::Ordering::SeqCst) as isize,
-            num_topn: tidb_vardef::ANALYZE_DEFAULT_NUM_TOP_N
-                .load(std::sync::atomic::Ordering::SeqCst) as isize,
+            num_buckets: defaults.num_buckets as isize,
+            num_topn: defaults.num_topn as isize,
             num_samples: 0,
             sample_rate: None,
+            defaults,
         }
     }
 }
@@ -150,6 +152,7 @@ impl AnalyzeOptions {
         BuildOptions {
             num_buckets: self.num_buckets,
             num_topn: self.num_topn,
+            defaults: self.defaults,
         }
     }
 }

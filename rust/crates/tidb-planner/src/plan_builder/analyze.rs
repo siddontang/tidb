@@ -220,6 +220,10 @@ pub struct AnalyzePlanVars {
     pub persist_analyze_options: bool,
     /// Go `vardef.AnalyzeColumnOptions`.
     pub analyze_column_options: String,
+    /// Go `vardef.AnalyzeDefaultNumBuckets`: the session's keyspace's.
+    pub default_num_buckets: u64,
+    /// Go `vardef.AnalyzeDefaultNumTopN`: the session's keyspace's.
+    pub default_num_topn: u64,
 }
 
 impl Default for AnalyzePlanVars {
@@ -231,6 +235,8 @@ impl Default for AnalyzePlanVars {
             analyze_skip_column_types: BTreeSet::new(),
             persist_analyze_options: true,
             analyze_column_options: tidb_vardef::tidb_vars::DEF_TIDB_ANALYZE_COLUMN_OPTIONS.to_owned(),
+            default_num_buckets: tidb_vardef::ANALYZE_DEFAULT_NUM_BUCKETS.load(std::sync::atomic::Ordering::SeqCst),
+            default_num_topn: tidb_vardef::ANALYZE_DEFAULT_NUM_TOP_N.load(std::sync::atomic::Ordering::SeqCst),
         }
     }
 }
@@ -250,18 +256,20 @@ fn analyze_option_limit(opt: AnalyzeOptionType) -> u64 {
     }
 }
 
-/// Go `AnalyzeOptionDefault`.
+/// Go `AnalyzeOptionDefault`, over the process's defaults.
 #[must_use]
 pub fn analyze_option_default() -> AnalyzeOpts {
+    analyze_option_default_with(&AnalyzePlanVars::default())
+}
+
+/// Go `AnalyzeOptionDefault` over `vars`' defaults: the session's
+/// keyspace's `tidb_analyze_default_num_buckets` / `_topn` (multi-keyspace
+/// design §6.3).
+#[must_use]
+pub fn analyze_option_default_with(vars: &AnalyzePlanVars) -> AnalyzeOpts {
     BTreeMap::from([
-        (
-            AnalyzeOptionType::NumBuckets,
-            tidb_vardef::ANALYZE_DEFAULT_NUM_BUCKETS.load(std::sync::atomic::Ordering::SeqCst),
-        ),
-        (
-            AnalyzeOptionType::NumTopN,
-            tidb_vardef::ANALYZE_DEFAULT_NUM_TOP_N.load(std::sync::atomic::Ordering::SeqCst),
-        ),
+        (AnalyzeOptionType::NumBuckets, vars.default_num_buckets),
+        (AnalyzeOptionType::NumTopN, vars.default_num_topn),
         (AnalyzeOptionType::CmSketchWidth, 2048),
         (AnalyzeOptionType::CmSketchDepth, 5),
         (AnalyzeOptionType::NumSamples, 0),
@@ -344,10 +352,16 @@ fn handle_analyze_options(opts: &[tidb_ast::AnalyzeOption]) -> Result<AnalyzeOpt
     Ok(opt_map)
 }
 
-/// Go `fillAnalyzeOptions`.
+/// Go `fillAnalyzeOptions`, over the process's defaults.
 #[must_use]
 pub fn fill_analyze_options(opt_map: &AnalyzeOpts) -> AnalyzeOpts {
-    analyze_option_default()
+    fill_analyze_options_with(opt_map, &AnalyzePlanVars::default())
+}
+
+/// Go `fillAnalyzeOptions` over `vars`' defaults.
+#[must_use]
+pub fn fill_analyze_options_with(opt_map: &AnalyzeOpts, vars: &AnalyzePlanVars) -> AnalyzeOpts {
+    analyze_option_default_with(vars)
         .into_iter()
         .map(|(key, default_val)| (key, opt_map.get(&key).copied().unwrap_or(default_val)))
         .collect()
@@ -513,7 +527,7 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
         // Require INSERT and SELECT privilege for tables.
         self.require_insert_and_select_priv(analyze.tables.iter());
         let opts = handle_analyze_options(&analyze.options)?;
-        let filled_opts = fill_analyze_options(&opts);
+        let filled_opts = fill_analyze_options_with(&opts, &vars);
         let mut tables = Vec::with_capacity(analyze.tables.len());
         for path in &analyze.tables {
             tables.push(self.analyze_table_name(path)?);
@@ -1123,7 +1137,7 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
             (tbl_col_choice, tbl_col_list) =
                 pick_column_list(ast_col_choice, &ast_col_list, tbl_saved_col_choice, &tbl_saved_col_list);
         }
-        let tbl_filled_opts = fill_analyze_options(&tbl_opts);
+        let tbl_filled_opts = fill_analyze_options_with(&tbl_opts, &self.analyze_plan_vars());
         let (tbl_cols_info, tbl_col_list) = self.get_full_analyze_columns_info(
             tbl,
             tbl_col_choice,
@@ -1173,7 +1187,7 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
                 pick_column_list(par_saved_col_choice, &par_saved_col_list, tbl_saved_col_choice, &tbl_saved_col_list);
             // Then merge statement level options.
             let merged_opts = merge_analyze_options(&ast_opts, &saved_opts);
-            let filled_merged_opts = fill_analyze_options(&merged_opts);
+            let filled_merged_opts = fill_analyze_options_with(&merged_opts, &self.analyze_plan_vars());
             let (final_col_choice, merged_col_list) =
                 pick_column_list(ast_col_choice, &ast_col_list, saved_col_choice, &saved_col_list);
             let (final_cols_info, final_col_list) = self.get_full_analyze_columns_info(

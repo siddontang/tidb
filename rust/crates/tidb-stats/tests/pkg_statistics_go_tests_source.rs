@@ -294,6 +294,7 @@ fn build_hist_and_topn_uses_analyze_default_globals() {
     let options = |num_buckets: isize, num_topn: isize| BuildOptions {
         num_buckets,
         num_topn,
+        defaults: tidb_stats::builder::AnalyzeDefaults::current(),
     };
     let mut samples = Vec::new();
     let mut ordinal = 0_isize;
