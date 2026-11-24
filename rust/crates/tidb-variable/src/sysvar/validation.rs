@@ -651,14 +651,20 @@ pub(super) fn tidb_auto_analyze_concurrency(
     scope: u8,
     lookup: Lookup<'_>,
 ) -> Result<Validated, ValidationError> {
-    if !tidb_vardef::RUN_AUTO_ANALYZE.load(std::sync::atomic::Ordering::SeqCst)
-        || !tidb_vardef::ENABLE_AUTO_ANALYZE_PRIORITY_QUEUE
-            .load(std::sync::atomic::Ordering::SeqCst)
-    {
-        let run_auto_analyze =
-            tidb_vardef::RUN_AUTO_ANALYZE.load(std::sync::atomic::Ordering::SeqCst);
-        let enable_auto_analyze_priority_queue = tidb_vardef::ENABLE_AUTO_ANALYZE_PRIORITY_QUEUE
-            .load(std::sync::atomic::Ordering::SeqCst);
+    // The two switches of the table being written when there is one (a
+    // keyspace's own values on a multi-keyspace node, design §6.3), else the
+    // process's.
+    let switch = |name: &str, process: &std::sync::atomic::AtomicBool| {
+        lookup
+            .and_then(|lookup| lookup.read(name))
+            .map_or_else(|| process.load(std::sync::atomic::Ordering::SeqCst), |value| tidb_vardef::option_values::tidb_opt_on(&value))
+    };
+    let run_auto_analyze = switch(tidb_vardef::tidb_vars::TIDB_ENABLE_AUTO_ANALYZE, &tidb_vardef::RUN_AUTO_ANALYZE);
+    let enable_auto_analyze_priority_queue = switch(
+        tidb_vardef::tidb_vars::TIDB_ENABLE_AUTO_ANALYZE_PRIORITY_QUEUE,
+        &tidb_vardef::ENABLE_AUTO_ANALYZE_PRIORITY_QUEUE,
+    );
+    if !run_auto_analyze || !enable_auto_analyze_priority_queue {
         return Err(ValidationError::Refused(format!(
             "cannot set {}: requires both tidb_enable_auto_analyze and tidb_enable_auto_analyze_priority_queue to be true. Current values: tidb_enable_auto_analyze={}, tidb_enable_auto_analyze_priority_queue={}",
             def.name, run_auto_analyze, enable_auto_analyze_priority_queue

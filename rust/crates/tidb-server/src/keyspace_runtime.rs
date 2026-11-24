@@ -70,7 +70,11 @@ impl KeyspaceRuntime {
             // The domain hands the snapshot to its sessions and its DDL.
             global_vars = global_vars.with_keyspace_vardef();
         }
-        crate::set_global_vars::set_global_vars(config, &global_vars);
+        if own_vardef {
+            crate::set_global_vars::set_global_vars_for_keyspace(config, &global_vars);
+        } else {
+            crate::set_global_vars::set_global_vars(config, &global_vars);
+        }
         let (mut stack, authority) =
             cluster_session_stack(config, global_vars, spill_storage, memory_arbitrator)?;
         // Go `store/driver` -> `gcworker.NewGCWorker` + `Start`: the GC leader

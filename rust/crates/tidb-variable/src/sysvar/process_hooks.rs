@@ -245,7 +245,7 @@ set_global! {
     // Go: only a change reaches the resource-control switch.
     set_tidb_enable_resource_control => |vd, s| {
         let enable = on(s);
-        if vd.enable_resource_control().swap(enable, SeqCst) != enable {
+        if tidb_vardef::ENABLE_RESOURCE_CONTROL.swap(enable, SeqCst) != enable {
             crate::vars::set_global_resource_control(enable);
             tidb_logutil::bg_logger().info(
                 "set resource control",
@@ -377,7 +377,7 @@ fn priority_to_str(priority: i32) -> String {
 }
 
 get_global! { |vd|
-    get_tidb_enable_resource_control => on_off(vd.enable_resource_control().load(SeqCst));
+    get_tidb_enable_resource_control => on_off(tidb_vardef::ENABLE_RESOURCE_CONTROL.load(SeqCst));
     get_tidb_memory_usage_alarm_ratio => go_g(tidb_vardef::memory_usage_alarm_ratio());
     get_tidb_force_priority => priority_to_str(tidb_vardef::FORCE_PRIORITY.load(SeqCst));
 }

@@ -1016,6 +1016,13 @@ impl GlobalSysvars {
         {
             return;
         }
+        // A keyspace that owns its vardef values never writes the process's
+        // state (design §6.3): a process variable's hook would apply the
+        // keyspace's value (an explicit write, or a row its rebuild loaded)
+        // to every keyspace.
+        if self.vardef.is_per_keyspace() && tidb_variable::process_scope::is_process_variable(name) {
+            return;
+        }
         // Go `SetGlobalFromHook`: the variable's one `SetGlobal` -- its own
         // (its process state, e.g. `vardef`'s atomics and the LDAP impls) or
         // the one a package outside the registry gave it (Go

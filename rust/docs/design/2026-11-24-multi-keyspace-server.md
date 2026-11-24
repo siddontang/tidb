@@ -708,7 +708,7 @@ How the global statics are kept per keyspace (`tidb_vardef::snapshot`):
 
 <!-- BEGIN generated: vardef classification -->
 
-92 statics: 58 global (52 kept per keyspace so far), 27 instance, 7 internal.
+92 statics: 57 global (51 kept per keyspace so far), 28 instance, 7 internal.
 
 | Static | System variable | Registry scope | Class | Per keyspace | Governs |
 | --- | --- | --- | --- | --- | --- |
@@ -765,7 +765,7 @@ How the global statics are kept per keyspace (`tidb_vardef::snapshot`):
 | `RUN_AUTO_ANALYZE` | `tidb_enable_auto_analyze` | GLOBAL | global | yes | the keyspace's auto-analyze |
 | `ENABLE_AUTO_ANALYZE_PRIORITY_QUEUE` | `tidb_enable_auto_analyze_priority_queue` | GLOBAL | global | yes | the keyspace's auto-analyze |
 | `AUTO_ANALYZE_CONCURRENCY` | `tidb_auto_analyze_concurrency` | GLOBAL | global | yes | the keyspace's auto-analyze |
-| `ENABLE_RESOURCE_CONTROL` | `tidb_enable_resource_control` | GLOBAL | global | yes | the keyspace's resource groups |
+| `ENABLE_RESOURCE_CONTROL` | `tidb_enable_resource_control` | GLOBAL | instance | -- | the process TiKV client's resource-control switch |
 | `MAX_USER_CONNECTIONS_VALUE` | `max_user_connections` | GLOBAL | global | yes | the keyspace's accounts |
 | `ACCELERATE_USER_CREATION_UPDATE` | `tidb_accelerate_user_creation_update` | GLOBAL | global | yes | the keyspace's privilege cache |
 | `ENABLE_RESOURCE_CONTROL_STRICT_MODE` | `tidb_resource_control_strict_mode` | GLOBAL | global | yes | the keyspace's resource groups |
@@ -806,6 +806,178 @@ How the global statics are kept per keyspace (`tidb_vardef::snapshot`):
 | `DDL_SLOW_OPR_THRESHOLD` | `ddl_slow_threshold` | INSTANCE | instance | -- | Go `ScopeInstance`: the process's log |
 
 <!-- END generated: vardef classification -->
+
+#### Appendix to §6.3: where the `SetGlobal` hooks write
+
+Generated from `tidb_variable::process_scope::HOOK_DESTINATIONS` by the same
+test; a `tidb-variable` unit test fails when a registry variable gains a
+`SetGlobal` hook the table does not classify. A *keyspace* hook writes only
+the keyspace's vardef snapshot (or nothing). A *process* hook writes state the
+whole process shares (another crate's static, collector or client, the
+process configuration, a vardef static not kept per keyspace): its variable is
+a process variable. In multi-keyspace mode a tenant's `SET GLOBAL` / `SET
+INSTANCE` of it is refused (`ER_SPECIFIC_ACCESS_DENIED_ERROR`), and a keyspace
+that owns its vardef values never runs its hook, neither for a write nor for a
+value its cache rebuild loads, so a tenant's stored value cannot reach the
+process. Hooks other packages register on a domain (GC, materialized views,
+the workload repository) act on that domain's keyspace and are not listed.
+The process settings `setGlobalVars` seeds directly are seeded once per node,
+by the configured keyspace's runtime; a later keyspace's open seeds only its
+own registry.
+
+<!-- BEGIN generated: set-global hook destinations -->
+
+145 variables with a `SetGlobal` hook: 52 keyspace, 93 process.
+
+| System variable | Registry scope | Hook writes | Class |
+| --- | --- | --- | --- |
+| `authentication_ldap_sasl_auth_method_name` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_sasl_bind_base_dn` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_sasl_bind_root_dn` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_sasl_bind_root_pwd` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_sasl_ca_path` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_sasl_init_pool_size` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_sasl_max_pool_size` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_sasl_server_host` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_sasl_server_port` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_sasl_tls` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_sasl_user_search_attr` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_simple_auth_method_name` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_simple_bind_base_dn` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_simple_bind_root_dn` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_simple_bind_root_pwd` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_simple_ca_path` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_simple_init_pool_size` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_simple_max_pool_size` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_simple_server_host` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_simple_server_port` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_simple_tls` | GLOBAL | the process LDAP authentication | process |
+| `authentication_ldap_simple_user_search_attr` | GLOBAL | the process LDAP authentication | process |
+| `ddl_slow_threshold` | INSTANCE | the process vardef static `DDL_SLOW_OPR_THRESHOLD` | process |
+| `max_connections` | INSTANCE | the process configuration | process |
+| `max_user_connections` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `password_history` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `password_reuse_interval` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `pd_enable_follower_handle_region` | GLOBAL | the process vardef static `ENABLE_PD_FOLLOWER_HANDLE_REGION` | process |
+| `performance_schema_session_connect_attrs_size` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `require_secure_transport` | GLOBAL | the process TLS transport policy | process |
+| `tidb_accelerate_user_creation_update` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_advancer_check_point_lag_limit` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_analyze_column_options` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_analyze_default_num_buckets` | GLOBAL | the process vardef static `ANALYZE_DEFAULT_NUM_BUCKETS` (not yet per keyspace) | process |
+| `tidb_analyze_default_num_topn` | GLOBAL | the process vardef static `ANALYZE_DEFAULT_NUM_TOP_N` (not yet per keyspace) | process |
+| `tidb_auto_analyze_concurrency` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_cb_pd_metadata_error_rate_threshold_ratio` | GLOBAL | the process vardef static `CIRCUIT_BREAKER_PD_METADATA_ERROR_RATE_THRESHOLD_RATIO` | process |
+| `tidb_check_mb4_value_in_utf8` | INSTANCE | the process configuration | process |
+| `tidb_committer_concurrency` | GLOBAL | the process TiKV client | process |
+| `tidb_ddl_disk_quota` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_ddl_enable_fast_reorg` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_ddl_error_count_limit` | GLOBAL | the process vardef static `DDL_ERROR_COUNT_LIMIT` (not yet per keyspace) | process |
+| `tidb_ddl_flashback_concurrency` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_ddl_reorg_batch_size` | GLOBAL \| SESSION | the keyspace vardef snapshot | keyspace |
+| `tidb_ddl_reorg_max_write_speed` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_ddl_reorg_worker_cnt` | GLOBAL \| SESSION | the keyspace vardef snapshot | keyspace |
+| `tidb_enable_auto_analyze` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_enable_auto_analyze_priority_queue` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_enable_batch_dml` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_enable_batch_query_region` | GLOBAL | the process vardef static `ENABLE_BATCH_QUERY_REGION` | process |
+| `tidb_enable_binding_usage` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_enable_check_constraint` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_enable_collect_execution_info` | INSTANCE | the process configuration | process |
+| `tidb_enable_connection_event_log` | GLOBAL | the process vardef static `ENABLE_CONNECTION_EVENT_LOG` | process |
+| `tidb_enable_ddl` | INSTANCE | the process configuration | process |
+| `tidb_enable_dist_task` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_enable_fast_create_table` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_enable_foreign_key` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_enable_gc_aware_memory_track` | GLOBAL | the process memory tuner and arbitrator | process |
+| `tidb_enable_instance_plan_cache` | GLOBAL | the process vardef static `ENABLE_INSTANCE_PLAN_CACHE` | process |
+| `tidb_enable_local_txn` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_enable_noop_variables` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_enable_resource_control` | GLOBAL | the process TiKV client resource-control switch | process |
+| `tidb_enable_row_level_checksum` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_enable_slow_log` | INSTANCE | the process configuration | process |
+| `tidb_enable_stats_owner` | INSTANCE | the process configuration | process |
+| `tidb_enable_stmt_summary` | GLOBAL | the process statement summary | process |
+| `tidb_enable_tiflash_pipeline_model` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_enable_tmp_storage_on_oom` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_enable_ts_validation` | GLOBAL | the process TiKV client | process |
+| `tidb_enable_tso_follower_proxy` | GLOBAL | the process vardef static `ENABLE_TSO_FOLLOWER_PROXY` | process |
+| `tidb_expensive_query_time_threshold` | INSTANCE | the process vardef static `EXPENSIVE_QUERY_TIME_THRESHOLD` | process |
+| `tidb_expensive_txn_time_threshold` | INSTANCE | the process vardef static `EXPENSIVE_TXN_TIME_THRESHOLD` | process |
+| `tidb_external_ts` | GLOBAL | the process external timestamp slot | process |
+| `tidb_force_priority` | INSTANCE | the process vardef static `FORCE_PRIORITY` | process |
+| `tidb_general_log` | INSTANCE | the process vardef static `PROCESS_GENERAL_LOG` | process |
+| `tidb_generate_binary_plan` | GLOBAL | the process log and trace | process |
+| `tidb_gogc_tuner_max_value` | GLOBAL | the process memory tuner and arbitrator | process |
+| `tidb_gogc_tuner_min_value` | GLOBAL | the process memory tuner and arbitrator | process |
+| `tidb_gogc_tuner_threshold` | GLOBAL | the process vardef static `GOGC_TUNER_THRESHOLD` | process |
+| `tidb_ignore_inlist_plan_digest` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_instance_plan_cache_max_size` | GLOBAL | the process vardef static `INSTANCE_PLAN_CACHE_MAX_MEM_SIZE` | process |
+| `tidb_instance_plan_cache_reserved_percentage` | GLOBAL | the process vardef static `INSTANCE_PLAN_CACHE_RESERVED_PERCENTAGE` | process |
+| `tidb_log_file_max_days` | INSTANCE | the process configuration | process |
+| `tidb_low_resolution_tso_update_interval` | GLOBAL | the process vardef static `LOW_RESOLUTION_TSO_UPDATE_INTERVAL` | process |
+| `tidb_max_auto_analyze_time` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_max_delta_schema_count` | GLOBAL | the process vardef static `MAX_DELTA_SCHEMA_COUNT` (not yet per keyspace) | process |
+| `tidb_mem_arbitrator_mode` | GLOBAL | the process memory tuner and arbitrator | process |
+| `tidb_mem_arbitrator_soft_limit` | GLOBAL | the process memory tuner and arbitrator | process |
+| `tidb_mem_oom_action` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_mem_quota_analyze` | GLOBAL | the process memory tuner and arbitrator | process |
+| `tidb_mem_quota_binding_cache` | GLOBAL \| INSTANCE | the process vardef static `MEM_QUOTA_BINDING_CACHE` | process |
+| `tidb_memory_usage_alarm_keep_record_num` | GLOBAL | the process vardef static `MEMORY_USAGE_ALARM_KEEP_RECORD_NUM` | process |
+| `tidb_memory_usage_alarm_ratio` | GLOBAL | the process vardef static `MEMORY_USAGE_ALARM_RATIO` | process |
+| `tidb_mlog_log_slow_purge` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_paging_size_bytes` | GLOBAL \| SESSION | the keyspace vardef snapshot | keyspace |
+| `tidb_partition_prune_mode` | GLOBAL \| SESSION | none: a statement warning | keyspace |
+| `tidb_persist_analyze_options` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_pprof_sql_cpu` | INSTANCE | the process vardef static `ENABLE_P_PROF_SQLCPU` | process |
+| `tidb_prepared_plan_cache_memory_guard_ratio` | GLOBAL | the process vardef static `PREPARED_PLAN_CACHE_MEMORY_GUARD_RATIO` | process |
+| `tidb_query_log_max_len` | GLOBAL | the process vardef static `QUERY_LOG_MAX_LEN` | process |
+| `tidb_rc_read_check_ts` | INSTANCE | the process vardef static `ENABLE_RC_READ_CHECK_TS` | process |
+| `tidb_record_plan_in_slow_log` | INSTANCE | the process configuration | process |
+| `tidb_redact_log` | GLOBAL \| SESSION | the process log and trace | process |
+| `tidb_resource_control_strict_mode` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_schema_cache_size` | GLOBAL \| INSTANCE | the process vardef static `SCHEMA_CACHE_SIZE_ORIGIN_TEXT` | process |
+| `tidb_server_memory_limit` | GLOBAL \| INSTANCE | the process memory tuner and arbitrator | process |
+| `tidb_server_memory_limit_gc_trigger` | GLOBAL \| INSTANCE | the process memory tuner and arbitrator | process |
+| `tidb_server_memory_limit_sess_min_size` | GLOBAL | the process memory tuner and arbitrator | process |
+| `tidb_service_scope` | INSTANCE | the process vardef static `SERVICE_SCOPE` | process |
+| `tidb_slow_log_max_per_sec` | GLOBAL | the process log and trace | process |
+| `tidb_slow_log_rules` | GLOBAL \| SESSION | the process log and trace | process |
+| `tidb_slow_log_threshold` | INSTANCE | the process configuration | process |
+| `tidb_stats_cache_mem_quota` | GLOBAL \| INSTANCE | the process vardef static `STATS_CACHE_MEM_QUOTA` | process |
+| `tidb_stats_load_pseudo_timeout` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_stats_load_sync_wait` | GLOBAL \| SESSION | the keyspace vardef snapshot | keyspace |
+| `tidb_stmt_summary_group_by_user` | GLOBAL | the process statement summary | process |
+| `tidb_stmt_summary_history_size` | GLOBAL | the process statement summary | process |
+| `tidb_stmt_summary_internal_query` | GLOBAL | the process statement summary | process |
+| `tidb_stmt_summary_max_sql_length` | GLOBAL | the process statement summary | process |
+| `tidb_stmt_summary_max_stmt_count` | GLOBAL \| INSTANCE | the process statement summary | process |
+| `tidb_stmt_summary_persist_evicted` | GLOBAL | the process statement summary | process |
+| `tidb_stmt_summary_refresh_interval` | GLOBAL | the process statement summary | process |
+| `tidb_store_limit` | GLOBAL | the process TiKV client | process |
+| `tidb_table_cache_lease` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_top_sql_max_meta_count` | GLOBAL | the process Top SQL collector | process |
+| `tidb_top_sql_max_time_series_count` | GLOBAL | the process Top SQL collector | process |
+| `tidb_trace_event` | INSTANCE | the process log and trace | process |
+| `tidb_tso_client_batch_max_wait_time` | GLOBAL | the process vardef static `MAX_TSO_BATCH_WAIT_INTERVAL` | process |
+| `tidb_tso_client_rpc_mode` | GLOBAL | the process PD client | process |
+| `tidb_ttl_delete_batch_size` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_ttl_delete_rate_limit` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_ttl_delete_worker_count` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_ttl_job_enable` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_ttl_job_schedule_window_end_time` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_ttl_job_schedule_window_start_time` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_ttl_running_tasks` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_ttl_scan_batch_size` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_ttl_scan_worker_count` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_txn_commit_batch_size` | GLOBAL | the process TiKV client | process |
+| `tidb_txn_entry_size_limit` | GLOBAL \| SESSION | the keyspace vardef snapshot | keyspace |
+| `validate_password.length` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `validate_password.mixed_case_count` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `validate_password.number_count` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `validate_password.special_char_count` | GLOBAL | the keyspace vardef snapshot | keyspace |
+
+<!-- END generated: set-global hook destinations -->
 
 ### 6.4 Caches keyed by table or job ID
 

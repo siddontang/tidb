@@ -370,6 +370,11 @@ pub fn disable_resource_control() {
     global_resource_control().write().unwrap().enabled = false;
 }
 
+/// Whether the process-wide resource-control dispatch path is enabled.
+pub fn resource_control_enabled() -> bool {
+    global_resource_control().read().unwrap().enabled
+}
+
 /// Installs the controller used by enabled process-wide resource control.
 pub fn set_resource_control_interceptor(controller: ResourceGroupControllerHandle) {
     global_resource_control().write().unwrap().controller = Some(controller);

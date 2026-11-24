@@ -370,14 +370,21 @@ fn a_tenant_cannot_set_process_variables() {
         "set instance tidb_general_log = 1",
         "set tidb_general_log = 1",
         "set global tidb_expensive_query_time_threshold = 120",
+        // Hooks writing another crate's process state.
+        "set global tidb_mem_quota_analyze = 1073741824",
+        "set global tidb_top_sql_max_time_series_count = 77",
+        "set global tidb_enable_resource_control = off",
     ];
 
     tidb_keyspace::set_multi_keyspace_mode(true);
+    let resource_control_client = tikv_client::resource_control_enabled();
     for sql in process_variables {
         let (code, message) = refusal(&mut session, sql).unwrap_or_else(|| panic!("{sql} ran"));
         assert_eq!(code, 1227, "{sql}: {message}");
         assert!(message.contains("RESTRICTED_VARIABLES_ADMIN"), "{sql}: {message}");
     }
+    // The refused SET reached no process switch.
+    assert_eq!(tikv_client::resource_control_enabled(), resource_control_client);
     // The keyspace's own variables, and the session's.
     for sql in ["set global tidb_enable_foreign_key = off", "set global tidb_enable_foreign_key = on", "set tidb_mem_quota_query = 1073741824"] {
         assert_eq!(refusal(&mut session, sql), None, "{sql}");
@@ -393,6 +400,9 @@ fn a_tenant_cannot_set_process_variables() {
         "set global tidb_memory_usage_alarm_ratio = default",
         "set global tidb_general_log = 0",
         "set global tidb_expensive_query_time_threshold = default",
+        "set global tidb_mem_quota_analyze = default",
+        "set global tidb_top_sql_max_time_series_count = default",
+        "set global tidb_enable_resource_control = on",
     ] {
         assert_eq!(refusal(&mut session, sql), None, "{sql}");
     }

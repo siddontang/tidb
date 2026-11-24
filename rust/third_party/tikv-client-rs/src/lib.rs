@@ -304,7 +304,7 @@ pub use crate::region_request::{
 pub use crate::request::RetryOptions;
 #[doc(inline)]
 pub use crate::resource_control::{
-    disable_resource_control, enable_resource_control, set_resource_control_interceptor,
+    disable_resource_control, enable_resource_control, resource_control_enabled, set_resource_control_interceptor,
     unset_resource_control_interceptor, RequestInfo as ResourceControlRequestInfo,
     RequestWaitResult, ResourceGroupController, ResourceGroupControllerHandle,
     ResponseInfo as ResourceControlResponseInfo, ResponseWaitResult,

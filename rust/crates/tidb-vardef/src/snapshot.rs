@@ -132,7 +132,6 @@ vardef_snapshot! {
     run_auto_analyze: AtomicBool = RUN_AUTO_ANALYZE (AtomicBool::new(defaults::DEF_TIDB_ENABLE_AUTO_ANALYZE));
     enable_auto_analyze_priority_queue: AtomicBool = ENABLE_AUTO_ANALYZE_PRIORITY_QUEUE (AtomicBool::new(defaults::DEF_TIDB_ENABLE_AUTO_ANALYZE_PRIORITY_QUEUE));
     auto_analyze_concurrency: AtomicI64 = AUTO_ANALYZE_CONCURRENCY (AtomicI64::new(defaults::DEF_TIDB_AUTO_ANALYZE_CONCURRENCY));
-    enable_resource_control: AtomicBool = ENABLE_RESOURCE_CONTROL (AtomicBool::new(false));
     max_user_connections_value: std::sync::atomic::AtomicU32 = MAX_USER_CONNECTIONS_VALUE (std::sync::atomic::AtomicU32::new(defaults::DEF_MAX_USER_CONNECTIONS as u32));
     accelerate_user_creation_update: AtomicBool = ACCELERATE_USER_CREATION_UPDATE (AtomicBool::new(defaults::DEF_TIDB_ACCELERATE_USER_CREATION_UPDATE));
     enable_resource_control_strict_mode: AtomicBool = ENABLE_RESOURCE_CONTROL_STRICT_MODE (AtomicBool::new(defaults::DEF_TIDB_RESOURCE_CONTROL_STRICT_MODE));

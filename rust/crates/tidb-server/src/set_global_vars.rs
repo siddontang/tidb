@@ -35,8 +35,24 @@ use tidb_domain::global_sysvars::GlobalSysvars;
 
 use tidb_domain_core::node_config::NodeConfig;
 
-/// Applies the ported `setGlobalVars` writes to the node's sysvar registry.
+/// Applies the ported `setGlobalVars` writes to the node's sysvar registry
+/// and the process settings it seeds: what the node's first (configured)
+/// keyspace runtime runs.
 pub fn set_global_vars(config: &NodeConfig, globals: &GlobalSysvars) {
+    seed_registry(config, globals);
+    seed_process_settings(config);
+}
+
+/// [`set_global_vars`] for another keyspace of a multi-keyspace node: its
+/// registry only. The process settings were seeded once, by the configured
+/// keyspace's runtime, and may have been changed since by the operator; a
+/// later keyspace's open must not put the boot values back (design §6.3).
+pub fn set_global_vars_for_keyspace(config: &NodeConfig, globals: &GlobalSysvars) {
+    seed_registry(config, globals);
+}
+
+/// The `setGlobalVars` writes to a keyspace's sysvar registry.
+fn seed_registry(config: &NodeConfig, globals: &GlobalSysvars) {
     globals.set_sys_var("version", tidb_mysql::runtime_versions().server_version);
     globals.set_sys_var(
         "version_comment",
@@ -93,18 +109,12 @@ pub fn set_global_vars(config: &NodeConfig, globals: &GlobalSysvars) {
     // variable's `GetGlobal` reads back.
     if !instance.tidb_service_scope.is_empty() {
         let scope = instance.tidb_service_scope.to_lowercase();
-        tidb_vardef::set_service_scope(scope.clone());
         globals.set_sys_var(tidb_vardef::tidb_vars::TIDB_SERVICE_SCOPE, scope);
     }
     let source = &config.global_config;
     let on_off = |enabled: bool| if enabled { "ON" } else { "OFF" }.to_owned();
-    // Go `vardef.ForcePriority = int32(priority)`, then
-    // `variable.SetSysVar(vardef.TiDBForcePriority,
+    // Go `variable.SetSysVar(vardef.TiDBForcePriority,
     // mysql.Priority2Str[mysql.Str2Priority(cfg.Instance.ForcePriority)])`.
-    tidb_vardef::FORCE_PRIORITY.store(
-        tidb_mysql::priority_from_str(&instance.force_priority).as_enum(),
-        std::sync::atomic::Ordering::SeqCst,
-    );
     globals.set_sys_var(
         tidb_vardef::tidb_vars::TIDB_FORCE_PRIORITY,
         tidb_mysql::priority_from_str(&instance.force_priority)
@@ -153,6 +163,21 @@ pub fn set_global_vars(config: &NodeConfig, globals: &GlobalSysvars) {
     // client that asked that it had no limit at all. Connection poolers and
     // monitoring read this variable to size themselves.
     globals.set_sys_var("max_connections", config.max_connections.to_string());
+}
+
+/// The process settings `setGlobalVars` seeds directly, bypassing the
+/// registry: once per node.
+fn seed_process_settings(config: &NodeConfig) {
+    let instance = &config.global_config.instance;
+    // Go: `vardef.ServiceScope.Store(strings.ToLower(cfg.Instance.TiDBServiceScope))`.
+    if !instance.tidb_service_scope.is_empty() {
+        tidb_vardef::set_service_scope(instance.tidb_service_scope.to_lowercase());
+    }
+    // Go `vardef.ForcePriority = int32(priority)`.
+    tidb_vardef::FORCE_PRIORITY.store(
+        tidb_mysql::priority_from_str(&instance.force_priority).as_enum(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
     // `vardef.MemoryUsageAlarmRatio.Store(cfg.Instance.MemoryUsageAlarmRatio)`.
     // Keep this after the startup registry writes: publishing a registry
     // value refreshes the typed process globals, while Go's direct atomic
@@ -230,6 +255,63 @@ mod tests {
         assert_eq!(tidb_vardef::service_scope(), "background");
         assert_eq!(globals.get("tidb_service_scope").expect("readable"), "background");
         tidb_vardef::set_service_scope(String::new());
+    }
+
+    /// On a multi-keyspace node a later keyspace's open seeds only its own
+    /// registry (design §6.3): process settings the operator changed after
+    /// boot survive it, while the configured keyspace's `set_global_vars`
+    /// is what seeds them.
+    #[test]
+    fn a_later_keyspace_open_keeps_the_process_settings() {
+        use std::sync::atomic::Ordering::SeqCst;
+        struct Restore(f64, bool, u32);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                tidb_vardef::set_memory_usage_alarm_ratio(self.0);
+                tidb_vardef::PROCESS_GENERAL_LOG.store(self.1, SeqCst);
+                tidb_vardef::DDL_SLOW_OPR_THRESHOLD.store(self.2, SeqCst);
+            }
+        }
+        let _restore = Restore(
+            tidb_vardef::memory_usage_alarm_ratio(),
+            tidb_vardef::PROCESS_GENERAL_LOG.load(SeqCst),
+            tidb_vardef::DDL_SLOW_OPR_THRESHOLD.load(SeqCst),
+        );
+        let config = NodeConfig::with_defaults(
+            |config| {
+                config.store = tidb_config::store::StoreType("unistore".to_owned());
+                config.port = 4159;
+            },
+            NodeOptions::default(),
+        )
+        .expect("parses");
+        // The operator changes process settings at runtime.
+        tidb_vardef::set_memory_usage_alarm_ratio(0.37);
+        tidb_vardef::PROCESS_GENERAL_LOG.store(!config.global_config.instance.tidb_general_log, SeqCst);
+        tidb_vardef::DDL_SLOW_OPR_THRESHOLD.store(config.global_config.instance.ddl_slow_opr_threshold + 77, SeqCst);
+        let operator = (
+            tidb_vardef::memory_usage_alarm_ratio(),
+            tidb_vardef::PROCESS_GENERAL_LOG.load(SeqCst),
+            tidb_vardef::DDL_SLOW_OPR_THRESHOLD.load(SeqCst),
+        );
+
+        // Another keyspace opens: its registry is seeded, the process kept.
+        let tenant = GlobalSysvars::before_domain().with_keyspace_vardef();
+        set_global_vars_for_keyspace(&config, &tenant);
+        assert_eq!(tenant.get("port").expect("readable"), "4159");
+        assert_eq!(
+            (
+                tidb_vardef::memory_usage_alarm_ratio(),
+                tidb_vardef::PROCESS_GENERAL_LOG.load(SeqCst),
+                tidb_vardef::DDL_SLOW_OPR_THRESHOLD.load(SeqCst),
+            ),
+            operator
+        );
+
+        // The configured keyspace's seeding does set them.
+        set_global_vars(&config, &GlobalSysvars::before_domain());
+        assert_eq!(tidb_vardef::PROCESS_GENERAL_LOG.load(SeqCst), config.global_config.instance.tidb_general_log);
+        assert_eq!(tidb_vardef::DDL_SLOW_OPR_THRESHOLD.load(SeqCst), config.global_config.instance.ddl_slow_opr_threshold);
     }
 
     /// `TestSetGlobalVars` (`cmd/tidb-server/main_test.go:97`), transcreated

@@ -123,7 +123,7 @@ pub const PROCESS_STATICS: &[ProcessStatic] = &[
     ProcessStatic { name: "RUN_AUTO_ANALYZE", sysvar: Some("tidb_enable_auto_analyze"), scope: StaticScope::Global, governs: "the keyspace's auto-analyze" },
     ProcessStatic { name: "ENABLE_AUTO_ANALYZE_PRIORITY_QUEUE", sysvar: Some("tidb_enable_auto_analyze_priority_queue"), scope: StaticScope::Global, governs: "the keyspace's auto-analyze" },
     ProcessStatic { name: "AUTO_ANALYZE_CONCURRENCY", sysvar: Some("tidb_auto_analyze_concurrency"), scope: StaticScope::Global, governs: "the keyspace's auto-analyze" },
-    ProcessStatic { name: "ENABLE_RESOURCE_CONTROL", sysvar: Some("tidb_enable_resource_control"), scope: StaticScope::Global, governs: "the keyspace's resource groups" },
+    ProcessStatic { name: "ENABLE_RESOURCE_CONTROL", sysvar: Some("tidb_enable_resource_control"), scope: StaticScope::Instance, governs: "the process TiKV client's resource-control switch" },
     ProcessStatic { name: "MAX_USER_CONNECTIONS_VALUE", sysvar: Some("max_user_connections"), scope: StaticScope::Global, governs: "the keyspace's accounts" },
     ProcessStatic { name: "ACCELERATE_USER_CREATION_UPDATE", sysvar: Some("tidb_accelerate_user_creation_update"), scope: StaticScope::Global, governs: "the keyspace's privilege cache" },
     ProcessStatic { name: "ENABLE_RESOURCE_CONTROL_STRICT_MODE", sysvar: Some("tidb_resource_control_strict_mode"), scope: StaticScope::Global, governs: "the keyspace's resource groups" },

@@ -56,6 +56,17 @@ fn other_value(name: &str) -> String {
     }
 }
 
+/// The kept statics whose variable no keyspace can change in this test, and
+/// why. A listed variable must really refuse the value (so the list cannot
+/// go stale), and an unlisted one must change.
+fn expected_refusal(sysvar: &str) -> Option<&'static str> {
+    // The nextgen read-only variables (Go `IsReadOnlyVarInNextGen`) are
+    // refused by the SQL layer; their tables take the value, so they are
+    // verified here like the rest.
+    (sysvar == "tidb_enable_auto_analyze_priority_queue")
+        .then_some("deprecated: Go refuses OFF and the default is ON")
+}
+
 /// For each global static a keyspace keeps: a keyspace that owns its values
 /// changes its own variable and neither the process statics (the configured
 /// keyspace's values) nor any other keyspace's; and the configured keyspace
@@ -66,21 +77,28 @@ fn set_global_in_one_keyspace_leaves_the_others_alone() {
     let tenant = GlobalSysvars::new().with_keyspace_vardef();
     let other_tenant = GlobalSysvars::new().with_keyspace_vardef();
     let mut checked = Vec::new();
+    let mut refused = Vec::new();
     for name in SNAPSHOT_STATICS {
         let sysvar = PROCESS_STATICS.iter().find(|entry| entry.name == *name).unwrap().sysvar.unwrap();
-        if tidb_config_kerneltype::is_next_gen() && tidb_vardef::is_read_only_var_in_next_gen(sysvar) {
-            continue;
+        if sysvar == "tidb_auto_analyze_concurrency" {
+            // Its validation requires both auto-analyze switches of the
+            // table being written; earlier iterations may have turned them
+            // off.
+            for table in [&configured, &tenant, &other_tenant] {
+                table.set("tidb_enable_auto_analyze", "ON".to_owned()).unwrap();
+            }
         }
         let value = other_value(sysvar);
         let before = configured.get(sysvar).unwrap();
         let other_before = other_tenant.get(sysvar).unwrap();
 
         if let Err(error) = tenant.set(sysvar, value.clone()) {
-            // A variable no keyspace can change (Go refuses the value
-            // everywhere, e.g. a deprecated switch).
-            assert!(configured.set(sysvar, value.clone()).is_err(), "{sysvar}={value}: {error:?}");
+            let reason = expected_refusal(sysvar).unwrap_or_else(|| panic!("{sysvar}={value} refused: {error:?}"));
+            assert!(configured.set(sysvar, value.clone()).is_err(), "{sysvar}: {reason}, in every keyspace");
+            refused.push(sysvar);
             continue;
         }
+        assert!(expected_refusal(sysvar).is_none(), "{sysvar} changed: drop it from the expected refusals");
         let changed = tenant.get(sysvar).unwrap();
         assert_ne!(changed, before, "{sysvar}: the tenant's SET GLOBAL took effect");
         assert_eq!(configured.get(sysvar).unwrap(), before, "{sysvar}: the process statics are unchanged");
@@ -91,8 +109,10 @@ fn set_global_in_one_keyspace_leaves_the_others_alone() {
         assert_eq!(other_tenant.get(sysvar).unwrap(), other_before, "{sysvar}: the process statics are not a tenant's");
         checked.push(sysvar);
     }
+    // Every kept static was either verified or refused for a listed reason.
+    assert_eq!(checked.len() + refused.len(), SNAPSHOT_STATICS.len());
     assert!(checked.contains(&"tidb_enable_foreign_key"));
-    assert!(checked.len() >= 40, "{checked:?}");
+    assert!(checked.contains(&"tidb_auto_analyze_concurrency"));
 
     // The snapshot itself: the tenant's hook wrote its own static.
     use std::sync::atomic::Ordering::SeqCst;
