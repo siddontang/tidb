@@ -4194,10 +4194,12 @@ impl tidb_planner::plan_builder::stmt_build::SessionPlanContext for Session {
                 .map(|value| tidb_variable::varsutil::parse_analyze_skip_column_types(&value))
                 .unwrap_or_default(),
             // Go `vardef.PersistAnalyzeOptions` / `vardef.AnalyzeColumnOptions`:
-            // process-wide, set by the global variables' hooks.
-            persist_analyze_options: tidb_vardef::PERSIST_ANALYZE_OPTIONS.load(std::sync::atomic::Ordering::SeqCst),
+            // the session's keyspace's, set by the global variables' hooks.
+            persist_analyze_options: vars.vardef().persist_analyze_options().load(std::sync::atomic::Ordering::SeqCst),
             analyze_column_options: {
-                let value = tidb_vardef::ANALYZE_COLUMN_OPTIONS
+                let value = vars
+                    .vardef()
+                    .analyze_column_options()
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();

@@ -38,6 +38,9 @@ use tidb_sessmgr::processinfo::{ProcessInfo, SessionManager};
 pub struct Handle {
     exit: Mutex<Receiver<()>>,
     sm: Mutex<Option<Arc<dyn SessionManager>>>,
+    /// The keyspace's values of the vardef global statics (Go
+    /// `vardef.MaxAutoAnalyzeTime`), design §6.3.
+    vardef: Arc<tidb_vardef::VardefSnapshot>,
 }
 
 /// The log times Go stores on `ProcessInfo`, per connection.
@@ -56,7 +59,15 @@ impl Handle {
         Self {
             exit: Mutex::new(exit),
             sm: Mutex::new(None),
+            vardef: tidb_vardef::snapshot::process(),
         }
+    }
+
+    /// The handle of a domain whose keyspace's settings are `vardef`.
+    #[must_use]
+    pub fn with_vardef(mut self, vardef: Arc<tidb_vardef::VardefSnapshot>) -> Self {
+        self.vardef = vardef;
+        self
     }
 
     /// Go `Handle.SetSessionManager`.
@@ -101,6 +112,7 @@ impl Handle {
             }
             check_processes(
                 sm.as_ref(),
+                &self.vardef,
                 threshold,
                 txn_threshold,
                 need_metrics,
@@ -160,6 +172,7 @@ fn since(info: &ProcessInfo) -> Duration {
 /// One tick of Go `Handle.Run` over the process list.
 fn check_processes(
     sm: &dyn SessionManager,
+    vardef: &tidb_vardef::VardefSnapshot,
     threshold: u64,
     txn_threshold: u64,
     need_metrics: bool,
@@ -241,7 +254,7 @@ fn check_processes(
         }
         if tidb_stats_handle_util::GLOBAL_AUTO_ANALYZE_PROCESS_LIST.contains(info.id) {
             let max_auto_analyze_time =
-                tidb_vardef::MAX_AUTO_ANALYZE_TIME.load(std::sync::atomic::Ordering::SeqCst);
+                vardef.max_auto_analyze_time().load(std::sync::atomic::Ordering::SeqCst);
             if max_auto_analyze_time > 0
                 && cost_time > Duration::from_secs(max_auto_analyze_time.unsigned_abs())
             {

@@ -141,6 +141,9 @@ pub struct ServiceHelper {
     pub is_auto_analyze_stopped: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Go `reportMetrics` and its observers.
     pub metrics: Arc<dyn MVMetricsReporter>,
+    /// The keyspace's values of the vardef global statics (Go
+    /// `vardef.RunAutoAnalyze`), design §6.3.
+    pub vardef: Arc<tidb_vardef::VardefSnapshot>,
 }
 
 /// The service's [`SessionPool`] over system sessions.
@@ -565,9 +568,9 @@ impl ServiceHelper {
     }
 
     /// Go `mlogAnalyzeStopped`.
-    fn mlog_analyze_stopped(&self, ctx: &Context) -> bool {
+    pub(crate) fn mlog_analyze_stopped(&self, ctx: &Context) -> bool {
         ctx.err().is_some()
-            || !tidb_vardef::RUN_AUTO_ANALYZE.load(std::sync::atomic::Ordering::SeqCst)
+            || !self.vardef.run_auto_analyze().load(std::sync::atomic::Ordering::SeqCst)
             || self.is_auto_analyze_stopped.as_ref().is_some_and(|stopped| stopped())
     }
 
@@ -608,6 +611,7 @@ impl ServiceHelper {
             sys_proc_tracker: None,
             is_auto_analyze_stopped: None,
             metrics: Arc::new(crate::mvservice_test::MockMVServiceHelper::default()),
+            vardef: tidb_vardef::snapshot::process(),
         }
     }
 
@@ -1371,6 +1375,7 @@ pub fn register_mv_service(
     sys_proc_tracker: Option<SysProcTracker>,
     is_auto_analyze_stopped: Arc<dyn Fn() -> bool + Send + Sync>,
     on_ddl_handled: Arc<dyn Fn() + Send + Sync>,
+    vardef: Arc<tidb_vardef::VardefSnapshot>,
 ) -> Arc<MVService> {
     let mut cfg = crate::service_settings::default_mv_service_config();
     cfg.task_backpressure = crate::service::TaskBackpressureConfig {
@@ -1385,6 +1390,7 @@ pub fn register_mv_service(
         sys_proc_tracker,
         is_auto_analyze_stopped: Some(is_auto_analyze_stopped),
         metrics: Arc::new(crate::metrics_reporter::MetricsReporter::default()),
+        vardef,
     };
     let mv_service = crate::service_settings::new_mv_service(ctx, se, Arc::new(helper), cfg);
     mv_service.notify_ddl_change(); // Trigger one startup refresh so in-memory state catches up with metadata.

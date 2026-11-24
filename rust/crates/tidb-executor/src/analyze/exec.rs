@@ -270,7 +270,8 @@ pub trait AnalyzeExec: crate::show::exec::ShowExec {
         // Go `buildAnalyze`: "auto " when the session is `InRestrictedSQL`.
         statement.auto_analyze = self.session_vars().restricted_sql;
         // Go `vardef.PersistAnalyzeOptions`.
-        statement.persist_options = tidb_vardef::PERSIST_ANALYZE_OPTIONS.load(std::sync::atomic::Ordering::SeqCst);
+        statement.persist_options =
+            self.session_vars().vardef().persist_analyze_options().load(std::sync::atomic::Ordering::SeqCst);
         statement.dynamic_partition_prune = !self
             .session_vars()
             .partition_prune_mode().eq_ignore_ascii_case("static");

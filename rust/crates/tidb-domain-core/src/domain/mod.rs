@@ -1105,6 +1105,7 @@ impl Domain {
                 Ok(())
             }
         }));
+        let vardef = global_vars.vardef();
         let stats_usage = Arc::new(tidb_stats_handle_usage::StatsUsageHandle::new());
         stats_usage.start_worker();
         let data_lock_waits = Arc::new(ClusterDataLockWaits {
@@ -1181,9 +1182,9 @@ impl Domain {
             ttl_job_manager: std::sync::OnceLock::new(),
             mv_service: std::sync::OnceLock::new(),
             signing_cert_loop: std::sync::OnceLock::new(),
-            expensive_query_handle: Arc::new(tidb_expensivequery::Handle::new(
-                expensive_query_exited,
-            )),
+            expensive_query_handle: Arc::new(
+                tidb_expensivequery::Handle::new(expensive_query_exited).with_vardef(vardef),
+            ),
             expensive_query_exit: Mutex::new(Some(expensive_query_exit)),
             closed: std::sync::atomic::AtomicBool::new(false),
             approximate_table_counts,
@@ -2131,8 +2132,9 @@ impl AutoAnalyzeWorker {
                 let Some(factory) = weak.upgrade() else {
                     return;
                 };
+                // The keyspace's auto-analyze switch (design §6.3).
                 factory.handle_auto_analyze_tick(
-                    tidb_vardef::RUN_AUTO_ANALYZE.load(std::sync::atomic::Ordering::SeqCst),
+                    factory.vardef().run_auto_analyze().load(std::sync::atomic::Ordering::SeqCst),
                     stats_lease,
                 );
             })

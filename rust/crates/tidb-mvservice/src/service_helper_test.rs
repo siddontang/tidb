@@ -2030,6 +2030,7 @@ fn test_register_mv_service_bootstrap_and_ddl_handler() {
         Arc::new(move || {
             called_add.fetch_add(1, SeqCst);
         }),
+        tidb_vardef::snapshot::process(),
     );
     stopped.store(true, SeqCst);
     // Go `svc.mh.(*serviceHelper).isAutoAnalyzeStopped()`: a stopped helper
@@ -2105,4 +2106,29 @@ impl tidb_ddl_notifier::NotifierSession for NoNotifierSession {
     }
 
     fn rollback(&mut self) {}
+}
+
+/// A keyspace's materialized-view log analysis follows its own
+/// `tidb_enable_auto_analyze` (multi-keyspace design §6.3), not the process
+/// statics' (the configured keyspace's).
+#[test]
+fn mlog_analysis_follows_the_keyspace_auto_analyze_switch() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let _serial = crate::test_helpers_test::serial();
+    let _run = RunAutoAnalyzeGuard::set(true);
+    let ctx = Context::background();
+
+    let mut tenant = crate::service_helper::ServiceHelper::new_for_test();
+    tenant.vardef = Arc::new(tidb_vardef::VardefSnapshot::per_keyspace());
+    tenant.vardef.run_auto_analyze().store(false, SeqCst);
+    assert!(tenant.mlog_analyze_stopped(&ctx), "the tenant turned auto-analyze off");
+
+    let configured = crate::service_helper::ServiceHelper::new_for_test();
+    assert!(!configured.mlog_analyze_stopped(&ctx), "the process switch is on");
+
+    // And the other way round.
+    tidb_vardef::RUN_AUTO_ANALYZE.store(false, SeqCst);
+    tenant.vardef.run_auto_analyze().store(true, SeqCst);
+    assert!(!tenant.mlog_analyze_stopped(&ctx));
+    assert!(configured.mlog_analyze_stopped(&ctx));
 }

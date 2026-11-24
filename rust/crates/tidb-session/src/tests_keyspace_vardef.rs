@@ -128,3 +128,31 @@ fn ttl_decisions_follow_the_keyspace_settings() {
         assert!(in_window, "the default window is the whole day");
     }
 }
+
+/// Statistics (reader batch 2): a keyspace's `tidb_persist_analyze_options`
+/// decides whether its ANALYZE stores its options, not the configured
+/// keyspace's.
+#[test]
+fn analyze_persists_options_by_the_keyspace_setting() {
+    let users = ConfiguredUserStore::parse("root\t%\tmysql_native_password\t\n")
+        .unwrap()
+        .with_global_vars(tidb_domain::global_sysvars::GlobalSysvars::new().with_keyspace_vardef());
+    let tenant = MockStoreDomain::create_with_users(Arc::new(users)).unwrap();
+    tenant
+        .new_session()
+        .unwrap()
+        .run("set global tidb_persist_analyze_options = off")
+        .unwrap();
+    let configured = MockStoreDomain::create().unwrap();
+    assert!(tidb_vardef::PERSIST_ANALYZE_OPTIONS.load(std::sync::atomic::Ordering::SeqCst));
+
+    let persisted = |store: &Arc<MockStoreDomain>| {
+        let mut session = store.new_session().unwrap();
+        for sql in ["use test", "create table t (a int, key (a))", "insert into t values (1), (2), (3)", "analyze table t with 2 buckets"] {
+            session.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        }
+        crate::tests_support::row_text(session.run("select count(*) from mysql.analyze_options"))
+    };
+    assert_eq!(persisted(&tenant), [["0"]], "the tenant keeps no analyze options");
+    assert_eq!(persisted(&configured), [["1"]], "the configured keyspace keeps them");
+}

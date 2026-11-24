@@ -133,6 +133,8 @@ impl Domain {
                 Arc::new(move || {
                     let _ = on_ddl_handled_tx.try_send(());
                 }),
+                // The keyspace's auto-analyze switch (design §6.3).
+                self.vardef(),
             );
             register_mv_service_sysvar_hooks(&self.global_vars, &service);
             let ddl_handler = ddl_handler.expect("RegisterMVService registers its DDL handler");
