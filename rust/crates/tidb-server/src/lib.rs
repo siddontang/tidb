@@ -159,6 +159,9 @@ pub use sql_node::{
 pub fn run_configured_node(config: NodeConfig) -> Result<(), RunConfiguredNodeError> {
     tidb_traceevent::register_with_client_go();
     crate::install_process_globals(&config);
+    // Before the logger is built: a multi-keyspace node labels log records by
+    // tenant instead of with the configured keyspace (design §6.1).
+    tidb_keyspace::set_multi_keyspace_mode(crate::keyspace_registry::MultiKeyspaceDev::for_node(&config).is_some());
     setup_log()?;
     setup_extensions()?;
     // Go `main`: `signal.SetupUSR1Handler()` before `registerStores`.
@@ -223,11 +226,12 @@ fn setup_log() -> Result<(), RunConfiguredNodeError> {
     log_config.config.disable_error_verbose = log.disable_error_verbose;
     log_config.config.timeout = log.timeout;
     // `keyspace.WrapZapcoreWithKeyspace`: entries carry `keyspaceName` only
-    // when a keyspace is configured. Process-level: the logger is built
-    // once, before any keyspace runtime opens, so it names the configured
-    // keyspace (multi-keyspace design §6.1).
+    // when a keyspace is configured. A multi-keyspace node serves several
+    // keyspaces, so its process-wide records carry none; a connection's or
+    // a runtime's records carry their tenant instead
+    // (`tidb_logutil::enter_tenant`, multi-keyspace design §6.1).
     let keyspace_name = tidb_keyspace::get_keyspace_name_by_settings();
-    let core_fields = if tidb_keyspace::is_keyspace_name_empty(&keyspace_name) {
+    let core_fields = if tidb_keyspace::is_multi_keyspace_mode() || tidb_keyspace::is_keyspace_name_empty(&keyspace_name) {
         Vec::new()
     } else {
         vec![tidb_log::Field::new(

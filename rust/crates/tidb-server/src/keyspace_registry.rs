@@ -71,6 +71,15 @@ impl MultiKeyspaceDev {
         Some(Self::new(&allow, std::env::var(MULTI_KEYSPACE_DEV_ROOT_PASSWORD_ENV).ok()))
     }
 
+    /// [`Self::from_env`] for `config`'s node: only a TiKV node serves
+    /// keyspaces through a registry.
+    pub(crate) fn for_node(config: &NodeConfig) -> Option<Self> {
+        if config.store_kind != tidb_domain_core::node_config::StoreKind::TiKv {
+            return None;
+        }
+        Self::from_env(&config.global_config.keyspace_name)
+    }
+
     fn new(allow: &str, root_password: Option<String>) -> Self {
         let allow = allow
             .split(',')
@@ -307,6 +316,9 @@ impl Opener {
         &self,
         keyspace: &str,
     ) -> Result<(KeyspaceRuntime, ProductionReadProcessAuthority), RunConfiguredNodeError> {
+        // The open's records (bootstrap, loaders, provisioning) are the
+        // tenant's (design §6.1).
+        let _tenant = tidb_logutil::enter_tenant(keyspace);
         let mut config = self.base_config.clone();
         config.global_config.keyspace_name = keyspace.to_owned();
         // The node's status port serves its configured keyspace's AutoID

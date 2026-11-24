@@ -38,7 +38,10 @@ pub mod file_sink;
 pub mod hex;
 mod log_bridge;
 pub mod observer;
+mod tenant;
 mod tracing_bridge;
+
+pub use tenant::{current_tenant, enter_tenant, TenantGuard};
 
 use std::collections::HashMap;
 use std::io;
@@ -388,7 +391,10 @@ fn init_global(
     let output = build_output(&cfg.config.file, &sink);
     let (gl, props) =
         tidb_log::init_logger_with_write_syncer(&cfg.config, Arc::clone(&output), output)?;
+    // A thread working for a tenant stamps its records with it (see
+    // [`enter_tenant`]); a thread that entered none writes them unchanged.
     let gl = gl
+        .wrap_core(|core| Arc::new(tenant::TenantCore(core)))
         .with_options(LoggerOptions::default().with_stacktrace_level(Level::Fatal))
         .with_fields(core_fields);
     let _ = tidb_log::replace_globals(gl.clone());
@@ -890,6 +896,59 @@ mod tests {
 
         let core_pattern = format!(r"{PATTERN_BASE} \[coreKey=.*\] (\[.*=.*\])");
         test_logger_output(&bg_logger(), &filename, &core_pattern);
+    }
+
+    /// On a multi-keyspace node (design §6.1) a record carries the tenant
+    /// the writing thread works for: a connection of `keyspace2` and one of
+    /// `keyspace1` stamp their own keyspace on the same operation's record,
+    /// and a process-wide record carries none. A single-keyspace node's
+    /// records are unchanged: the core field alone, as Go's
+    /// `WrapZapcoreWithKeyspace` writes it.
+    #[test]
+    fn records_carry_the_writing_threads_tenant() {
+        let _g = guard();
+        let filename = temp_file("zap_log_tenant.log");
+        let file_cfg = FileLogConfig {
+            filename: filename.clone(),
+            max_size: 4096,
+            ..Default::default()
+        };
+        let conf = new_log_config("info", DEFAULT_LOG_FORMAT, "", "", file_cfg, false);
+        let operation = |conn: i64| {
+            bg_logger().info("CRUCIAL OPERATION", &[Field::new("conn", Value::I64(conn))]);
+        };
+
+        // A multi-keyspace node: no core keyspace field.
+        init_logger_with_core_fields(&conf, &[]).unwrap();
+        {
+            let _tenant = enter_tenant("keyspace2");
+            operation(2);
+            {
+                let _inner = enter_tenant("keyspace1");
+                operation(1);
+            }
+            operation(3);
+        }
+        operation(4);
+        let content = std::fs::read_to_string(&filename).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 4, "{content}");
+        assert!(lines[0].ends_with("[\"CRUCIAL OPERATION\"] [conn=2] [keyspaceName=keyspace2]"), "{}", lines[0]);
+        assert!(lines[1].ends_with("[\"CRUCIAL OPERATION\"] [conn=1] [keyspaceName=keyspace1]"), "{}", lines[1]);
+        assert!(lines[2].ends_with("[\"CRUCIAL OPERATION\"] [conn=3] [keyspaceName=keyspace2]"), "{}", lines[2]);
+        assert!(lines[3].ends_with("[\"CRUCIAL OPERATION\"] [conn=4]"), "{}", lines[3]);
+        assert_eq!(current_tenant(), None);
+        let _ = std::fs::remove_file(&filename);
+
+        // A single-keyspace node: the core field, no tenant entered.
+        init_logger_with_core_fields(&conf, &[Field::new("keyspaceName", Value::Str("keyspace1".into()))]).unwrap();
+        operation(5);
+        let content = std::fs::read_to_string(&filename).unwrap();
+        assert!(
+            content.trim_end().ends_with("[\"CRUCIAL OPERATION\"] [keyspaceName=keyspace1] [conn=5]"),
+            "{content}"
+        );
+        let _ = std::fs::remove_file(&filename);
     }
 
     // Go TestFieldsFromTraceInfo.

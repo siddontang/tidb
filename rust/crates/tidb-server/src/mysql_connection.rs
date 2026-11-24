@@ -1637,6 +1637,9 @@ fn serve_connection_inner<F: QuerySessionFactory>(
     let keyspace = factory
         .keyspace_context()
         .unwrap_or_else(|| Arc::new(tidb_keyspace::KeyspaceContext::unbound()));
+    // On a multi-keyspace node the connection's records carry its tenant
+    // (design §6.1); its thread serves it to the end.
+    let _tenant = tidb_keyspace::is_multi_keyspace_mode().then(|| tidb_logutil::enter_tenant(keyspace.name()));
     let decision = check_auth_plugin(
         &server_plugin,
         &mut client_plugin,

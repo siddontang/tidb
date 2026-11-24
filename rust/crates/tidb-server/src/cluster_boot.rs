@@ -124,12 +124,18 @@ pub(crate) fn run_cluster_session_node_with_spill(
     spill_storage: Arc<tidb_spill_storage::SpillStorage>,
     memory_arbitrator: Option<Arc<tidb_memory::MemArbitrator>>,
 ) -> Result<(), RunConfiguredNodeError> {
-    let multi_keyspace = crate::keyspace_registry::MultiKeyspaceDev::from_env(&config.global_config.keyspace_name)
+    let multi_keyspace = crate::keyspace_registry::MultiKeyspaceDev::for_node(&config)
         .map(|dev| (dev, Arc::clone(&spill_storage), memory_arbitrator.clone()));
     // Before the first runtime opens: each runtime's username policy then
     // prefixes its tenant's accounts (design §6.1).
     tidb_keyspace::set_multi_keyspace_mode(multi_keyspace.is_some());
+    // On a multi-keyspace node the configured keyspace's open is that
+    // tenant's (design §6.1).
+    let tenant = multi_keyspace
+        .is_some()
+        .then(|| tidb_logutil::enter_tenant(&config.global_config.keyspace_name));
     let (runtime, authority) = KeyspaceRuntime::open(&config, spill_storage, memory_arbitrator)?;
+    drop(tenant);
     // Go `main`: `if deploymode.IsStarter() { externalWorkloadManager :=
     // initExternalWorkloadManager(ctx, storage); defer close... }`.
     let _external_workload_manager = tidb_config_deploymode::is_starter()
