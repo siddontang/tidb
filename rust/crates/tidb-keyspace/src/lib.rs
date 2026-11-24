@@ -377,12 +377,19 @@ mod tests {
     }
 
     // Go `TestNoKeyspaceNameSet`'s name-side assertions: with no keyspace
-    // configured the name is empty and no log field is produced.
+    // configured the name is empty and no log field is produced. The fixture
+    // configures none explicitly: a nextgen test build starts from SYSTEM
+    // (Go `initByLDFlags`). No other test of this binary reads the
+    // configured keyspace.
     #[test]
     fn an_unset_keyspace_name_is_empty() {
+        let restore = tidb_config::config_tree::config::restore_func();
+        tidb_config::config_tree::config::update_global(|config| config.keyspace_name.clear());
         let name = get_keyspace_name_by_settings();
+        let log_field = keyspace_name_log_field();
+        restore();
         assert!(is_keyspace_name_empty(&name));
-        assert!(keyspace_name_log_field().is_none());
+        assert!(log_field.is_none());
         // On a classic kernel the bytes are Go's nil slice.
         if !kerneltype::is_next_gen() {
             assert!(get_keyspace_name_bytes_by_settings().is_none());

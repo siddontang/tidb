@@ -282,12 +282,12 @@ fn refusal(session: &mut Session, sql: &str) -> Option<(u16, String)> {
     })
 }
 
-/// A multi-keyspace node refuses IMPORT INTO, its job statements, BR and
-/// PLAN REPLAYER with `ER_NOT_SUPPORTED_YET` (1235) before they reach the
+/// A multi-keyspace node refuses IMPORT INTO, its job statements, BR (and
+/// its job listings) and PLAN REPLAYER with `ER_NOT_SUPPORTED_YET` (1235) before they reach the
 /// process-wide import store, DXF task managers, BRIE node or external
 /// storage (design §10 phase 2, until phase 3f moves them into each keyspace
-/// runtime). The counting import store sees no call, and no statement
-/// reports the missing task manager it would have consulted. A
+/// runtime). The counting import store and the BRIE queue see no access,
+/// and no statement reports the missing task manager it would have consulted. A
 /// single-keyspace node runs the same statements as before: they reach the
 /// import store and the task manager.
 #[test]
@@ -314,8 +314,15 @@ fn a_multi_keyspace_node_refuses_import_br_and_plan_replayer() {
         "cancel import job 1",
         "backup database * to 'local:///tmp/br-multi-keyspace'",
         "restore database * from 'local:///tmp/br-multi-keyspace'",
+        "show backups",
+        "show restores",
+        "show br job 1",
+        "show br job query 1",
+        "cancel br job 1",
         "plan replayer dump explain select a from t",
     ];
+    let brie_queue = &*tidb_executor::brie::GLOBAL_BRIE_QUEUE;
+    let brie_accesses = brie_queue.accesses();
     tidb_keyspace::set_multi_keyspace_mode(true);
     for sql in statements {
         let (code, message) = refusal(&mut session, sql).unwrap_or_else(|| panic!("{sql} ran"));
@@ -323,6 +330,7 @@ fn a_multi_keyspace_node_refuses_import_br_and_plan_replayer() {
         assert!(message.ends_with("on a multi-keyspace node'"), "{sql}: {message}");
     }
     assert_eq!(import_store.calls(), 0);
+    assert_eq!(brie_queue.accesses(), brie_accesses);
 
     // A single-keyspace node goes on to the task manager and the import store.
     tidb_keyspace::set_multi_keyspace_mode(false);
@@ -336,5 +344,6 @@ fn a_multi_keyspace_node_refuses_import_br_and_plan_replayer() {
         Some("task manager is not initialized")
     );
     assert!(import_store.calls() > 0);
+    assert!(brie_queue.accesses() > brie_accesses);
     tidb_dxf_importinto::set_import_store(None);
 }

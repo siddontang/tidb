@@ -145,6 +145,10 @@ pub struct BrieQueue {
     last_clear_time: Mutex<Option<Instant>>,
     worker_tx: crossbeam_channel::Sender<()>,
     worker_rx: crossbeam_channel::Receiver<()>,
+    /// How many times a statement reached the queue's jobs (registered,
+    /// queried, cancelled or listed one), for tests that assert a statement
+    /// never did.
+    accesses: std::sync::atomic::AtomicUsize,
 }
 
 /// Go `globalBRIEQueue`.
@@ -160,10 +164,20 @@ impl BrieQueue {
             last_clear_time: Mutex::new(None),
             worker_tx,
             worker_rx,
+            accesses: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+    /// How many times a statement reached the queue's jobs.
+    #[doc(hidden)]
+    pub fn accesses(&self) -> usize {
+        self.accesses.load(Ordering::SeqCst)
+    }
+    fn accessed(&self) {
+        self.accesses.fetch_add(1, Ordering::SeqCst);
     }
     /// Go `brieQueue.registerTask`.
     pub fn register_task(&self, ctx: &Context, mut info: BrieTaskInfo) -> (Context, u64) {
+        self.accessed();
         let (ctx, cancel) = Context::with_cancel(ctx);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
         info.id = id;
@@ -179,6 +193,7 @@ impl BrieQueue {
     }
     /// Go `brieQueue.queryTask`.
     pub fn query_task(&self, id: u64) -> Option<Arc<Mutex<BrieTaskInfo>>> {
+        self.accessed();
         self.tasks
             .lock()
             .unwrap()
@@ -203,6 +218,7 @@ impl BrieQueue {
     }
     /// Go `brieQueue.cancelTask`: retain the row after cancelling.
     pub fn cancel_task(&self, id: u64) -> bool {
+        self.accessed();
         let tasks = self.tasks.lock().unwrap();
         let Some(item) = tasks.get(&id) else {
             return false;
@@ -233,6 +249,7 @@ impl BrieQueue {
     }
     /// Go `ShowExec.fetchShowBRIE`: fetch BEFORE opportunistic cleanup.
     pub fn fetch_show_brie(&self, kind: BrieKind) -> Vec<Vec<Datum>> {
+        self.accessed();
         let rows = self
             .tasks
             .lock()

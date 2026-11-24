@@ -942,6 +942,11 @@ pub trait PlanReplayerCapture: crate::sessionctx::SessionContext + crate::plan_r
         plan: &tidb_stmtctx::ProcessPlanInfo,
         txn_ts: u64,
     ) {
+        // A multi-keyspace node writes no dump to the process-wide external
+        // storage (PLAN REPLAYER is refused there until phase 3f).
+        if tidb_keyspace::is_multi_keyspace_mode() {
+            return;
+        }
         // Go also skips the statistics request sources; this node's
         // statistics statements all run on restricted sessions.
         let vars = self.session_vars();

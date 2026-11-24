@@ -589,10 +589,13 @@ pub trait ShowExec: crate::simple::account_password::AccountPasswordExec {
             | T::OpenTables
             | T::Plugins => Vec::new(),
             T::Backups => {
+                // The BRIE queue is process-wide.
+                crate::multi_keyspace::refuse_on_multi_keyspace_node("SHOW BACKUPS")?;
                 crate::brie::require_brie_privilege(self, tidb_ast::BrieKind::Backup)?;
                 crate::brie::GLOBAL_BRIE_QUEUE.fetch_show_brie(tidb_ast::BrieKind::Backup)
             },
             T::Restores => {
+                crate::multi_keyspace::refuse_on_multi_keyspace_node("SHOW RESTORES")?;
                 crate::brie::require_brie_privilege(self, tidb_ast::BrieKind::Restore)?;
                 crate::brie::GLOBAL_BRIE_QUEUE.fetch_show_brie(tidb_ast::BrieKind::Restore)
             },

@@ -33,9 +33,17 @@ thread_local! {
 }
 
 /// The tenant this thread works for, until dropped (then the previous one).
+/// Bound to the thread that entered it (`!Send`): its drop restores that
+/// thread's state.
+///
+/// ```compile_fail
+/// fn send<T: Send>(_: T) {}
+/// send(tidb_logutil::enter_tenant("keyspace1"));
+/// ```
 #[must_use = "the thread leaves the tenant when the guard drops"]
 pub struct TenantGuard {
     previous: Option<String>,
+    _thread_bound: std::marker::PhantomData<*const ()>,
 }
 
 impl Drop for TenantGuard {
@@ -50,7 +58,10 @@ impl Drop for TenantGuard {
 /// drops.
 pub fn enter_tenant(keyspace: &str) -> TenantGuard {
     let previous = TENANT.with(|tenant| tenant.borrow_mut().replace(keyspace.to_owned()));
-    TenantGuard { previous }
+    TenantGuard {
+        previous,
+        _thread_bound: std::marker::PhantomData,
+    }
 }
 
 /// The tenant the current thread works for, if any.
