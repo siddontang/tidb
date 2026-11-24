@@ -1376,6 +1376,7 @@ mod import_into;
 pub mod import_query;
 mod load_data;
 pub mod stats_statement_service;
+mod admission;
 mod dispatch;
 mod gcutil;
 mod mview_session;
