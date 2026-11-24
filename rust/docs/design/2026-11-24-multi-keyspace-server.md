@@ -1,6 +1,6 @@
 # Multi-keyspace tidb-server: one process, many tenants
 
-- Status: **Draft for review, revision 6**: session migration through the Rust TiProxy (§5.6, §5.7); addresses the reviews of `42b666f`, `7cbdef8ad3` and `08d9476bfc`. No code has been written yet.
+- Status: **Draft for review, revision 7**: tenant hibernation (§5.8); session migration through the Rust TiProxy (§5.6, §5.7); addresses the reviews of `42b666f`, `7cbdef8ad3` and `08d9476bfc`. No code has been written yet.
 - Scope: the Rust SQL node (`rust/crates/tidb-server`), Next Generation kernel (`--features nextgen`) only.
 - Branch base: `hparser-integration` @ `73a0893eff`.
 
@@ -605,6 +605,81 @@ shared deployment behind TiProxy. **Decision (siddontang, 2026-11-24):** they li
 branch of a `siddontang/tiproxy` fork, based on `pingcap/tiproxy` `rust`. They
 do not block TiDB Phases 1–3g.
 
+### 5.8 Tenant hibernation (freeze and thaw)
+
+**Decision (siddontang, 2026-11-24):** add hibernation as Phase 4b, after
+Phase 4.
+
+Everything a tenant uses inside the process should belong to that tenant and
+be accountable to it. Then a cold tenant can be **frozen**: its warm state is
+written out, and its memory goes back to the process. A frozen tenant is
+**thawed** on its next connection, without the slow rebuild a fresh open does
+today. This is scale-to-zero per tenant inside a shared process. Starter does
+it today with one process per tenant and a standby pool.
+
+**What a tenant owns.** After Phase 3, all per-tenant state lives in its
+`KeyspaceRuntime` (§5.2). It falls into three kinds:
+
+| Kind | Examples | On freeze |
+| --- | --- | --- |
+| Rebuildable caches | infoschema, stats, plan cache, privileges, bindings, global sysvars, region and TSO caches | Snapshot the expensive ones; drop the rest |
+| Connections to the cluster | PD client, TiKV channels, etcd client, owner campaigns, background loops | Close, resigning owner roles first (§5.3) |
+| Live sessions | client connections, transactions, prepared statements | Migrate through TiProxy (§5.6), or wait for them to end |
+
+Storage (CSE) is the source of truth, so nothing in the first two rows needs a
+snapshot for correctness. The snapshot only makes thaw fast.
+
+**Memory isolation.**
+- Each runtime gets its own memory-tracker root under the process
+  `MemArbitrator`, with a per-tenant quota. Quota pressure on one tenant then
+  cancels or spills that tenant's statements, not another tenant's.
+- For a hard guarantee, each runtime can also get its own jemalloc arena. A
+  thread serving a tenant's session or background work sets
+  `thread.arena` for the duration (`tikv-jemallocator` exposes `mallctl`).
+  Destroying the arena on freeze returns the tenant's pages to the OS instead
+  of leaving holes in a shared heap. Allocations that outlive a tenant (shared
+  caches, the process listener) stay in the default arena. Phase 4b measures
+  whether per-tenant arenas are worth their fragmentation cost before
+  committing to them.
+
+**Freeze**, when a tenant has been idle for `freeze-after` (default 30m) or the
+process is under memory pressure:
+1. Stop admitting new sessions for the tenant; a connection that arrives now
+   waits for thaw, as in §5.3 Draining.
+2. Migrate or wait out live sessions (§5.6). Skip the freeze while the tenant
+   owns unfinished DDL, DXF or TTL work and this node may be its last serving
+   node (§5.3).
+3. Write a versioned snapshot: the infoschema at schema version N, stats meta
+   and histograms already loaded, privileges, global sysvars and bindings,
+   each with the version or timestamp it was read at. The snapshot goes to
+   local disk for a warm tenant and to object storage for a cold one.
+4. Retire and release the runtime (§5.2), then destroy its arena.
+
+**Thaw**, on the first connection or an explicit preload:
+1. Open the store and domain as Phase 1 does, but seed the caches from the
+   snapshot instead of loading them from storage.
+2. Catch up: apply schema diffs from N to the latest version (the normal
+   schema-sync path), and reload stats and privileges changed after the
+   snapshot's timestamps.
+3. If the snapshot is missing, from another binary version, or fails its
+   checksum or version check, fall back to a normal open. Correctness never
+   depends on the snapshot.
+
+**Policy.** Tenants move between hot (open), warm (frozen to local disk) and
+cold (frozen to object storage). Eviction is by idle time and by memory
+pressure, most idle first; `preload` tenants are never frozen.
+
+**Tests.**
+- Freeze then thaw gives the same query results and the same `SHOW` output as
+  before the freeze, including after DDL in the tenant done by another node
+  while it was frozen.
+- A corrupt or stale snapshot falls back to a normal open.
+- A tenant's arena is gone after freeze: process RSS drops by about the
+  tenant's measured footprint.
+- First-query latency after thaw versus a cold open, for 10, 100 and 1000
+  tables.
+- A session migrated away during freeze keeps working (§9 harness).
+
 ## 6. Removing single-keyspace globals
 
 This is the bulk of the work. Each row names the current global and its
@@ -904,6 +979,7 @@ in parallel once Phase 1 lands.
 | **3g** | Session migration (§5.6): keyspace-bound session tokens, token logins through routing, tenant-scoped `SET SESSION_STATES`, parity check of the ported session-states code in multi-keyspace mode | §5.6 migration tests, including cross-tenant token replay rejection |
 | **3h. TiProxy** (pingcap/tiproxy `rust`) | K1–K6 (§5.7): multi-keyspace backends, username-prefix routing, migration guard and metering by session keyspace, per-keyspace drain, keyspace-compatible balancing | TiProxy unit tests plus the §5.6 migration tests through `tiproxy-rs --standalone` |
 | **4. Lifecycle** | Idle close, PD state watch and drain (using proxy session migration when present, §5.6), per-tenant `max_connections`, optional prefix alias (Q1) | Lifecycle tests; leak check that repeated open/close does not grow memory or file descriptors |
+| **4b. Hibernation** | Per-tenant memory roots and quotas; optional per-tenant jemalloc arenas; freeze (session migration, versioned snapshot, release) and thaw (seeded caches plus catch-up, fallback to normal open); hot/warm/cold policy (§5.8) | §5.8 tests; RSS returned on freeze; thaw-to-first-query latency vs cold open |
 | **5. Hardening** | Full isolation suite; footprint benchmark N=1/10/50; per-tenant memory quota; docs | The isolation suite is the bar for calling the mode tenant-isolated |
 
 Phase 2 may be developed alongside Phase 3.
