@@ -3653,6 +3653,13 @@ pub(super) fn cleanup_mview_out_of_place_cutover_after_commit(
             ],
         );
     }
+    // A multi-keyspace node leaves PD and the process-wide TiFlash progress
+    // cache alone (design §10 phase 2, until 3b): the affinity group and the
+    // progress entries are named by bare table IDs, which another tenant on
+    // this node may also use. The tenant's own alert row is gone above.
+    if tidb_keyspace::is_multi_keyspace_mode() {
+        return;
+    }
     let group = crate::ddl_affinity::get_table_affinity_group_id(old);
     if let Err(error) = tidb_domain_affinity::delete_groups_with_retry(&[group]) {
         warn(

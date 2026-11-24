@@ -1475,7 +1475,15 @@ pub(super) fn on_create_columnar_index(
                 active.job.snapshot_version = start_ts;
                 return Ok(action_step(super::job_only_write(active.job.id, Vec::new())));
             }
-            // Check the progress of the TiFlash backfill index.
+            // Check the progress of the TiFlash backfill index. The TiKV and
+            // TiFlash progress requests name only the table and index IDs,
+            // which another tenant on a multi-keyspace node may also use
+            // (design §10 phase 2): a step that can be cancelled is refused,
+            // and one that cannot rolls back rather than trust them.
+            if !super::step_pd_write("COLUMNAR INDEX")? {
+                let error = super::multi_keyspace_refusal("COLUMNAR INDEX");
+                return columnar_index_rollback_step(txn, active, &mut info, &indexes, error, start_ts);
+            }
             let index_id = indexes[0].read().id;
             match check_columnar_index_process(txn, &mut active.job, info.id, index_id) {
                 Ok(true) => {}

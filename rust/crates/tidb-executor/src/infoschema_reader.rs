@@ -1184,6 +1184,12 @@ pub fn set_data_for_attributes(
     visibility: &SchemaVisibility,
 ) -> Result<Vec<Vec<Datum>>, crate::DriverError> {
     use tidb_ddl_label as ddl_label;
+    // A multi-keyspace node lists no label rules (design §10 phase 2, until
+    // 3b): their IDs carry no keyspace, and the name and physical-ID checks
+    // below cannot tell this tenant's rules from another's.
+    if tidb_keyspace::is_multi_keyspace_mode() {
+        return Ok(Vec::new());
+    }
     // Go `infosync.GetAllLabelRules`: the node's label-rule manager.
     let rules = tidb_domain_infosync::label_manager::label_rule_manager()
         .get_all_label_rules(&ddl_label::CodecV1)

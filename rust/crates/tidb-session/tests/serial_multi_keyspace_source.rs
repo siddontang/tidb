@@ -781,3 +781,344 @@ fn a_tenant_cannot_set_process_variables() {
         assert_eq!(refusal(&mut session, sql), None, "{sql}");
     }
 }
+
+/// A PD affinity client that counts its calls and holds no groups.
+#[derive(Default)]
+struct CountingAffinity(std::sync::atomic::AtomicUsize);
+
+impl CountingAffinity {
+    fn calls(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn count(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl tidb_domain_affinity::PdAffinityClient for CountingAffinity {
+    fn create_affinity_groups(
+        &self,
+        _groups: &tidb_domain_affinity::AffinityGroups,
+        _skip_exist_check: bool,
+    ) -> Result<tidb_domain_affinity::AffinityGroupStates, tidb_domain_affinity::PdHttpError> {
+        self.count();
+        Ok(tidb_domain_affinity::AffinityGroupStates::new())
+    }
+    fn get_affinity_groups(
+        &self,
+        _ids: &[String],
+    ) -> Result<tidb_domain_affinity::AffinityGroupStates, tidb_domain_affinity::PdHttpError> {
+        self.count();
+        Ok(tidb_domain_affinity::AffinityGroupStates::new())
+    }
+    fn get_all_affinity_groups(
+        &self,
+    ) -> Result<tidb_domain_affinity::AffinityGroupStates, tidb_domain_affinity::PdHttpError> {
+        self.count();
+        Ok(tidb_domain_affinity::AffinityGroupStates::new())
+    }
+    fn batch_delete_affinity_groups(&self, _ids: &[String], _force: bool) -> Result<(), tidb_domain_affinity::PdHttpError> {
+        self.count();
+        Ok(())
+    }
+}
+
+/// The table's (or partition's) physical ID in `test`.
+fn physical_id(session: &mut Session, table: &str, partition: Option<&str>) -> i64 {
+    let sql = match partition {
+        None => format!("select tidb_table_id from information_schema.tables where table_schema = 'test' and table_name = '{table}'"),
+        Some(partition) => format!(
+            "select tidb_partition_id from information_schema.partitions where table_schema = 'test' and table_name = '{table}' and partition_name = '{partition}'"
+        ),
+    };
+    row_text(session.run(&sql))[0][0].parse().unwrap()
+}
+
+/// Runs `arm` once, before the first step of a job of `action` whose saved
+/// state `ready` accepts: the job was persisted by a single-keyspace node,
+/// and the step that resumes it runs on a multi-keyspace node.
+fn before_resumed_step(
+    action: tidb_model::ActionType,
+    ready: impl Fn(&tidb_model::Job) -> bool + Send + Sync + 'static,
+    arm: impl Fn(&mut tidb_model::Job) + Send + Sync + 'static,
+) -> tidb_failpoint::Guard {
+    let armed = std::sync::atomic::AtomicBool::new(false);
+    tidb_failpoint::enable_call_for_test("github.com/pingcap/tidb/pkg/ddl/beforeRunOneJobStep", move |job| {
+        let Some(job) = job.downcast_mut::<tidb_model::Job>() else {
+            return;
+        };
+        if job.type_ == action && ready(job) && !armed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            arm(job);
+            tidb_keyspace::set_multi_keyspace_mode(true);
+        }
+    })
+}
+
+/// A materialized view's out-of-place cutover job, DONE and persisted, is
+/// finished by a separate step that cleans up after the old MV ID (Go
+/// `transitOneJobStep`'s done branch). On a multi-keyspace node that
+/// cleanup deletes the tenant's own refresh alert, but neither the PD
+/// affinity group nor the process-wide TiFlash progress entries, which are
+/// named by bare table IDs another tenant may also use (design §10 phase 2).
+/// A single-keyspace node does both as before.
+#[test]
+fn a_multi_keyspace_node_leaves_pd_and_tiflash_progress_alone_after_a_cutover() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
+    let store = MockStoreDomain::create().unwrap();
+    let mut session = store.new_session().unwrap();
+    // Go master's materialized-view system tables, which the mock store's
+    // bootstrap does not create.
+    for table in tidb_metadef::BOOTSTRAP_TABLES.iter().filter(|table| {
+        matches!(
+            table.name,
+            "tidb_mview_refresh_info" | "tidb_mlog_purge_info" | "tidb_mview_refresh_hist" | "tidb_mview_refresh_alert" | "tidb_mlog_purge_hist"
+        )
+    }) {
+        session.run(table.create_sql).unwrap_or_else(|error| panic!("{}: {error:?}", table.name));
+    }
+    session.run(tidb_metadef::system_tables_def::CREATE_TI_DBMVIEW_FAST_REFRESH_SOURCE_INFO_TABLE).unwrap();
+    for sql in [
+        "set tidb_mview_enable = on",
+        "use test",
+        "create table t (a int not null, b int not null)",
+        "insert into t values (1, 10), (2, 7)",
+        "create materialized view log on t (a, b) purge next date_add(now(), interval 1 hour)",
+        "create materialized view mv (a, s, cnt) refresh fast next date_add(now(), interval 1 hour) as select a, sum(b), count(1) from t group by a",
+    ] {
+        session.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let affinity = std::sync::Arc::new(CountingAffinity::default());
+    tidb_domain_affinity::init_manager(Some(affinity.clone()));
+    let alert = |id: i64| {
+        format!(
+            "insert into mysql.tidb_mview_refresh_alert (MVIEW_ID, MVIEW_SCHEMA, MVIEW_NAME, ALERT_LEVEL, LAST_SUCCESS_SNAPSHOT_TIME, UPDATE_TIME) values ({id}, 'test', 'mv', 'warning', UTC_TIMESTAMP(), UTC_TIMESTAMP())"
+        )
+    };
+    let alerts = |session: &mut Session, id: i64| {
+        row_text(session.run(&format!("select count(*) from mysql.tidb_mview_refresh_alert where MVIEW_ID = {id}")))
+    };
+    let cache = |id| tidb_domain_infosync::tiflash_manager::get_tiflash_progress_from_cache(id);
+
+    // Single-keyspace: the cutover deletes the alert, the affinity group
+    // and the progress entry.
+    let old = physical_id(&mut session, "mv", None);
+    session.run(&alert(old)).unwrap();
+    tidb_domain_infosync::tiflash_manager::update_tiflash_progress_cache(old, 0.5);
+    session.run("refresh materialized view mv complete out of place").unwrap();
+    assert_ne!(physical_id(&mut session, "mv", None), old);
+    assert_eq!(alerts(&mut session, old), [["0"]]);
+    assert_eq!(cache(old), None);
+    assert!(affinity.calls() > 0, "the single-keyspace cutover deletes the old affinity group");
+    let affinity_calls = affinity.calls();
+
+    // Multi-keyspace: another keyspace's progress entry for the same ID survives.
+    tidb_keyspace::set_multi_keyspace_mode(true);
+    let old = physical_id(&mut session, "mv", None);
+    session.run(&alert(old)).unwrap();
+    tidb_domain_infosync::tiflash_manager::update_tiflash_progress_cache(old, 0.5);
+    assert_eq!(refusal(&mut session, "refresh materialized view mv complete out of place"), None);
+    assert_ne!(physical_id(&mut session, "mv", None), old);
+    assert_eq!(
+        row_text(session.run(
+            "select state from information_schema.ddl_jobs where job_type = 'refresh materialized view complete out-of-place cutover' order by job_id desc limit 1"
+        )),
+        [["synced"]]
+    );
+    assert_eq!(alerts(&mut session, old), [["0"]], "the tenant's own alert is cleaned up");
+    assert_eq!(cache(old), Some(0.5), "another keyspace's progress entry survives");
+    assert_eq!(affinity.calls(), affinity_calls, "no affinity call in multi-keyspace mode");
+
+    tidb_keyspace::set_multi_keyspace_mode(false);
+    tidb_domain_infosync::tiflash_manager::delete_tiflash_progress_from_cache(old);
+    tidb_domain_affinity::init_manager(None);
+}
+
+/// An ADD PARTITION of a table with an available TiFlash replica, saved in
+/// its REPLICA_ONLY state by a single-keyspace node, would check the new
+/// partitions' replication in PD and write their progress into the
+/// process-wide cache by bare partition ID. Resumed on a multi-keyspace node
+/// the step is refused with 1235 before either: the job is cancelled and
+/// rolled back, the table keeps its partitions, and another keyspace's cache
+/// entry for the same partition ID survives. A single-keyspace node writes
+/// the entry as before.
+#[test]
+fn a_resumed_add_partition_writes_no_tiflash_progress_on_a_multi_keyspace_node() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
+    let store = MockStoreDomain::create_with_mock_tiflash(1).unwrap();
+    let mut session = store.new_session().unwrap();
+    for sql in [
+        "use test",
+        "create table ft (a int) partition by range (a) (partition p0 values less than (10))",
+        "alter table ft set tiflash replica 1",
+    ] {
+        session.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    use tidb_session::domain::cluster_session_node::DomainTestSessions as _;
+    store.factory().update_table_replica_info(physical_id(&mut session, "ft", Some("p0")), true).unwrap();
+    // The mock's regions have no TiFlash peers: Go's failpoint reports the
+    // new partitions replicated, so only the guard keeps the cache write out.
+    let _replicated = tidb_failpoint::enable_for_test("github.com/pingcap/tidb/pkg/ddl/mockWaitTiFlashReplicaOK", "return(true)");
+    let cache = |id| tidb_domain_infosync::tiflash_manager::get_tiflash_progress_from_cache(id);
+
+    // Single-keyspace: the new partition's progress is cached.
+    session.run("alter table ft add partition (partition p1 values less than (20))").unwrap();
+    let p1 = physical_id(&mut session, "ft", Some("p1"));
+    assert_eq!(cache(p1), Some(1.0));
+
+    // Saved at REPLICA_ONLY, resumed on a multi-keyspace node.
+    let adding = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seeded = adding.clone();
+    let _resume = before_resumed_step(
+        tidb_model::ActionType::ACTION_ADD_TABLE_PARTITION,
+        |job| job.schema_state == tidb_model::SchemaState::REPLICA_ONLY && job.is_running(),
+        move |job| {
+            let args = tidb_model::get_table_partition_args(&mut job.clone()).unwrap().unwrap();
+            let part_info = args.read().part_info.get().unwrap().read().clone_like_go();
+            for definition in part_info.definitions.snapshot() {
+                // Another keyspace's table with the same partition ID.
+                tidb_domain_infosync::tiflash_manager::update_tiflash_progress_cache(definition.id, 0.25);
+                seeded.lock().unwrap().push(definition.id);
+            }
+        },
+    );
+    let (code, message) = refusal(&mut session, "alter table ft add partition (partition p2 values less than (30))")
+        .expect("the resumed ADD PARTITION is refused");
+    assert_eq!(code, 1235, "{message}");
+    assert!(message.ends_with("TIFLASH REPLICA on a multi-keyspace node'"), "{message}");
+    let adding = adding.lock().unwrap().clone();
+    assert!(!adding.is_empty(), "the job reached REPLICA_ONLY");
+    for id in &adding {
+        assert_eq!(cache(*id), Some(0.25), "another keyspace's progress entry survives");
+    }
+    assert_eq!(
+        row_text(session.run(
+            "select state from information_schema.ddl_jobs where job_type = 'add partition' order by job_id desc limit 1"
+        )),
+        [["rollback done"]]
+    );
+    assert_eq!(
+        row_text(session.run(
+            "select group_concat(partition_name order by partition_ordinal_position) from information_schema.partitions where table_schema = 'test' and table_name = 'ft'"
+        )),
+        [["p0,p1"]]
+    );
+    assert_eq!(row_text(session.run("select count(*) from mysql.tidb_ddl_job")), [["0"]]);
+
+    tidb_keyspace::set_multi_keyspace_mode(false);
+    for id in adding.into_iter().chain([p1]) {
+        tidb_domain_infosync::tiflash_manager::delete_tiflash_progress_from_cache(id);
+    }
+}
+
+/// A columnar index job, saved in WRITE_REORGANIZATION with its snapshot
+/// version set by a single-keyspace node, would poll the index build's
+/// progress by bare table and index IDs and could make the index public on
+/// another tenant's progress. Resumed on a multi-keyspace node the step is
+/// refused with 1235 before the poll: the job is cancelled and rolled back,
+/// and the index does not exist. The poll here is the mock that reports the
+/// build done, so without the guard the index would become public.
+#[test]
+fn a_resumed_columnar_index_does_not_poll_progress_on_a_multi_keyspace_node() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
+    let store = MockStoreDomain::create_with_mock_tiflash(2).unwrap();
+    tidb_domain_infosync::tiflash_manager::set_mock_tiflash(std::sync::Arc::new(
+        tidb_domain_infosync::tiflash_manager::MockTiFlash::new(),
+    ));
+    let mut session = store.new_session().unwrap();
+    for sql in ["use test", "create table vt (a int, c vector(3))", "alter table vt set tiflash replica 2"] {
+        session.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let _done = tidb_failpoint::enable_for_test("github.com/pingcap/tidb/pkg/ddl/MockCheckColumnarIndexProcess", "return(1)");
+    let _resume = before_resumed_step(
+        tidb_model::ActionType::ACTION_ADD_COLUMNAR_INDEX,
+        |job| {
+            job.schema_state == tidb_model::SchemaState::WRITE_REORGANIZATION
+                && job.snapshot_version != 0
+                && job.is_running()
+        },
+        |_| {},
+    );
+    let (code, message) =
+        refusal(&mut session, "alter table vt add vector index vidx((vec_cosine_distance(c))) using hnsw")
+            .expect("the resumed columnar index is refused");
+    assert_eq!(code, 1235, "{message}");
+    assert!(message.ends_with("COLUMNAR INDEX on a multi-keyspace node'"), "{message}");
+    assert_eq!(
+        row_text(session.run(
+            "select state from information_schema.ddl_jobs where job_type = 'add columnar index' order by job_id desc limit 1"
+        )),
+        [["rollback done"]]
+    );
+    assert_eq!(
+        row_text(session.run(
+            "select count(*) from information_schema.tidb_indexes where table_schema = 'test' and table_name = 'vt' and key_name = 'vidx'"
+        )),
+        [["0"]]
+    );
+    assert_eq!(row_text(session.run("select count(*) from mysql.tidb_ddl_job")), [["0"]]);
+    tidb_keyspace::set_multi_keyspace_mode(false);
+}
+
+/// INFORMATION_SCHEMA.ATTRIBUTES lists label rules, whose IDs carry no
+/// keyspace: its name and physical-ID checks cannot tell one tenant's rules
+/// from another's. A multi-keyspace node lists none and does not ask the
+/// label manager (design §10 phase 2, until 3b); a single-keyspace node
+/// lists the table's rule as before.
+#[test]
+fn a_multi_keyspace_node_lists_no_label_rule_attributes() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
+    let store = MockStoreDomain::create().unwrap();
+    let labels = std::sync::Arc::new(CountingLabels::default());
+    let previous_labels = tidb_domain_infosync::label_manager::label_rule_manager();
+    tidb_domain_infosync::label_manager::init_label_rule_manager(Some(labels.clone()));
+    let mut session = store.new_session().unwrap();
+    for sql in ["use test", "create table at (a int)", "alter table at attributes = 'merge_option=deny'"] {
+        session.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let attributes = "select id, attributes from information_schema.attributes where id = 'schema/test/at'";
+    assert_eq!(row_text(session.run(attributes)), [["schema/test/at", "\"merge_option=deny\""]]);
+
+    tidb_keyspace::set_multi_keyspace_mode(true);
+    let calls = labels.calls();
+    assert!(row_text(session.run("select * from information_schema.attributes")).is_empty());
+    assert_eq!(labels.calls(), calls, "no label manager call in multi-keyspace mode");
+
+    tidb_keyspace::set_multi_keyspace_mode(false);
+    tidb_domain_infosync::label_manager::init_label_rule_manager(Some(previous_labels));
+}
+
+/// FLASHBACK CLUSTER closes and later restores PD's schedule limits, which
+/// are the whole PD cluster's: a multi-keyspace node refuses it.
+#[test]
+fn a_multi_keyspace_node_refuses_flashback_cluster() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
+    let store = MockStoreDomain::create().unwrap();
+    let mut session = store.new_session().unwrap();
+    tidb_keyspace::set_multi_keyspace_mode(true);
+    let (code, message) = refusal(&mut session, "flashback cluster to timestamp '2026-01-01 00:00:00'")
+        .expect("FLASHBACK CLUSTER ran");
+    assert_eq!(code, 1235, "{message}");
+    assert!(message.ends_with("FLASHBACK CLUSTER on a multi-keyspace node'"), "{message}");
+    assert_eq!(row_text(session.run("select count(*) from mysql.tidb_ddl_job")), [["0"]]);
+    tidb_keyspace::set_multi_keyspace_mode(false);
+}

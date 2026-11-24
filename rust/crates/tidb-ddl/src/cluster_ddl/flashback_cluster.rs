@@ -73,8 +73,13 @@ fn flashback_get_min_safe_time_timeout() -> Duration {
     }
 }
 
-/// Go `closePDSchedule`.
+/// Go `closePDSchedule`. The limits are PD's, for every keyspace: a
+/// multi-keyspace node's step neither saves nor closes them (design §10
+/// phase 2).
 fn close_pd_schedule() -> Result<(), DdlPlanError> {
+    if !super::step_pd_write("FLASHBACK CLUSTER")? {
+        return Ok(());
+    }
     let close_map: HashMap<String, serde_json::Value> = PD_SCHEDULE_KEY
         .iter()
         .map(|key| ((*key).to_owned(), serde_json::json!(0)))
@@ -84,6 +89,9 @@ fn close_pd_schedule() -> Result<(), DdlPlanError> {
 
 /// Go `savePDSchedule`.
 fn save_pd_schedule(args: &mut FlashbackClusterArgs) -> Result<(), DdlPlanError> {
+    if !super::step_pd_write("FLASHBACK CLUSTER")? {
+        return Ok(());
+    }
     let ret_value = tidb_domain_infosync::schedule_manager::get_pd_schedule_config().map_err(unknown)?;
     args.pd_schedule_value = Some(
         PD_SCHEDULE_KEY

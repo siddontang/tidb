@@ -773,13 +773,22 @@ pub(super) fn on_add_table_partition(
             tidb_failpoint::inject("github.com/pingcap/tidb/pkg/ddl/sleepBeforeReplicaOnly", |val| {
                 std::thread::sleep(std::time::Duration::from_secs(u64::try_from(val.int()).unwrap_or(0)));
             });
+            // A multi-keyspace node neither reads the new partitions'
+            // replication from PD nor writes their progress into the
+            // process-wide cache, both named by bare partition IDs (design
+            // §10 phase 2): a step that can be cancelled is refused, and one
+            // that cannot finishes without them.
+            let tiflash_pd = match &info.tiflash_replica {
+                Some(replica) if replica.read().available => super::step_pd_write("TIFLASH REPLICA")?,
+                _ => true,
+            };
             // Here need do some tiflash replica complement check.
             if let Some(replica) = info.tiflash_replica.clone() {
                 let (available, count) = {
                     let replica = replica.read();
                     (replica.available, replica.count)
                 };
-                if available {
+                if available && tiflash_pd {
                     // For available state, the new added partition should wait it's replica to
                     // be finished. Otherwise the query to this partition will be blocked.
                     let adding = partition.read().adding_definitions.snapshot();
@@ -808,10 +817,12 @@ pub(super) fn on_add_table_partition(
                 if replica.read().available {
                     for definition in part_info.definitions.snapshot().iter() {
                         // Go: a failed cache update only logs.
-                        tidb_domain_infosync::tiflash_manager::update_tiflash_progress_cache(
-                            definition.id,
-                            1.0,
-                        );
+                        if tiflash_pd {
+                            tidb_domain_infosync::tiflash_manager::update_tiflash_progress_cache(
+                                definition.id,
+                                1.0,
+                            );
+                        }
                     }
                     let mut replica = replica.write();
                     let mut ids = replica

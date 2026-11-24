@@ -44,9 +44,9 @@ pub fn refuse_on_multi_keyspace_node(feature: &str) -> Result<(), DriverError> {
 
 /// The PD-backed part of `ddl`, if any: the feature a multi-keyspace node
 /// refuses for it (design §10 phase 2). Resource groups, placement policies,
-/// label rules (`ATTRIBUTES`) and TiFlash replicas are written through the
-/// process's PD clients, which belong to whichever keyspace opened last
-/// (phase 3b); an `AUTO_ID_CACHE=1` table allocates through the AutoID
+/// label rules (`ATTRIBUTES`), TiFlash replicas and FLASHBACK CLUSTER's
+/// schedule limits are written through the process's PD clients, which
+/// belong to whichever keyspace opened last (phase 3b); an `AUTO_ID_CACHE=1` table allocates through the AutoID
 /// service only the configured keyspace runs (phase 3f).
 #[must_use]
 pub fn pd_backed_ddl_feature(ddl: &tidb_ast::DdlStmt) -> Option<&'static str> {
@@ -64,6 +64,10 @@ pub fn pd_backed_ddl_feature(ddl: &tidb_ast::DdlStmt) -> Option<&'static str> {
         }
         DdlStmt::CreatePlacementPolicy(_) | DdlStmt::AlterPlacementPolicy(_) | DdlStmt::DropPlacementPolicy(_) => {
             Some("PLACEMENT POLICY DDL")
+        }
+        // Closes and restores PD's schedule limits for the whole cluster.
+        DdlStmt::FlashbackToTimestamp(flashback) if flashback.tables.is_empty() && flashback.database_name.is_empty() => {
+            Some("FLASHBACK CLUSTER")
         }
         DdlStmt::CreateDatabase { options, .. } | DdlStmt::AlterDatabase { options, .. } => database_options(options),
         DdlStmt::CreateTable(create) => table_options_feature(&create.table_options)
