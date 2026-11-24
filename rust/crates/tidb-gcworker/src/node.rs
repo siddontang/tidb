@@ -321,14 +321,29 @@ impl NodeGcRules {
     }
 }
 
+/// A multi-keyspace node leaves PD's rules alone when it GCs a tenant's
+/// dropped objects (design §10 phase 2): the PD clients are the process's,
+/// and placement group IDs (`TiDB_DDL_<id>`) carry no keyspace, so a
+/// tenant's cleanup could delete another keyspace's rules. Rules a table
+/// had before the node served several keyspaces stay until phase 3b.
+fn skip_pd_rule_cleanup() -> bool {
+    tidb_keyspace::is_multi_keyspace_mode()
+}
+
 impl GcRuleClient for NodeGcRules {
     /// Go `infosync.DeleteTiFlashPlacementRules`.
     fn delete_tiflash_placement_rules(&self, physical_table_ids: &[i64]) -> GcResult<()> {
+        if skip_pd_rule_cleanup() {
+            return Ok(());
+        }
         tidb_domain_infosync::tiflash_manager::delete_tiflash_placement_rules(physical_table_ids)
             .map_err(GcError::new)
     }
 
     fn put_rule_bundles(&self, bundles: Vec<tidb_placement::Bundle>) -> GcResult<()> {
+        if skip_pd_rule_cleanup() {
+            return Ok(());
+        }
         tidb_ddl::placement_delivery::put_rule_bundles(
             self.pd_http_client()?,
             &bundles,
@@ -341,6 +356,9 @@ impl GcRuleClient for NodeGcRules {
         &self,
         rule_ids: &[String],
     ) -> GcResult<HashMap<String, tidb_ddl_label::Rule>> {
+        if skip_pd_rule_cleanup() {
+            return Ok(HashMap::new());
+        }
         tidb_domain_infosync::label_manager::label_rule_manager()
             .get_label_rules(rule_ids)
             .map(|rules| rules.into_iter().collect())
@@ -348,6 +366,9 @@ impl GcRuleClient for NodeGcRules {
     }
 
     fn delete_label_rules(&self, rule_ids: Vec<String>) -> GcResult<()> {
+        if skip_pd_rule_cleanup() {
+            return Ok(());
+        }
         tidb_domain_infosync::label_manager::label_rule_manager()
             .update_label_rules(&tidb_ddl_label::new_rule_patch(
                 Vec::new(),

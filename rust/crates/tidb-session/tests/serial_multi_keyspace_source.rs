@@ -460,6 +460,78 @@ fn a_multi_keyspace_node_refuses_pd_backed_ddl() {
     )));
 }
 
+/// The PD restriction holds for the metadata a DDL job resolves, not only
+/// the statement's text (design §10 phase 2): a table that got placement
+/// before the node served several keyspaces carries it in its TableInfo,
+/// and a TRUNCATE or partition change of it would re-put its bundles
+/// through the process's PD client. In multi-keyspace mode such a job
+/// step is refused with 1235 before any PD call and the job is cancelled:
+/// the counting placement manager sees no call and the rows stay. DDL that
+/// writes no PD state still runs.
+#[test]
+fn a_multi_keyspace_node_refuses_ddl_jobs_that_carry_placement() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
+    let store = MockStoreDomain::create().unwrap();
+    let mut session = store.new_session().unwrap();
+    let pd = std::sync::Arc::new(CountingPd::default());
+    let placement = tidb_domain_infosync::placement_manager::placement_manager();
+    tidb_domain_infosync::placement_manager::init_placement_manager(Some(pd.clone()));
+    // Created by a single-keyspace node: the tables carry placement.
+    for sql in [
+        "use test",
+        "create placement policy p1 followers = 1",
+        "create table tp (a int) placement policy = p1",
+        "insert into tp values (1), (2)",
+        "create table pp (a int) partition by range (a) (partition p0 values less than (10) placement policy = p1, partition p9 values less than (100))",
+        "insert into pp values (1)",
+        "create table plain (a int)",
+    ] {
+        session.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    assert!(pd.calls() > 0, "the single-keyspace DDL put its bundles");
+    let before = pd.calls();
+
+    tidb_keyspace::set_multi_keyspace_mode(true);
+    for sql in [
+        "truncate table tp",
+        "alter table pp truncate partition p0",
+        "alter table pp add partition (partition p10 values less than (200))",
+        "alter table pp reorganize partition p9 into (partition p90 values less than (50), partition p91 values less than (100))",
+    ] {
+        let (code, message) = refusal(&mut session, sql).unwrap_or_else(|| panic!("{sql} ran"));
+        assert_eq!(code, 1235, "{sql}: {message}");
+        assert!(message.ends_with("PLACEMENT on a multi-keyspace node'"), "{sql}: {message}");
+    }
+    assert_eq!(pd.calls(), before, "no PD call in multi-keyspace mode");
+    assert_eq!(row_text(session.run("select count(*) from tp")), [["2"]]);
+    assert_eq!(row_text(session.run("select count(*) from pp")), [["1"]]);
+    // DROP PARTITION puts its bundles past the point the job can be
+    // cancelled: it finishes without the PD write (the dropped partition's
+    // rules stay until phase 3b).
+    assert_eq!(refusal(&mut session, "alter table pp drop partition p0"), None);
+    assert_eq!(pd.calls(), before);
+    assert_eq!(row_text(session.run("select count(*) from pp")), [["0"]]);
+    // Jobs without PD state run, and the refused jobs left none queued.
+    for sql in ["truncate table plain", "alter table tp add column b int"] {
+        assert_eq!(refusal(&mut session, sql), None, "{sql}");
+    }
+    assert_eq!(pd.calls(), before);
+    assert_eq!(
+        row_text(session.run("select count(*) from mysql.tidb_ddl_job")),
+        [["0"]]
+    );
+
+    tidb_keyspace::set_multi_keyspace_mode(false);
+    for sql in ["drop table tp, pp, plain", "drop placement policy p1"] {
+        session.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    tidb_domain_infosync::placement_manager::init_placement_manager(Some(placement));
+}
+
 /// A tenant of a multi-keyspace node sets its keyspace's GLOBAL variables
 /// but not the process's (design §6.3): a variable whose value is the
 /// process's memory, log, PD client or watchdog, or one Go scopes to the

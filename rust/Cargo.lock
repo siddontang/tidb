@@ -7576,6 +7576,7 @@ dependencies = [
  "tidb-extworkload",
  "tidb-go-time-layout",
  "tidb-intest",
+ "tidb-keyspace",
  "tidb-log",
  "tidb-logutil",
  "tidb-metrics",

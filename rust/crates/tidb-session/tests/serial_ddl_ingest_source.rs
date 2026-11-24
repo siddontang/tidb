@@ -981,8 +981,11 @@ fn an_unset_reorg_batch_size_reads_the_job_keyspace_on_the_scan_workers() {
     use tidb_session::domain::configured_user_store::ConfiguredUserStore;
     use tidb_session::domain::mock_store::MockStoreDomain;
     if tidb_config_kerneltype::is_next_gen() {
-        // Nextgen runs ADD INDEX as a distributed task, on the SYSTEM
-        // keyspace's nodes.
+        // Nextgen runs ADD INDEX as a distributed task on the SYSTEM
+        // keyspace's nodes, whose step executors use the process snapshot
+        // (`executor_vardef`); a user keyspace's mock store runs no DXF
+        // loop. So this test proves nothing about a populated nextgen ADD
+        // INDEX: it covers the classic local-ingest path only.
         return;
     }
     let _serial = serial();

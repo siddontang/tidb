@@ -278,6 +278,13 @@ impl TiFlashReplicaManager {
     /// Starts one worker whose returned owner must be retained until node shutdown.
     pub fn spawn(self) -> TiFlashReplicaPoller {
         TiFlashReplicaPoller::start(POLL_INTERVAL, move || {
+            // TiFlash replicas are PD rules written through the process's
+            // PD client, which a multi-keyspace node does not have per
+            // keyspace yet (design §10 phase 2): no tenant's poll writes
+            // or reads them.
+            if tidb_keyspace::is_multi_keyspace_mode() {
+                return;
+            }
             if let Err(error) = self.poll_once() {
                 tidb_ddl_logutil::ddl_logger()
                     .warn("refreshTiFlashTicker returns error", &[zap_error(&error)]);
