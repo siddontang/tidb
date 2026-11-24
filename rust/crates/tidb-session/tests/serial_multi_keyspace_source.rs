@@ -1,0 +1,274 @@
+// Copyright 2026 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Keyspace identity and the Starter username policy
+//! (`rust/docs/design/2026-11-24-multi-keyspace-server.md`, §4.1, §6.1). Each
+//! test changes the configured keyspace, the deploy mode or the
+//! multi-keyspace mode, so it holds the serial lock through
+//! [`ProcessModes`], which restores all three even when an assertion fails.
+
+use prost::Message as _;
+use tidb_executor::exec_stmt_observation::ExecStmtObservation as _;
+use tidb_session::domain::mock_store::MockStoreDomain;
+use tidb_session::Session;
+
+use crate::support::testkit::{update_global_config, ConfigGuard};
+
+/// The configured keyspace, deploy mode and multi-keyspace mode a test runs
+/// under, restored on drop (the configuration by its guard, which also
+/// holds the serial lock until the modes are back).
+struct ProcessModes {
+    deploy_mode: tidb_config_deploymode::Mode,
+    multi_keyspace: bool,
+    _config: ConfigGuard,
+}
+
+impl ProcessModes {
+    fn set(keyspace: &str, deploy_mode: tidb_config_deploymode::Mode, multi_keyspace: bool) -> Self {
+        let keyspace = keyspace.to_owned();
+        let config = update_global_config(|config| config.keyspace_name = keyspace);
+        let modes = Self {
+            deploy_mode: tidb_config_deploymode::get(),
+            multi_keyspace: tidb_keyspace::is_multi_keyspace_mode(),
+            _config: config,
+        };
+        tidb_config_deploymode::set(deploy_mode).unwrap();
+        tidb_keyspace::set_multi_keyspace_mode(multi_keyspace);
+        modes
+    }
+}
+
+impl Drop for ProcessModes {
+    fn drop(&mut self) {
+        tidb_keyspace::set_multi_keyspace_mode(self.multi_keyspace);
+        let _ = tidb_config_deploymode::set(self.deploy_mode);
+    }
+}
+
+fn cell_text(value: &tidb_datatype::Datum) -> String {
+    if value.is_null() {
+        return "NULL".to_owned();
+    }
+    String::from_utf8_lossy(&value.to_bytes().expect("a result cell")).into_owned()
+}
+
+/// The statement's rows as text cells.
+fn row_text<E: std::fmt::Debug>(result: Result<tidb_session::StmtResult, E>) -> Vec<Vec<String>> {
+    match result.unwrap() {
+        tidb_session::StmtResult::Rows(rows) => {
+            rows.into_iter().map(|row| row.iter().map(cell_text).collect()).collect()
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// Go `TestStarterUsernamePolicyInSimpleExec`
+/// (`executor/test/simpletest/simple_test.go:43`): in Starter mode the
+/// account statements require new names to carry the keyspace prefix and
+/// resolve an unprefixed target to its prefixed account.
+#[test]
+fn starter_username_policy_in_simple_exec() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // The starter deploy mode exists only in the nextgen kernel.
+        return;
+    }
+    let _modes = ProcessModes::set("SYSTEM", tidb_config_deploymode::Mode::Starter, false);
+
+    let privs = tidb_privilege::PrivilegeRegistry::default();
+    let store = MockStoreDomain::create_with_accounts(Some(privs.clone())).unwrap();
+    let mut tk = store.new_session().unwrap();
+    let rows = |session: &mut Session, sql: &str| row_text(session.run(sql));
+    let run = |session: &mut Session, sql: &str| {
+        session
+            .run(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    };
+    let contains_err = |session: &mut Session, sql: &str, want: &str| {
+        let message = session
+            .run(sql)
+            .expect_err(sql)
+            .to_mysql_error()
+            .message;
+        assert!(message.contains(want), "{sql}: {message}");
+    };
+    let need_prefix = "User name must start with `SYSTEM.`";
+
+    run(&mut tk, "create user if not exists `SYSTEM.r1`@`%`");
+    run(&mut tk, "create user if not exists `SYSTEM.u1`@`%`");
+
+    contains_err(&mut tk, "create user u2@'%' identified by 'pwd'", need_prefix);
+    contains_err(&mut tk, "create role r2", need_prefix);
+    run(&mut tk, "create role `SYSTEM.r2`");
+    assert_eq!(
+        rows(&mut tk, "select User from mysql.user where User='SYSTEM.r2' and Host='%'"),
+        [["SYSTEM.r2"]]
+    );
+    contains_err(&mut tk, "rename user `SYSTEM.u1`@`%` to u2@'%'", need_prefix);
+
+    run(&mut tk, "grant r1 to u1");
+    assert_eq!(
+        rows(
+            &mut tk,
+            "select TO_USER from mysql.role_edges where FROM_USER='SYSTEM.r1' and TO_USER='SYSTEM.u1' and TO_HOST='%'"
+        ),
+        [["SYSTEM.u1"]]
+    );
+
+    run(&mut tk, "set default role r1 to u1");
+    assert_eq!(
+        rows(
+            &mut tk,
+            "select USER, DEFAULT_ROLE_USER from mysql.default_roles where USER='SYSTEM.u1' and DEFAULT_ROLE_USER='SYSTEM.r1'"
+        ),
+        [["SYSTEM.u1", "SYSTEM.r1"]]
+    );
+
+    run(&mut tk, "set default role none to u1");
+    assert!(rows(&mut tk, "select USER from mysql.default_roles where USER='SYSTEM.u1'").is_empty());
+
+    run(&mut tk, "set default role all to u1");
+    assert_eq!(
+        rows(
+            &mut tk,
+            "select USER, DEFAULT_ROLE_USER from mysql.default_roles where USER='SYSTEM.u1' and DEFAULT_ROLE_USER='SYSTEM.r1'"
+        ),
+        [["SYSTEM.u1", "SYSTEM.r1"]]
+    );
+
+    run(&mut tk, "revoke r1 from u1");
+    assert!(rows(
+        &mut tk,
+        "select TO_USER from mysql.role_edges where FROM_USER='SYSTEM.r1' and TO_USER='SYSTEM.u1' and TO_HOST='%'"
+    )
+    .is_empty());
+    assert!(rows(&mut tk, "select USER from mysql.default_roles where USER='SYSTEM.u1'").is_empty());
+
+    run(&mut tk, "alter user u1 identified by 'pwd2'");
+    assert_eq!(
+        rows(&mut tk, "select authentication_string from mysql.user where user='SYSTEM.u1' and host='%'"),
+        [[tidb_privilege::encode_password("pwd2")]]
+    );
+
+    run(&mut tk, "create user if not exists `SYSTEM.keao.yang`@`%`");
+    run(&mut tk, "alter user `keao.yang`@`%` identified by 'pwd3'");
+    assert_eq!(
+        rows(
+            &mut tk,
+            "select authentication_string from mysql.user where user='SYSTEM.keao.yang' and host='%'"
+        ),
+        [[tidb_privilege::encode_password("pwd3")]]
+    );
+
+    run(&mut tk, "create user if not exists `SYSTEM.admin`@`%`");
+    run(&mut tk, "grant create user on *.* to `SYSTEM.admin`@`%`");
+    run(&mut tk, "create user if not exists `SYSTEM.u_sys`@`%`");
+    run(&mut tk, "grant system_user on *.* to `SYSTEM.u_sys`@`%`");
+    let mut admin_tk = store.new_session().unwrap();
+    admin_tk.set_user("SYSTEM.admin@%".to_owned(), "SYSTEM.admin@%".to_owned());
+    admin_tk.attach_privileges(privs.clone());
+    contains_err(&mut admin_tk, "alter user u_sys identified by 'pwd4'", "SYSTEM_USER or SUPER");
+    assert_eq!(
+        rows(&mut tk, "select authentication_string from mysql.user where user='SYSTEM.u_sys' and host='%'"),
+        [[tidb_privilege::encode_password("")]]
+    );
+
+    run(&mut tk, "set sql_mode=''");
+    contains_err(&mut tk, "grant select on *.* to u_auto@'%'", need_prefix);
+    assert!(rows(&mut tk, "select User from mysql.user where User='u_auto' and Host='%'").is_empty());
+    run(&mut tk, "set sql_mode=default");
+
+}
+
+/// A session bound to keyspace `ks_b` on a node whose configured keyspace is
+/// `ks_a` (`rust/docs/design/2026-11-24-multi-keyspace-server.md`, §6.1)
+/// validates new account names against `ks_b`'s prefix, with Go's Starter
+/// `ErrUserNameNeedPrefix`, and resolves unprefixed targets to `ks_b.`
+/// accounts.
+#[test]
+fn account_statements_use_the_session_keyspace_prefix() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // The starter deploy mode exists only in the nextgen kernel.
+        return;
+    }
+    let _modes = ProcessModes::set("ks_a", tidb_config_deploymode::Mode::Starter, false);
+    let store = MockStoreDomain::create_for_keyspace("ks_b").unwrap();
+
+    let mut tk = store.new_session().unwrap();
+    assert_eq!(tk.keyspace_context().name(), "ks_b");
+    // Go `exeerrors.ErrUserNameNeedPrefix`: `mysql.ErrUsername` (1468).
+    let error = |session: &mut Session, sql: &str| {
+        let error = session.run(sql).expect_err(sql).to_mysql_error();
+        assert_eq!(error.code, 1468, "{sql}: {}", error.message);
+        error.message
+    };
+    let run = |session: &mut Session, sql: &str| {
+        session
+            .run(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    };
+
+    assert_eq!(
+        error(&mut tk, "create user `ks_a.x`@`%`"),
+        "User name must start with `ks_b.` (use `ks_b.ks_a.x` instead)"
+    );
+    assert_eq!(
+        error(&mut tk, "create user x@`%`"),
+        "User name must start with `ks_b.` (use `ks_b.x` instead)"
+    );
+    run(&mut tk, "create user `ks_b.x`@`%`");
+    assert_eq!(
+        row_text(tk.run("select User from mysql.user where User like 'ks_%'")),
+        [["ks_b.x"]]
+    );
+    assert_eq!(
+        error(&mut tk, "rename user `ks_b.x`@`%` to `ks_a.y`@`%`"),
+        "User name must start with `ks_b.` (use `ks_b.ks_a.y` instead)"
+    );
+    // An unprefixed target resolves to the session keyspace's account.
+    run(&mut tk, "alter user x@`%` identified by 'pwd'");
+    assert_eq!(
+        row_text(tk.run("select authentication_string from mysql.user where User='ks_b.x'")),
+        [[tidb_privilege::encode_password("pwd")]]
+    );
+
+}
+
+/// A session bound to keyspace `ks_b` on a node whose configured
+/// keyspace is `ks_a` (multi-keyspace design §6.1) reports `ks_b` in its
+/// slow log and statement summary, and its requests' resource-group tags
+/// carry `ks_b`.
+#[test]
+fn observation_and_resource_tags_name_the_session_keyspace() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Named mock keyspaces exist only in the nextgen kernel.
+        return;
+    }
+    let _modes = ProcessModes::set("ks_a", tidb_config_deploymode::get(), false);
+    let store = MockStoreDomain::create_for_keyspace("ks_b").unwrap();
+    let mut session = store.new_session().unwrap();
+
+    assert_eq!(session.observed_keyspace_name(), "ks_b");
+    let keyspace_id = session.keyspace_context().id().expect("a named store's keyspace ID");
+    assert_eq!(session.observed_keyspace_id(), keyspace_id);
+
+    session.context_with_initialized_exec_details("select 1");
+    let tagger = session
+        .statement_kv_context_cell()
+        .get()
+        .resource_group_tagger
+        .expect("the statement's tagger");
+    let tag = tidb_proto::ResourceGroupTag::decode(tagger().encode_tag_with_key(&[]).as_slice()).unwrap();
+    assert_eq!(tag.keyspace_name.as_deref(), Some(&b"ks_b"[..]));
+
+}

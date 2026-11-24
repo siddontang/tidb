@@ -4503,33 +4503,31 @@ mod check_auth_plugin_tests {
     }
 
     /// A connection routed to keyspace `ks_b` on a node configured for
-    /// `ks_a` (design §6.1) resolves login names under `ks_b`'s policy: an
-    /// unprefixed name becomes its `ks_b.` account, and the configured
-    /// keyspace's prefix is another keyspace's.
+    /// `ks_a` (design §6.1) resolves login names under `ks_b`'s policy (the
+    /// one `KeyspaceContext::username_policy` gives `ks_b` in Starter or
+    /// multi-keyspace mode): an unprefixed name becomes its `ks_b.` account,
+    /// and the configured keyspace's prefix is another keyspace's. The policy
+    /// is the argument, so the test leaves the process-wide mode alone.
     #[test]
     fn login_variants_use_the_routed_keyspace_prefix() {
-        if !tidb_config_kerneltype::is_next_gen() {
-            // The starter deploy mode exists only in the nextgen kernel.
-            return;
-        }
-        let restore_config = tidb_config::config_tree::config::restore_func();
-        let original_mode = tidb_config_deploymode::get();
-        tidb_config::config_tree::config::update_global(|config| {
-            config.keyspace_name = "ks_a".into();
-        });
-        tidb_config_deploymode::set(tidb_config_deploymode::Mode::Starter).unwrap();
-
         use tidb_privilege::loaded::LoadedUser;
         let users = ConfiguredUserStore::from_accounts(tidb_privilege::load::registry_from_user_rows([
             LoadedUser::new("ks_a.app", "%", "mysql_native_password", ""),
             LoadedUser::new("ks_b.app", "%", "mysql_native_password", ""),
         ]));
-        let routed = tidb_keyspace::KeyspaceContext::new("ks_b", Some(2));
+        let routed = tidb_keyspace::UsernamePolicy::Prefix { user_prefix: "ks_b".to_owned() };
         let run = |user: &str| {
             let mut user = user.to_owned();
             let mut client_plugin = "mysql_native_password".to_owned();
-            let decision =
-                check_auth_plugin("mysql_native_password", &mut client_plugin, true, &routed, &users, &mut user, &tcp());
+            let decision = super::check_auth_plugin_resolving(
+                "mysql_native_password",
+                &mut client_plugin,
+                true,
+                Some(&routed),
+                &users,
+                &mut user,
+                &tcp(),
+            );
             (decision, user)
         };
         let (decision, user) = run("app");
@@ -4542,9 +4540,6 @@ mod check_auth_plugin_tests {
 
         let (decision, _) = run("ks_a.app");
         assert!(matches!(decision, Err(AuthPluginRefusal::UserPrefixMismatch)));
-
-        tidb_config_deploymode::set(original_mode).unwrap();
-        restore_config();
     }
 
     /// On a multi-keyspace node outside Starter, a plain name routed to a
@@ -4574,11 +4569,6 @@ mod check_auth_plugin_tests {
             );
             (decision, user)
         };
-        assert!(
-            !tidb_config_deploymode::is_starter() && !tidb_keyspace::is_multi_keyspace_mode(),
-            "a single-keyspace node outside Starter"
-        );
-
         // Single keyspace outside Starter: the exact name only.
         let (decision, _) = run("app", false);
         assert!(matches!(decision, Err(AuthPluginRefusal::AccessDenied)));

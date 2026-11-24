@@ -1,6 +1,17 @@
 //! The per-runtime keyspace identity
 //! (`rust/docs/design/2026-11-24-multi-keyspace-server.md`, §6.1). Separate
-//! executable: it changes the process's multi-keyspace mode.
+//! executable with one test: it changes the process's configured keyspace and
+//! multi-keyspace mode, and restores the mode even when an assertion fails.
+
+/// Restores the process's multi-keyspace mode when dropped, including while
+/// a failed assertion unwinds.
+struct RestoreMode(bool);
+
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        tidb_keyspace::set_multi_keyspace_mode(self.0);
+    }
+}
 
 /// A runtime's identity answers for its own keyspace, not the process's
 /// configured one: its name, its resource-tag bytes and its username policy.
@@ -21,6 +32,7 @@ fn a_keyspace_context_names_its_own_keyspace() {
 
     // A node serving several keyspaces prefixes each tenant's accounts with
     // its own keyspace.
+    let _restore = RestoreMode(tidb_keyspace::is_multi_keyspace_mode());
     tidb_keyspace::set_multi_keyspace_mode(true);
     let policy = tenant.username_policy();
     assert!(policy.validate_username("ks_b.x").is_ok());
@@ -29,16 +41,4 @@ fn a_keyspace_context_names_its_own_keyspace() {
         "[ddl:1468]User name must start with `ks_b.` (use `ks_b.ks_a.x` instead)"
     );
     assert_eq!(policy.get_username_variants("app"), ["ks_b.app"]);
-    tidb_keyspace::set_multi_keyspace_mode(false);
-}
-
-/// A tenant-level path that finds no runtime identity on a multi-keyspace
-/// node trips the debug assertion instead of silently using the process's
-/// configured keyspace.
-#[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "multi-keyspace node")]
-fn an_unbound_read_on_a_multi_keyspace_node_is_caught() {
-    tidb_keyspace::set_multi_keyspace_mode(true);
-    let _ = tidb_keyspace::KeyspaceContext::unbound();
 }
