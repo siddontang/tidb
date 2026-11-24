@@ -415,7 +415,8 @@ Tenants and operators get separate doors:
   client certificate (CA from `[security] operator-ca`); plaintext is allowed
   only on loopback with `dev-mode`. It serves:
   - SQL to SYSTEM;
-  - process-wide administration: instance-scoped variables (§6.3),
+  - process-wide administration: process variables (§6.3; tenants set only
+    their keyspace variables),
     provisioning and account migration (§4.1), forced drain or close of a
     runtime;
   - every tenant-scoped HTTP status endpoint (§6.9), selected by
@@ -605,6 +606,88 @@ shared deployment behind TiProxy. **Decision (siddontang, 2026-11-24):** they li
 branch of a `siddontang/tiproxy` fork, based on `pingcap/tiproxy` `rust`. They
 do not block TiDB Phases 1–3g.
 
+### 5.8 Per-tenant data model
+
+This section lists what each tenant's state is, where it lives, who changes
+it, and whether it is isolated today. It was checked against the code at
+`3905611647` (paths relative to `rust/crates/`).
+
+**Admin model.** Tenants change only keyspace state: their data, accounts and
+keyspace-scoped variables. Process state (instance variables, the process
+statics behind them, PD-wide settings) is changed only by an operator, through
+SYSTEM on the mTLS operator listener (§5.5). A tenant's `SET GLOBAL` of a
+process variable is refused with 1227 (§6.3).
+
+Abbreviations. **Lives in:** TS = tenant storage (inside the keyspace prefix),
+RT = per-runtime memory, P = process memory, PD = the PD cluster. **Changed
+by:** SQL = tenant SQL, Op = operator, Cfg = node config only. Until the
+operator listener exists, Op means node config.
+
+| Item | Lives in | Changed by | Status | Evidence | Fix phase |
+| --- | --- | --- | --- | --- | --- |
+| Schema meta (meta keys, schema version, global IDs) | TS | SQL (DDL) | Isolated: the store is opened with the keyspace's API v2 codec. `GLOBAL_ID_MUTEX` is a process lock (contention only). | `tidb-server/src/cluster_stack.rs:114`; `tidb-txnkv/src/driver/tikv_store.rs:158`; `tidb-meta/src/transaction.rs:52` | — |
+| Infoschema cache, schema lease, schema-version sync | RT | SQL (DDL) | Isolated: one loader per runtime; schema sync on the tenant's etcd. `MAX_DELTA_SCHEMA_COUNT` is still a process static. | `cluster_stack.rs:799,970` | 3c |
+| DDL job queue and history, DDL owner | TS + tenant etcd | SQL | Isolated: owner managers are keyed by keyspace. A job's reorganization reads its keyspace's vardef values on every thread it spawns. | `tidb-ddl/src/owner_mgr.rs:16`; `tidb-ddl/src/real_tikv_ddl.rs` (job scope) | — |
+| `JOB_CTX_MAP` (reorg contexts by job ID) | P | — | Shared: job IDs collide across tenants. | `tidb-ddl/src/job_ctx.rs:130` | 3d |
+| `JOB_VER_IN_USE`, `GLOBAL_INDEX_V1_SUPPORTED` | P | Each tenant's DDL version check | Shared: the last tenant's DDL worker sets the value for every tenant. | `tidb-model/src/job_enums.rs:210`; `tidb-model/src/index.rs:84`; `tidb-ddl/src/worker.rs:700,784` | 3d (§6.4) |
+| MDL (`mysql.tidb_mdl_info`, schema pins) | TS + RT | — | Isolated: pins per domain. `ENABLE_MDL` is still a process static. | vardef appendix | 3c |
+| Accounts (`mysql.user`, `db`, `tables_priv`, roles, `global_priv`, password history) | TS | SQL | Isolated: privileges per domain, privilege watch on the tenant's etcd, username policy per runtime. Users without a prefix route to the configured keyspace. | `tidb-server/src/keyspace_registry.rs` (`route`) | Prefix-less users: Phase 2 (Q2) |
+| `mysql.global_variables` and the sysvar cache | TS + RT | SQL (keyspace variables); Op (process variables) | 50 of 56 global statics are kept per keyspace; a tenant's `SET GLOBAL` of a process variable is refused. | `tidb-server/src/keyspace_runtime.rs`; §6.3 appendices | The remaining "not yet" statics: 3c |
+| `tidb_external_ts` | PD (whole cluster) | Op | Shared by design: PD keeps one external timestamp per cluster. A process variable; tenants read it. | commit `a18dec47b5` | — |
+| Bindings (`mysql.bind_info`, cache) | TS + RT | SQL | Isolated: binding handle per domain. | `cluster_stack.rs:256` | — |
+| Statistics (`mysql.stats_*`, cache, owner, auto-analyze queue) | TS + RT | SQL (ANALYZE) | Isolated per domain; auto-analyze reads its keyspace's settings. | `cluster_stack.rs:810,944` | — |
+| Stats globals keyed by table ID (`TABLE_ROW_STATS_CACHE`, async and sync load queues, `GLOBAL_AUTO_ANALYZE_PROCESS_LIST`) | P | — | Shared: table and process IDs collide. | `tidb-stats-handle-cache/src/stats_table_row_cache.rs:61`; `tidb-stats-asyncload/src/lib.rs:26`; `tidb-stats-handle-syncload/src/sync_load.rs:75`; `tidb-stats-handle-util/src/auto_analyze_proc_id_generator.rs:101` | 3d |
+| GC worker, delete ranges, GC settings, safe points | TS + PD (per keyspace) | SQL (GC settings) | Isolated: one GC worker per runtime. | `keyspace_runtime.rs` | — |
+| min-start-ts report | Tenant etcd | — | Shared: every tenant's report reads the process-wide `ACTIVE_START_TS`, `GLOBAL_INNER_TXN_START_TS` and auto-analyze list. | `cluster_stack.rs:293`; `tidb-txnkv/src/inner_txn.rs:28,153` | Phase 2 (§6.5) |
+| TSO, PD client, region cache, TiKV channels | RT | — | Isolated: one store per keyspace. The tokio pool is shared by design. | `tikv_store.rs:93,127,158` | — |
+| AutoID allocators (default caching) | RT | — | Isolated per domain. | `cluster_stack.rs:793` | — |
+| AutoID service (`AUTO_ID_CACHE=1`) | P | — | Shared: only the configured runtime serves it, bound to one keyspace. Refused in multi-keyspace mode. | `keyspace_registry.rs`; `tidb-autoid-service/src/lib.rs:354` | 3f |
+| Sequences | TS + RT | SQL | Isolated. | — | — |
+| Resource groups | PD (per keyspace) | SQL | Shared: the resource-manager client static belongs to the last-opened runtime. Resource-group DDL is refused in multi-keyspace mode. `DEFAULT_RESOURCE_GROUP` is a process static. | `cluster_stack.rs:126`; `tidb-domain-infosync/src/resource_manager_client.rs:147`; `tidb-meta/src/transaction.rs:59` | 3b, 3d |
+| Placement, label rules, TiFlash replicas, PD HTTP | PD | SQL | Shared: the last-opened runtime's clients win. Refused in multi-keyspace mode. Placement group IDs (`TiDB_DDL_<id>`) carry no keyspace, so table IDs collide in PD. | `cluster_stack.rs:1043`; `tidb-ddl-label/src/lib.rs:289`; `tidb-placement/src/bundle.rs:49` | 3b, including the group ID namespace |
+| DXF tables and task managers | SYSTEM storage (nextgen) | — | User runtimes skip the DXF loop, but `TASK_MANAGER_INSTANCE` and `DXF_SVC_TASK_MGR` belong to the last-opened runtime. | `tidb-domain-core/src/domain/dist_task.rs:145`; `tidb-dxf-storage/src/lib.rs:300,304` | 3f (§6.10) |
+| TTL jobs and timers | TS + RT | SQL | Isolated: job manager per domain; delete rate per keyspace. | `tidb-ttl-ttlworker/src/del.rs:118` | — |
+| MV service, workload repository, runaway, RU writer, telemetry | RT | — | Isolated per domain. | `keyspace_runtime.rs` | — |
+| IMPORT INTO, BR, PLAN REPLAYER, external storage | P | — | Shared; refused in multi-keyspace mode. Each runtime open overwrites the import store, BRIE node and cluster ID. | `keyspace_runtime.rs:100`; `tidb-executor/src/builder.rs`; `tidb-executor/src/admin.rs` | 3f |
+| INFORMATION_SCHEMA, PERFORMANCE_SCHEMA, SYS | RT | — | Isolated (only table definitions are static). | `tidb-infoschema/src/lib.rs:2266` | — |
+| METRICS_SCHEMA | P | — | Shared: `PROMETHEUS_STATE` belongs to the last-opened runtime, and metrics carry no keyspace label. | `tidb-domain-infosync/src/prometheus_addr.rs:86` | 3b, 3e |
+| Instance plan cache, stats, binding and schema caches | RT | Cfg (limits) | Isolated, but each runtime gets the full process quota, so memory grows with the number of tenants. | `tidb-session/src/domain/cluster_session_node/node_services.rs:37` | Phase 5 |
+| Statement summary v1 and v2 | P | — | Shared. | `tidb-stmtsummary/src/statement_summary.rs:46`; `v2/stmtsummary.rs:138` | 3e |
+| Slow log, `slow_query`, top-N slow | P | — | Shared: entries carry the keyspace, but nothing filters on it. | `tidb-domain/src/topn_slow_query.rs:490` | 3e |
+| Deadlock history, transaction summary | P | — | Shared. | `tidb-deadlockhistory/src/lib.rs:214`; `tidb-txninfo/src/lib.rs:237` | 3e |
+| Top SQL | P | — | Shared: the reporter binds one keyspace. | `tidb-topsql/src/lib.rs:45` | 3e |
+| `SHOW STATUS` providers | P | — | Shared: one process list (`STATISTICS_LIST`); each domain and GC worker registers into it, and a later provider wins on name. | `tidb-variable/src/statusvar.rs:50`; `tidb-gcworker/src/gc_worker.rs:314` | 3e (§6.8) |
+| Processlist, `KILL`, connection IDs | RT + P | — | Processlist per domain. Connection IDs come from the configured runtime's allocator, while each runtime leases its own server ID. | `tidb-server/src/sql_node.rs:747`; `cluster_stack.rs:851` | Phase 2 (§6.6) |
+| Expensive-query watchdog | RT | — | Isolated: each runtime runs its own over its own processes and settings. | `keyspace_registry.rs` (`start_expensive_query_watchdog`) | — |
+| `max_prepared_stmt_count` counter | P | — | Shared: one process counter checked against each tenant's own limit. | `tidb-variable/src/vars.rs:1024` | Phase 4 |
+| Server info, topology | Tenant etcd | — | Isolated per runtime; the process record for TiProxy is missing. | `cluster_stack.rs:840` | 3h |
+| Keyspace identity, resource tags | RT | — | Mostly isolated. A few readers still use the configured keyspace name. | `tidb-ddl-ingest/src/util.rs:45`; `tidb-planner/src/plan_builder/stmt_build.rs:51`; `tidb-planner-extstore/src/lib.rs:56`; `tidb-server/src/http_status.rs` | 3a |
+| Logging | P (one file) | Cfg | Shared by design; each record carries the tenant. | `tidb-logutil/src/tenant.rs` | — |
+| Metrics | P | — | Shared: no keyspace label. | `tidb-metrics` | 3e, §5.5 |
+| Password validation, history, lockout | TS + RT | SQL | Isolated (vardef appendix: kept per keyspace). | §6.3 appendix | — |
+| Signing cert, JWKS, LDAP, SEM, extensions | P | Cfg | Shared by design. Session tokens are not bound to a keyspace. | `tidb-sessionstates/src/session_token.rs:189` | 3g |
+| `require_secure_transport` | P | Op | A process static, while §6.7 checks it per tenant. | `tidb-tls/src/lib.rs:28` | Phase 2 (§6.7) |
+| Memory arbitrator, server memory limit, top-1 kill | P | Cfg | Shared by design (noisy neighbour). | `tidb-memory/src/process.rs:13,55` | Phase 5 |
+| `max_connections` | P | Cfg | Process cap only; no per-tenant cap, no `max-keyspaces`, no idle close. | `sql_node.rs:161` | Phase 4 |
+| `DDL_HISTORY_SEQUENCE` | P | — | Shared; harmless (a sequence of history writes). | `tidb-ddl/src/cluster_ddl.rs:90` | — |
+
+**Cross-tenant risks today**, all in development mode only:
+
+- GC: one tenant's long transactions and auto-analyze, timed by its own TSO,
+  hold back another tenant's reported min-start-ts (Phase 2).
+- DDL: a peer on an old version in one tenant's fleet sets the job version
+  for every tenant on the node; reorganization contexts collide when job IDs
+  overlap (3d).
+- Wrong data: with overlapping table IDs, `TABLE_ROW_STATS_CACHE` can give one
+  tenant another tenant's sizes in information-schema tables (3d).
+- Leaks: statement summary, `slow_query`, deadlocks, transaction summary, Top
+  SQL, METRICS_SCHEMA and `SHOW STATUS` (3e).
+- Exhaustion: one tenant's prepared statements count against another tenant's
+  limit; one process connection cap; the memory top-1 kill can pick a tenant
+  that is not the cause (Phases 4 and 5).
+- PD writes (resource groups, placement, label rules, TiFlash replicas,
+  `AUTO_ID_CACHE=1`): refused in multi-keyspace mode until 3b and 3f.
+
 ## 6. Removing single-keyspace globals
 
 This is the bulk of the work. Each row names the current global and its
@@ -639,6 +722,12 @@ They move into `RuntimeServices` on the runtime, and the global accessors take
 for example region and Prometheus. Those may stay shared once each call site has
 been checked for keyspace-scoped requests. Resource groups, placement and label
 rules are keyspace-scoped and must be per runtime.
+
+Placement needs more than a per-runtime client: its rule group IDs are
+`TiDB_DDL_<object id>` (`tidb-placement/src/bundle.rs:49`), one namespace in
+PD for the whole cluster, and table IDs overlap across keyspaces. 3b adds the
+keyspace to the group ID (as label rule IDs already do), with a migration for
+existing single-keyspace bundles.
 
 ### 6.3 `SET GLOBAL` and process atomics
 
@@ -999,6 +1088,9 @@ Table and job IDs are per keyspace, so these caches collide across tenants:
   `sync_load.rs:75`)
 - the auto-analyze process ID generator (`auto_analyze_proc_id_generator.rs:101`)
 - `JOB_CTX_MAP` (`tidb-ddl/src/job_ctx.rs:129`)
+- `JOB_VER_IN_USE` and `GLOBAL_INDEX_V1_SUPPORTED` (`tidb-model/src/job_enums.rs:210`,
+  `tidb-model/src/index.rs:84`): derived from each tenant's server-info
+  versions, so they belong to the tenant's DDL, not the process
 
 Each moves into the runtime's `Domain`, or is re-keyed by `(keyspace_id, id)`.
 Moving it into the `Domain` is preferred, because it closes with the tenant.
@@ -1075,7 +1167,10 @@ overlapping candidate IDs. Check:
   AuthSwitch path handles it.
 - **`require_secure_transport`.** It is checked after routing, against the
   tenant's sysvar. `admit_transport` already reads it from `users`, which is now
-  the tenant's.
+  the tenant's. *Gap:* the policy itself is still the process static
+  `REQUIRE_SECURE_TRANSPORT` (`tidb-tls/src/lib.rs:28`), so today it is a
+  process variable that tenants cannot set (§6.3). Phase 2 makes the check
+  read the tenant's value.
 - **`max_connections`.** A process-wide cap plus the tenant's own
   `max_connections`, both enforced. Today only the process cap is checked
   (`mysql_connection.rs:1634`).
@@ -1090,6 +1185,7 @@ overlapping candidate IDs. Check:
 | TopSQL reporter | binds one keyspace name (`tidb-topsql/src/lib.rs:68`) | Reports carry the keyspace per record. Before merging, check that the reporter protocol supports this; otherwise use one reporter per runtime. |
 | Metrics | the `keyspace_name` const label is fixed at registration | A variable `keyspace` label on per-tenant series, bounded by `max-keyspaces` |
 | `CLUSTER_*` tables, `SHOW PROCESSLIST`, `KILL` | | Filtered to the caller's keyspace |
+| `SHOW STATUS` | one process provider list (`tidb-variable/src/statusvar.rs:50`); every domain and GC worker registers into it, a later provider wins on name | One provider list per runtime |
 
 ### 6.9 Status port and AutoID service
 
@@ -1109,6 +1205,8 @@ The following become per runtime:
 - the IMPORT INTO / DXF import globals (`tidb-dxf-importinto/src/lib.rs:107,141`)
 - `tidb-extworkload/src/lib.rs:173`
 - `tidb-planner-extstore/src/lib.rs:33`
+- the DXF task managers `TASK_MANAGER_INSTANCE` and `DXF_SVC_TASK_MGR`
+  (`tidb-dxf-storage/src/lib.rs:300,304`), which every runtime open overwrites
 
 ## 7. Isolation and security
 
@@ -1221,17 +1319,17 @@ in parallel once Phase 1 lands.
 | **0** | This design; decisions on §11 | Owner sign-off |
 | **1. Extract the runtime** | `ProcessServices` + `KeyspaceRuntime::open/close` + `KeyspaceRegistry` with one preloaded runtime. Pure refactor; no routing, no behavior change | All default-mode gates green; baseline footprint numbers for N=1 |
 | **1b. Username-policy parity** | Port Go's Starter username handling into the Rust handshake and user DDL (§4.1): the prerequisite compatibility release for migrating existing keyspaces | Go-parity tests for variants, prefix mismatch and `CREATE USER` prefix; plain `app` login after migration on a single-keyspace node |
-| **2. Controlled demo** (behind `multi-keyspace.enable` **and** `dev-mode`) | Handshake split and registry lookup; TLS rule and operator listener (§5.4, §5.5); provisioning (§4.1); server-ID reservation (§6.6); pin-count lifecycle without idle close (§5.3); greeting plugin from config; allow-list, preload, max-keyspaces. **Pulled forward from 3d:** per-keyspace min-start-ts / GC tracking (§6.5), because GC is a data-loss risk even in a demo. **Unsupported operations are rejected** with `ER_NOT_SUPPORTED_YET` until their phase lands: placement and resource-group DDL (3b), `AUTO_ID_CACHE=1` tables (3f), IMPORT INTO / BR / external storage (3f), tenant HTTP status APIs | Two tenants on one node: data, auth, GC-safety and AutoID tests (§9) pass; every rejected operation has a test asserting the rejection. **Not for shared deployment.** |
+| **2. Controlled demo** (behind `multi-keyspace.enable` **and** `dev-mode`) | Handshake split and registry lookup; TLS rule and operator listener (§5.4, §5.5); provisioning (§4.1); server-ID reservation (§6.6); pin-count lifecycle without idle close (§5.3); greeting plugin from config; allow-list, preload, max-keyspaces. **Pulled forward from 3d:** per-keyspace min-start-ts / GC tracking (§6.5), because GC is a data-loss risk even in a demo. **Unsupported operations are rejected** with `ER_NOT_SUPPORTED_YET` until their phase lands: placement, resource-group, label-rule and TiFlash-replica DDL (3b), `AUTO_ID_CACHE=1` tables (3f), IMPORT INTO / BR / PLAN REPLAYER / external storage (3f), tenant HTTP status APIs. **Also in Phase 2:** prefix-less users rejected by default (Q2); `require_secure_transport` read per tenant (§6.7) | Two tenants on one node: data, auth, GC-safety and AutoID tests (§9) pass; every rejected operation has a test asserting the rejection. **Not for shared deployment.** |
 | **3a** | Keyspace identity reads + resource tags + username policy (§6.1) | Unit and integration tests; no empty-keyspace assertions firing |
-| **3b** | PD/infosync singletons into `RuntimeServices` (§6.2) | Resource-group, placement and label-rule SQL per tenant |
+| **3b** | PD/infosync singletons into `RuntimeServices` (§6.2), including a keyspace-qualified placement group ID | Resource-group, placement and label-rule SQL per tenant |
 | **3c** | `SET GLOBAL` / vardef split (§6.3), with the generated classification appendix | `SET GLOBAL` isolation tests for every global-scoped atomic |
-| **3d** | ID-keyed caches into the runtime (§6.4) and transaction/GC maps (§6.5) | Stats and DDL concurrency in two tenants; GC safe point per tenant |
-| **3e** | Observability isolation (§6.8) | Processlist, KILL, statement summary and slow-query filtering tests |
-| **3f** | Status port multiplexing + AutoID service map + per-store globals (§6.9, §6.10) | AUTO_ID_CACHE=1 tables in two tenants; IMPORT INTO per tenant |
+| **3d** | ID-keyed caches and DDL version state into the runtime (§6.4) and transaction/GC maps (§6.5) | Stats and DDL concurrency in two tenants; GC safe point per tenant |
+| **3e** | Observability isolation (§6.8), including the `SHOW STATUS` providers | Processlist, KILL, statement summary and slow-query filtering tests |
+| **3f** | Status port multiplexing + AutoID service map + per-store globals, including the DXF task managers (§6.9, §6.10) | AUTO_ID_CACHE=1 tables in two tenants; IMPORT INTO per tenant |
 | **3g** | Session migration (§5.6): keyspace-bound session tokens, token logins through routing, tenant-scoped `SET SESSION_STATES`, parity check of the ported session-states code in multi-keyspace mode | §5.6 migration tests, including cross-tenant token replay rejection |
 | **3h. TiProxy** (pingcap/tiproxy `rust`) | K1–K6 (§5.7): multi-keyspace backends, username-prefix routing, migration guard and metering by session keyspace, per-keyspace drain, keyspace-compatible balancing | TiProxy unit tests plus the §5.6 migration tests through `tiproxy-rs --standalone` |
-| **4. Lifecycle** | Idle close, PD state watch and drain (using proxy session migration when present, §5.6), per-tenant `max_connections`, optional prefix alias (Q1) | Lifecycle tests; leak check that repeated open/close does not grow memory or file descriptors |
-| **5. Hardening** | Full isolation suite; footprint benchmark N=1/10/50; per-tenant memory quota; docs | The isolation suite is the bar for calling the mode tenant-isolated |
+| **4. Lifecycle** | Idle close, PD state watch and drain (using proxy session migration when present, §5.6), per-tenant `max_connections` and prepared-statement count (`PREPARED_STMT_COUNT`, §5.8), optional prefix alias (Q1) | Lifecycle tests; leak check that repeated open/close does not grow memory or file descriptors |
+| **5. Hardening** | Full isolation suite; footprint benchmark N=1/10/50; per-tenant memory quota; a per-runtime share of the process cache quotas (plan, stats, binding, schema caches, §5.8); docs | The isolation suite is the bar for calling the mode tenant-isolated |
 
 Phase 2 may be developed alongside Phase 3.
 
@@ -1253,7 +1351,9 @@ tenants:
   *Recommendation:* the keyspace name in v1. Later add an optional alias from
   PD keyspace config (`tidb_user_prefix`), resolved through a cached PD lookup.
 - **Q2. Users without a prefix.** *Recommendation:* reject by default, with
-  optional `default-keyspace`.
+  optional `default-keyspace`. *Today (development mode):* they route to the
+  node's configured keyspace, which acts as `default-keyspace`; Phase 2 makes
+  rejection the default.
 - **Q3. Which keyspaces may a node serve?** *Recommendation:* an explicit
   allow-list, with `*` permitted for development.
 - **Q4. Full member or serve-only?** Should every runtime take owner duties
