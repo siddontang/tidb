@@ -643,7 +643,8 @@ rules are keyspace-scoped and must be per runtime.
 ### 6.3 `SET GLOBAL` and process atomics
 
 This is the largest semantic issue. `GlobalSysvars` is already per instance,
-but its SetGlobal hooks write **83 process atomics** in `tidb-vardef/src/lib.rs`
+but its SetGlobal hooks write **85 process statics** in `tidb-vardef/src/lib.rs`
+(the appendix below classifies all 92 statics it declares)
 (for example `ENABLE_FOREIGN_KEY` at :190 and `INSTANCE_PLAN_CACHE_*`). So one
 tenant's `SET GLOBAL` would change behavior for every tenant.
 
@@ -662,6 +663,122 @@ The plan:
    `vardef::X.load()` to `session.vardef().x()` (or `domain.vardef()` for
    background loops). In single-keyspace mode both paths read the same
    snapshot, so behavior is unchanged.
+
+#### Appendix to §6.3: the process statics of `tidb-vardef`
+
+Generated from `tidb_vardef::classification::PROCESS_STATICS` and the
+system-variable registry by
+`rust/crates/tidb-variable/tests/vardef_classification_appendix.rs`, which
+fails when the table and this appendix drift (rerun it with
+`UPDATE_MULTI_KEYSPACE_APPENDIX=1` to regenerate). The classification test in
+`tidb-vardef` fails when `lib.rs` declares a static the table does not
+classify. *Global* statics move into each keyspace runtime's snapshot;
+*instance* statics stay process-wide and a tenant cannot set them in
+multi-keyspace mode; *internal* statics are not written by a `SetGlobal`
+hook. The registry scope is the Rust registry's, which follows Go's: Go keeps
+several process-resource variables at `GLOBAL` scope (instance plan cache,
+memory alarm, PD client), and the class is what the value governs.
+
+<!-- BEGIN generated: vardef classification -->
+
+92 statics: 58 global, 27 instance, 7 internal.
+
+| Static | System variable | Registry scope | Class | Governs |
+| --- | --- | --- | --- | --- |
+| `ENABLE_MDL` | `tidb_enable_metadata_lock` | GLOBAL | global | metadata locking of the keyspace's DDL (its meta key) |
+| `DDL_FLASHBACK_CONCURRENCY` | `tidb_ddl_flashback_concurrency` | GLOBAL | global | the keyspace's DDL jobs |
+| `DDL_REORG_WORKER_COUNTER` | `tidb_ddl_reorg_worker_cnt` | GLOBAL \| SESSION | global | the keyspace's DDL jobs |
+| `DDL_REORG_BATCH_SIZE` | `tidb_ddl_reorg_batch_size` | GLOBAL \| SESSION | global | the keyspace's DDL jobs |
+| `DDL_ERROR_COUNT_LIMIT` | `tidb_ddl_error_count_limit` | GLOBAL | global | the keyspace's DDL jobs |
+| `MAX_AUTO_ANALYZE_TIME` | `tidb_max_auto_analyze_time` | GLOBAL | global | the keyspace's auto-analyze |
+| `ENABLE_WORKLOAD_BASED_LEARNING` | -- | -- | internal | no system variable |
+| `WORKLOAD_BASED_LEARNING_INTERVAL` | -- | -- | internal | no system variable |
+| `ENABLE_FAST_CREATE_TABLE` | `tidb_enable_fast_create_table` | GLOBAL | global | the keyspace's DDL submission |
+| `IS_SAND_BOX_MODE_ENABLED` | -- | -- | internal | process config (`security.disconnect-on-expired-password`) |
+| `TABLE_CACHE_LEASE` | `tidb_table_cache_lease` | GLOBAL | global | the keyspace's cached tables |
+| `ANALYZE_DEFAULT_NUM_BUCKETS` | `tidb_analyze_default_num_buckets` | GLOBAL | global | the keyspace's statistics |
+| `ANALYZE_DEFAULT_NUM_TOP_N` | `tidb_analyze_default_num_topn` | GLOBAL | global | the keyspace's statistics |
+| `STATS_CACHE_MEM_QUOTA` | `tidb_stats_cache_mem_quota` | GLOBAL \| INSTANCE | instance | process memory |
+| `MEMORY_USAGE_ALARM_RATIO` | `tidb_memory_usage_alarm_ratio` | GLOBAL | instance | process memory |
+| `FORCE_PRIORITY` | `tidb_force_priority` | INSTANCE | instance | Go `ScopeInstance` |
+| `MEMORY_USAGE_ALARM_KEEP_RECORD_NUM` | `tidb_memory_usage_alarm_keep_record_num` | GLOBAL | instance | process memory |
+| `PLAN_REPLAYER_FILE_RETENTION_TIME` | -- | -- | internal | no SetGlobal writer |
+| `CONNECT_ATTRS_SIZE` | `performance_schema_session_connect_attrs_size` | GLOBAL | global | the keyspace's connections |
+| `CONNECT_ATTRS_LONGEST_SEEN` | -- | -- | internal | status counter |
+| `CONNECT_ATTRS_LOST` | -- | -- | internal | status counter |
+| `MAX_DELTA_SCHEMA_COUNT` | `tidb_max_delta_schema_count` | GLOBAL | global | the keyspace's schema validator |
+| `ENABLE_ROW_LEVEL_CHECKSUM` | `tidb_enable_row_level_checksum` | GLOBAL | global | the keyspace's row encoding |
+| `ENABLE_FOREIGN_KEY` | `tidb_enable_foreign_key` | GLOBAL | global | the keyspace's DDL policy |
+| `ENABLE_CHECK_CONSTRAINT` | `tidb_enable_check_constraint` | GLOBAL | global | the keyspace's DDL policy |
+| `ENABLE_FAST_REORG` | `tidb_ddl_enable_fast_reorg` | GLOBAL | global | the keyspace's DDL jobs |
+| `SERVICE_SCOPE` | `tidb_service_scope` | INSTANCE | instance | Go `ScopeInstance`: this node's DXF scope |
+| `CLOUD_STORAGE_URI` | `tidb_cloud_storage_uri` | GLOBAL | global | the keyspace's import and DDL storage |
+| `DDL_DISK_QUOTA` | `tidb_ddl_disk_quota` | GLOBAL | global | the keyspace's DDL jobs |
+| `ENABLE_TTL_JOB` | `tidb_ttl_job_enable` | GLOBAL | global | the keyspace's TTL jobs |
+| `TTL_SCAN_BATCH_SIZE` | `tidb_ttl_scan_batch_size` | GLOBAL | global | the keyspace's TTL jobs |
+| `TTL_DELETE_BATCH_SIZE` | `tidb_ttl_delete_batch_size` | GLOBAL | global | the keyspace's TTL jobs |
+| `TTL_DELETE_RATE_LIMIT` | `tidb_ttl_delete_rate_limit` | GLOBAL | global | the keyspace's TTL jobs |
+| `TTL_JOB_SCHEDULE_WINDOW_START_TIME` | `tidb_ttl_job_schedule_window_start_time` | GLOBAL | global | the keyspace's TTL jobs |
+| `TTL_JOB_SCHEDULE_WINDOW_END_TIME` | `tidb_ttl_job_schedule_window_end_time` | GLOBAL | global | the keyspace's TTL jobs |
+| `TTL_SCAN_WORKER_COUNT` | `tidb_ttl_scan_worker_count` | GLOBAL | global | the keyspace's TTL jobs |
+| `TTL_DELETE_WORKER_COUNT` | `tidb_ttl_delete_worker_count` | GLOBAL | global | the keyspace's TTL jobs |
+| `TTL_RUNNING_TASKS` | `tidb_ttl_running_tasks` | GLOBAL | global | the keyspace's TTL jobs |
+| `ENABLE_INSTANCE_PLAN_CACHE` | `tidb_enable_instance_plan_cache` | GLOBAL | instance | the process's plan cache |
+| `INSTANCE_PLAN_CACHE_MAX_MEM_SIZE` | `tidb_instance_plan_cache_max_size` | GLOBAL | instance | process memory |
+| `INSTANCE_PLAN_CACHE_RESERVED_PERCENTAGE` | `tidb_instance_plan_cache_reserved_percentage` | GLOBAL | instance | process memory |
+| `TXN_ENTRY_SIZE_LIMIT` | `tidb_txn_entry_size_limit` | GLOBAL \| SESSION | global | the keyspace's transactions |
+| `SCHEMA_CACHE_SIZE` | `tidb_schema_cache_size` | GLOBAL \| INSTANCE | instance | process memory |
+| `ENABLE_TSO_FOLLOWER_PROXY` | `tidb_enable_tso_follower_proxy` | GLOBAL | instance | the PD client |
+| `ENABLE_PD_FOLLOWER_HANDLE_REGION` | `pd_enable_follower_handle_region` | GLOBAL | instance | the PD client |
+| `ENABLE_BATCH_QUERY_REGION` | `tidb_enable_batch_query_region` | GLOBAL | instance | the PD client |
+| `MAX_TSO_BATCH_WAIT_INTERVAL` | `tidb_tso_client_batch_max_wait_time` | GLOBAL | instance | the PD client |
+| `LOW_RESOLUTION_TSO_UPDATE_INTERVAL` | `tidb_low_resolution_tso_update_interval` | GLOBAL | instance | the PD client |
+| `SCHEMA_CACHE_SIZE_ORIGIN_TEXT` | `tidb_schema_cache_size` | GLOBAL \| INSTANCE | instance | process memory (the text `SCHEMA_CACHE_SIZE` was set with) |
+| `CIRCUIT_BREAKER_PD_METADATA_ERROR_RATE_THRESHOLD_RATIO` | `tidb_cb_pd_metadata_error_rate_threshold_ratio` | GLOBAL | instance | the PD client |
+| `RUN_AUTO_ANALYZE` | `tidb_enable_auto_analyze` | GLOBAL | global | the keyspace's auto-analyze |
+| `ENABLE_AUTO_ANALYZE_PRIORITY_QUEUE` | `tidb_enable_auto_analyze_priority_queue` | GLOBAL | global | the keyspace's auto-analyze |
+| `AUTO_ANALYZE_CONCURRENCY` | `tidb_auto_analyze_concurrency` | GLOBAL | global | the keyspace's auto-analyze |
+| `ENABLE_RESOURCE_CONTROL` | `tidb_enable_resource_control` | GLOBAL | global | the keyspace's resource groups |
+| `MAX_USER_CONNECTIONS_VALUE` | `max_user_connections` | GLOBAL | global | the keyspace's accounts |
+| `ACCELERATE_USER_CREATION_UPDATE` | `tidb_accelerate_user_creation_update` | GLOBAL | global | the keyspace's privilege cache |
+| `ENABLE_RESOURCE_CONTROL_STRICT_MODE` | `tidb_resource_control_strict_mode` | GLOBAL | global | the keyspace's resource groups |
+| `OOM_ACTION` | `tidb_mem_oom_action` | GLOBAL | global | the keyspace's statements |
+| `GOGC_TUNER_THRESHOLD` | `tidb_gogc_tuner_threshold` | GLOBAL | instance | process memory |
+| `PLAN_REPLAYER_GC_LEASE` | -- | -- | internal | process internal |
+| `TI_FLASH_ENABLE_PIPELINE_MODE` | `tidb_enable_tiflash_pipeline_model` | GLOBAL | global | the keyspace's TiFlash requests |
+| `PROCESS_GENERAL_LOG` | `tidb_general_log` | INSTANCE | instance | Go `ScopeInstance`: the process's general log |
+| `ENABLE_RC_READ_CHECK_TS` | `tidb_rc_read_check_ts` | INSTANCE | instance | Go `ScopeInstance` |
+| `PERSIST_ANALYZE_OPTIONS` | `tidb_persist_analyze_options` | GLOBAL | global | the keyspace's statistics |
+| `STATS_LOAD_PSEUDO_TIMEOUT` | `tidb_stats_load_pseudo_timeout` | GLOBAL | global | the keyspace's statistics |
+| `ENABLE_BATCH_DML` | `tidb_enable_batch_dml` | GLOBAL | global | the keyspace's statements |
+| `ENABLE_NOOP_VARIABLES` | `tidb_enable_noop_variables` | GLOBAL | global | the keyspace's sessions |
+| `ENABLE_TMP_STORAGE_ON_OOM` | `tidb_enable_tmp_storage_on_oom` | GLOBAL | global | the keyspace's statements |
+| `ENABLE_BINDING_USAGE` | `tidb_enable_binding_usage` | GLOBAL | global | the keyspace's bindings |
+| `M_LOG_LOG_SLOW_PURGE` | `tidb_mlog_log_slow_purge` | GLOBAL | global | the keyspace's materialized views |
+| `IGNORE_INLIST_PLAN_DIGEST` | `tidb_ignore_inlist_plan_digest` | GLOBAL | global | the keyspace's statement digests |
+| `ENABLE_CONNECTION_EVENT_LOG` | `tidb_enable_connection_event_log` | GLOBAL | instance | the process's log |
+| `ENABLE_DIST_TASK` | `tidb_enable_dist_task` | GLOBAL | global | the keyspace's DXF tasks |
+| `PASSWORD_VALIDATION_LENGTH` | `validate_password.length` | GLOBAL | global | the keyspace's accounts |
+| `PASSWORD_VALIDATION_MIXED_CASE_COUNT` | `validate_password.mixed_case_count` | GLOBAL | global | the keyspace's accounts |
+| `PASSWORD_VALIDTAION_NUMBER_COUNT` | `validate_password.number_count` | GLOBAL | global | the keyspace's accounts |
+| `PASSWORD_VALIDATION_SPECIAL_CHAR_COUNT` | `validate_password.special_char_count` | GLOBAL | global | the keyspace's accounts |
+| `PASSWORD_HISTORY` | `password_history` | GLOBAL | global | the keyspace's accounts |
+| `PASSWORD_REUSE_INTERVAL` | `password_reuse_interval` | GLOBAL | global | the keyspace's accounts |
+| `MEM_QUOTA_BINDING_CACHE` | `tidb_mem_quota_binding_cache` | GLOBAL \| INSTANCE | instance | process memory |
+| `STATS_LOAD_SYNC_WAIT` | `tidb_stats_load_sync_wait` | GLOBAL \| SESSION | global | the keyspace's statistics |
+| `QUERY_LOG_MAX_LEN` | `tidb_query_log_max_len` | GLOBAL | instance | the process's log |
+| `PAGING_SIZE_BYTES` | `tidb_paging_size_bytes` | GLOBAL \| SESSION | global | the keyspace's coprocessor requests |
+| `EXPENSIVE_QUERY_TIME_THRESHOLD` | `tidb_expensive_query_time_threshold` | INSTANCE | instance | Go `ScopeInstance`: the process's watchdog |
+| `EXPENSIVE_TXN_TIME_THRESHOLD` | `tidb_expensive_txn_time_threshold` | INSTANCE | instance | Go `ScopeInstance`: the process's watchdog |
+| `ENABLE_P_PROF_SQLCPU` | `tidb_pprof_sql_cpu` | INSTANCE | instance | Go `ScopeInstance`: the process's profiler |
+| `PREPARED_PLAN_CACHE_MEMORY_GUARD_RATIO` | `tidb_prepared_plan_cache_memory_guard_ratio` | GLOBAL | instance | process memory |
+| `ANALYZE_COLUMN_OPTIONS` | `tidb_analyze_column_options` | GLOBAL | global | the keyspace's statistics |
+| `ADVANCER_CHECK_POINT_LAG_LIMIT` | `tidb_advancer_check_point_lag_limit` | GLOBAL | global | the keyspace's log backup |
+| `ENABLE_LOCAL_TXN` | `tidb_enable_local_txn` | GLOBAL | global | the keyspace's transactions |
+| `DDL_REORG_MAX_WRITE_SPEED` | `tidb_ddl_reorg_max_write_speed` | GLOBAL | global | the keyspace's DDL jobs |
+| `DDL_SLOW_OPR_THRESHOLD` | `ddl_slow_threshold` | INSTANCE | instance | Go `ScopeInstance`: the process's log |
+
+<!-- END generated: vardef classification -->
 
 ### 6.4 Caches keyed by table or job ID
 

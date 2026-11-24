@@ -494,6 +494,7 @@ pub fn is_read_only_var_in_next_gen(name: &str) -> bool {
 }
 
 pub mod bounds;
+pub mod classification;
 pub mod defaults;
 /// One function from `sessionctx/variable/sysvar.go` rather than from
 /// `vardef`: `GlobalSystemVariableInitialValue`, which decides the value a
