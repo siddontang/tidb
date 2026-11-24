@@ -156,3 +156,38 @@ fn analyze_persists_options_by_the_keyspace_setting() {
     assert_eq!(persisted(&tenant), [["0"]], "the tenant keeps no analyze options");
     assert_eq!(persisted(&configured), [["1"]], "the configured keyspace keeps them");
 }
+
+/// DDL reorg (reader batch 3): an ADD INDEX job takes its reorg write
+/// speed from its keyspace's `tidb_ddl_reorg_max_write_speed`, not the
+/// configured keyspace's.
+#[test]
+fn add_index_takes_the_keyspace_reorg_write_speed() {
+    if tidb_config_kerneltype::is_next_gen() {
+        // Nextgen keeps the variable read-only and hides the job's
+        // parameters.
+        return;
+    }
+    let users = ConfiguredUserStore::parse("root\t%\tmysql_native_password\t\n")
+        .unwrap()
+        .with_global_vars(tidb_domain::global_sysvars::GlobalSysvars::new().with_keyspace_vardef());
+    let tenant = MockStoreDomain::create_with_users(Arc::new(users)).unwrap();
+    tenant
+        .new_session()
+        .unwrap()
+        .run("set global tidb_ddl_reorg_max_write_speed = '1MiB'")
+        .unwrap();
+    let configured = MockStoreDomain::create().unwrap();
+
+    let job_comments = |store: &Arc<MockStoreDomain>| {
+        let mut session = store.new_session().unwrap();
+        for sql in ["use test", "create table t (a int)", "insert into t values (1), (2)", "alter table t add index i (a)"] {
+            session.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        }
+        let rows = crate::tests_support::row_text(session.run("admin show ddl jobs 1"));
+        rows[0].last().cloned().unwrap_or_default()
+    };
+    let tenant_comments = job_comments(&tenant);
+    assert!(tenant_comments.contains("max_write_speed=1048576"), "{tenant_comments}");
+    let configured_comments = job_comments(&configured);
+    assert!(!configured_comments.contains("max_write_speed"), "{configured_comments}");
+}

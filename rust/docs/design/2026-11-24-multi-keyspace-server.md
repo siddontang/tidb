@@ -708,7 +708,7 @@ How the global statics are kept per keyspace (`tidb_vardef::snapshot`):
 
 <!-- BEGIN generated: vardef classification -->
 
-92 statics: 57 global (51 kept per keyspace so far), 28 instance, 7 internal.
+92 statics: 56 global (50 kept per keyspace so far), 29 instance, 7 internal.
 
 | Static | System variable | Registry scope | Class | Per keyspace | Governs |
 | --- | --- | --- | --- | --- | --- |
@@ -740,7 +740,7 @@ How the global statics are kept per keyspace (`tidb_vardef::snapshot`):
 | `ENABLE_FAST_REORG` | `tidb_ddl_enable_fast_reorg` | GLOBAL | global | yes | the keyspace's DDL jobs |
 | `SERVICE_SCOPE` | `tidb_service_scope` | INSTANCE | instance | -- | Go `ScopeInstance`: this node's DXF scope |
 | `CLOUD_STORAGE_URI` | `tidb_cloud_storage_uri` | GLOBAL | global | not yet | the keyspace's import and DDL storage |
-| `DDL_DISK_QUOTA` | `tidb_ddl_disk_quota` | GLOBAL | global | yes | the keyspace's DDL jobs |
+| `DDL_DISK_QUOTA` | `tidb_ddl_disk_quota` | GLOBAL | instance | -- | the node's local disk, which every keyspace's ingest shares |
 | `ENABLE_TTL_JOB` | `tidb_ttl_job_enable` | GLOBAL | global | yes | the keyspace's TTL jobs |
 | `TTL_SCAN_BATCH_SIZE` | `tidb_ttl_scan_batch_size` | GLOBAL | global | yes | the keyspace's TTL jobs |
 | `TTL_DELETE_BATCH_SIZE` | `tidb_ttl_delete_batch_size` | GLOBAL | global | yes | the keyspace's TTL jobs |
@@ -830,7 +830,7 @@ keyspace's domain answers `tidb_external_ts` from its own store.
 
 <!-- BEGIN generated: set-global hook destinations -->
 
-145 variables with a `SetGlobal` hook: 53 keyspace, 92 process.
+145 variables with a `SetGlobal` hook: 52 keyspace, 93 process.
 
 | System variable | Registry scope | Hook writes | Class |
 | --- | --- | --- | --- |
@@ -873,7 +873,7 @@ keyspace's domain answers `tidb_external_ts` from its own store.
 | `tidb_cb_pd_metadata_error_rate_threshold_ratio` | GLOBAL | the process vardef static `CIRCUIT_BREAKER_PD_METADATA_ERROR_RATE_THRESHOLD_RATIO` | process |
 | `tidb_check_mb4_value_in_utf8` | INSTANCE | the process configuration | process |
 | `tidb_committer_concurrency` | GLOBAL | the process TiKV client | process |
-| `tidb_ddl_disk_quota` | GLOBAL | the keyspace vardef snapshot | keyspace |
+| `tidb_ddl_disk_quota` | GLOBAL | the process vardef static `DDL_DISK_QUOTA` | process |
 | `tidb_ddl_enable_fast_reorg` | GLOBAL | the keyspace vardef snapshot | keyspace |
 | `tidb_ddl_error_count_limit` | GLOBAL | the process vardef static `DDL_ERROR_COUNT_LIMIT` (not yet per keyspace) | process |
 | `tidb_ddl_flashback_concurrency` | GLOBAL | the keyspace vardef snapshot | keyspace |

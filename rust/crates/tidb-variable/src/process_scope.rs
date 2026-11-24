@@ -101,7 +101,7 @@ pub const HOOK_DESTINATIONS: &[HookDestination] = &[
     HookDestination { sysvar: "tidb_cb_pd_metadata_error_rate_threshold_ratio", scope: HookScope::Process, writes: "the process vardef static `CIRCUIT_BREAKER_PD_METADATA_ERROR_RATE_THRESHOLD_RATIO`" },
     HookDestination { sysvar: "tidb_check_mb4_value_in_utf8", scope: HookScope::Process, writes: "the process configuration" },
     HookDestination { sysvar: "tidb_committer_concurrency", scope: HookScope::Process, writes: "the process TiKV client" },
-    HookDestination { sysvar: "tidb_ddl_disk_quota", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
+    HookDestination { sysvar: "tidb_ddl_disk_quota", scope: HookScope::Process, writes: "the process vardef static `DDL_DISK_QUOTA`" },
     HookDestination { sysvar: "tidb_ddl_enable_fast_reorg", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },
     HookDestination { sysvar: "tidb_ddl_error_count_limit", scope: HookScope::Process, writes: "the process vardef static `DDL_ERROR_COUNT_LIMIT` (not yet per keyspace)" },
     HookDestination { sysvar: "tidb_ddl_flashback_concurrency", scope: HookScope::Keyspace, writes: "the keyspace vardef snapshot" },

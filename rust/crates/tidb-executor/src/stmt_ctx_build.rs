@@ -766,15 +766,21 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
             ),
             batch_size: int_var(tidb_vars::TIDB_DDL_REORG_BATCH_SIZE, defaults.batch_size),
             // Go `initJobReorgMetaFromVariables`:
-            // `vardef.DDLReorgMaxWriteSpeed.Load()`.
-            max_write_speed: tidb_vardef::DDL_REORG_MAX_WRITE_SPEED
+            // `vardef.DDLReorgMaxWriteSpeed.Load()`, the session's keyspace's.
+            max_write_speed: self
+                .session_vars()
+                .vardef()
+                .ddl_reorg_max_write_speed()
                 .load(std::sync::atomic::Ordering::SeqCst),
             max_dist_task_nodes: int_var(
                 tidb_vars::TIDB_MAX_DIST_TASK_NODES,
                 defaults.max_dist_task_nodes,
             ),
             enable_dist_task: bool_var(tidb_vars::TIDB_ENABLE_DIST_TASK, defaults.enable_dist_task),
-            enable_fast_reorg: tidb_vardef::ENABLE_FAST_REORG
+            enable_fast_reorg: self
+                .session_vars()
+                .vardef()
+                .enable_fast_reorg()
                 .load(std::sync::atomic::Ordering::SeqCst),
             target_scope: self
                 .session_vars()

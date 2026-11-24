@@ -118,7 +118,6 @@ vardef_snapshot! {
     enable_foreign_key: AtomicBool = ENABLE_FOREIGN_KEY (AtomicBool::new(true));
     enable_check_constraint: AtomicBool = ENABLE_CHECK_CONSTRAINT (AtomicBool::new(defaults::DEF_TIDB_ENABLE_CHECK_CONSTRAINT));
     enable_fast_reorg: AtomicBool = ENABLE_FAST_REORG (AtomicBool::new(defaults::DEF_TIDB_ENABLE_FAST_REORG));
-    ddl_disk_quota: AtomicU64 = DDL_DISK_QUOTA (AtomicU64::new(defaults::DEF_TIDB_DDL_DISK_QUOTA as u64));
     enable_ttl_job: AtomicBool = ENABLE_TTL_JOB (AtomicBool::new(defaults::DEF_TIDB_TTL_JOB_ENABLE));
     ttl_scan_batch_size: AtomicI64 = TTL_SCAN_BATCH_SIZE (AtomicI64::new(defaults::DEF_TIDB_TTL_SCAN_BATCH_SIZE));
     ttl_delete_batch_size: AtomicI64 = TTL_DELETE_BATCH_SIZE (AtomicI64::new(defaults::DEF_TIDB_TTL_DELETE_BATCH_SIZE));

@@ -213,9 +213,23 @@ fn show_comments_from_job(job: &Job) -> String {
             DEF_TIDB_DDL_REORG_BATCH_SIZE, DEF_TIDB_DDL_REORG_MAX_WRITE_SPEED,
             DEF_TIDB_DDL_REORG_WORKER_COUNT,
         };
+        // The keyspace's counters, which the statement's session entered
+        // (multi-keyspace design §6.3).
         let defaults = tidb_model::DDLReorgProcessDefaults::new(
-            || i64::from(tidb_vardef::get_ddl_reorg_worker_counter()),
-            || i64::from(tidb_vardef::get_ddl_reorg_batch_size()),
+            || {
+                i64::from(
+                    tidb_vardef::snapshot::current()
+                        .ddl_reorg_worker_counter()
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                )
+            },
+            || {
+                i64::from(
+                    tidb_vardef::snapshot::current()
+                        .ddl_reorg_batch_size()
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                )
+            },
         );
         let concurrency = meta.get_concurrency(defaults);
         let batch_size = meta.get_batch_size(defaults);

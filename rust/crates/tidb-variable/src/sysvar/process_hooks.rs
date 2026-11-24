@@ -105,7 +105,7 @@ set_global! {
         SeqCst,
     );
     // Go: `vardef.DDLDiskQuota.Store(TidbOptUint64(val, DefTiDBDDLDiskQuota))`.
-    set_tidb_ddl_disk_quota => |vd, s| vd.ddl_disk_quota().store(
+    set_tidb_ddl_disk_quota => |vd, s| tidb_vardef::DDL_DISK_QUOTA.store(
         s.parse::<u64>().unwrap_or(tidb_vardef::defaults::DEF_TIDB_DDL_DISK_QUOTA as u64),
         SeqCst,
     );
@@ -193,7 +193,7 @@ get_global! { |vd|
     get_tidb_enable_fast_create_table => on_off(vd.enable_fast_create_table().load(SeqCst));
     get_max_user_connections => vd.max_user_connections_value().load(SeqCst).to_string();
     get_performance_schema_session_connect_attrs_size => vd.connect_attrs_size().load(SeqCst).to_string();
-    get_tidb_ddl_disk_quota => vd.ddl_disk_quota().load(SeqCst).to_string();
+    get_tidb_ddl_disk_quota => tidb_vardef::DDL_DISK_QUOTA.load(SeqCst).to_string();
     get_tidb_auto_analyze_concurrency => vd.auto_analyze_concurrency().load(SeqCst).to_string();
     get_tidb_max_auto_analyze_time => vd.max_auto_analyze_time().load(SeqCst).to_string();
     get_tidb_stats_cache_mem_quota => tidb_vardef::STATS_CACHE_MEM_QUOTA.load(SeqCst).to_string();

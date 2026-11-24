@@ -620,7 +620,7 @@ pub(super) fn on_flashback_cluster(
             let (flashback_ts, start_ts, key_ranges) = flashback_rpc_args(&args.read());
             // Split region by keyRanges, make sure no unrelated key ranges be locked.
             let region_store = flashback_region_store(sessions)?;
-            let concurrency = tidb_vardef::get_ddl_flashback_concurrency() as usize;
+            let concurrency = tidb_vardef::snapshot::current().ddl_flashback_concurrency().load(std::sync::atomic::Ordering::SeqCst) as usize;
             split_regions_by_key_ranges(region_store.as_ref(), &key_ranges);
             let mut total_regions = 0_u64;
             for (start_key, end_key) in &key_ranges {
@@ -652,7 +652,7 @@ pub(super) fn on_flashback_cluster(
             let (flashback_ts, start_ts, key_ranges) = flashback_rpc_args(&args.read());
             let commit_ts = args.read().commit_ts;
             let region_store = flashback_region_store(sessions)?;
-            let concurrency = tidb_vardef::get_ddl_flashback_concurrency() as usize;
+            let concurrency = tidb_vardef::snapshot::current().ddl_flashback_concurrency().load(std::sync::atomic::Ordering::SeqCst) as usize;
             for (start_key, end_key) in &key_ranges {
                 // Use same startTS as prepare phase to simulate 1PC txn.
                 region_store

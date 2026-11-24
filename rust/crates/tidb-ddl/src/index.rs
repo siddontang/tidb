@@ -60,11 +60,13 @@ pub static UPDATE_DDL_JOB_REORG_CFG_INTERVAL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(2000);
 
 /// Go `ReorgMeta.GetConcurrency` / `GetBatchSize` over the job's reorg meta:
-/// an unset value falls back to the global `vardef` counters.
+/// an unset value falls back to the global `vardef` counters -- the
+/// keyspace's the running DDL entered (multi-keyspace design §6.3).
 pub fn reorg_defaults() -> tidb_model::DDLReorgProcessDefaults {
+    use std::sync::atomic::Ordering::SeqCst;
     tidb_model::DDLReorgProcessDefaults::new(
-        || i64::from(tidb_vardef::get_ddl_reorg_worker_counter()),
-        || i64::from(tidb_vardef::get_ddl_reorg_batch_size()),
+        || i64::from(tidb_vardef::snapshot::current().ddl_reorg_worker_counter().load(SeqCst)),
+        || i64::from(tidb_vardef::snapshot::current().ddl_reorg_batch_size().load(SeqCst)),
     )
 }
 

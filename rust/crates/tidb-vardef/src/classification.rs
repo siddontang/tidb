@@ -98,7 +98,7 @@ pub const PROCESS_STATICS: &[ProcessStatic] = &[
     ProcessStatic { name: "ENABLE_FAST_REORG", sysvar: Some("tidb_ddl_enable_fast_reorg"), scope: StaticScope::Global, governs: "the keyspace's DDL jobs" },
     ProcessStatic { name: "SERVICE_SCOPE", sysvar: Some("tidb_service_scope"), scope: StaticScope::Instance, governs: "Go `ScopeInstance`: this node's DXF scope" },
     ProcessStatic { name: "CLOUD_STORAGE_URI", sysvar: Some("tidb_cloud_storage_uri"), scope: StaticScope::Global, governs: "the keyspace's import and DDL storage" },
-    ProcessStatic { name: "DDL_DISK_QUOTA", sysvar: Some("tidb_ddl_disk_quota"), scope: StaticScope::Global, governs: "the keyspace's DDL jobs" },
+    ProcessStatic { name: "DDL_DISK_QUOTA", sysvar: Some("tidb_ddl_disk_quota"), scope: StaticScope::Instance, governs: "the node's local disk, which every keyspace's ingest shares" },
     ProcessStatic { name: "ENABLE_TTL_JOB", sysvar: Some("tidb_ttl_job_enable"), scope: StaticScope::Global, governs: "the keyspace's TTL jobs" },
     ProcessStatic { name: "TTL_SCAN_BATCH_SIZE", sysvar: Some("tidb_ttl_scan_batch_size"), scope: StaticScope::Global, governs: "the keyspace's TTL jobs" },
     ProcessStatic { name: "TTL_DELETE_BATCH_SIZE", sysvar: Some("tidb_ttl_delete_batch_size"), scope: StaticScope::Global, governs: "the keyspace's TTL jobs" },
