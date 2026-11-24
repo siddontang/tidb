@@ -330,11 +330,36 @@ impl Opener {
             runtime.stack.factory.install_tls_manager(manager, variables);
         }
         provision(keyspace, &runtime.stack.factory, self.root_password.as_deref());
+        start_expensive_query_watchdog(keyspace, &runtime.stack.factory);
         tidb_logutil::bg_logger().info(
             "keyspace opened for multi-keyspace serving",
             &[tidb_log::Field::new("keyspace", tidb_log::Value::Str(keyspace.to_owned()))],
         );
         Ok((runtime, authority))
+    }
+}
+
+/// Go `go dom.ExpensiveQueryHandle().SetSessionManager(svr).Run()` for an
+/// extra keyspace: `ConcurrentSqlNode::bind` starts only the configured
+/// keyspace's. The watchdog checks this keyspace's processes (its client
+/// sessions and its auto-analyze workers) against this keyspace's
+/// `tidb_max_auto_analyze_time` (design §6.3), and stops when the runtime
+/// retires (`Domain::close` drops its exit).
+fn start_expensive_query_watchdog(keyspace: &str, factory: &Domain) {
+    let handle = factory.expensive_query_handle();
+    handle.set_session_manager(factory.session_manager());
+    let keyspace = keyspace.to_owned();
+    let spawned = std::thread::Builder::new()
+        .name("tidb-expensive-query".to_owned())
+        .spawn(move || {
+            let _tenant = tidb_logutil::enter_tenant(&keyspace);
+            handle.run();
+        });
+    if let Err(error) = spawned {
+        tidb_logutil::bg_logger().warn(
+            "start expensive query watchdog failed",
+            &[tidb_log::Field::new("error", tidb_log::Value::Str(error.to_string()))],
+        );
     }
 }
 
@@ -401,6 +426,82 @@ mod tests {
         assert_eq!(keyspace_of_user("root"), None);
         assert_eq!(keyspace_of_user(".root"), None);
         assert_eq!(keyspace_of_user("ks."), None);
+    }
+
+    /// Records the kills an expensive-query watchdog sends a process.
+    #[derive(Default)]
+    struct RecordingKill(std::sync::atomic::AtomicUsize);
+
+    impl tidb_sessmgr::ProcessKillTarget for RecordingKill {
+        fn cancel_query(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn kill_connection(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// An extra keyspace runs its own expensive-query watchdog over its own
+    /// processes and its own `tidb_max_auto_analyze_time` (design §6.3):
+    /// the tenant's 1-second limit cancels the tenant's auto-analyze, and
+    /// the configured keyspace's auto-analyze of the same age runs on under
+    /// the configured keyspace's (process) limit.
+    #[test]
+    fn an_extra_keyspace_runs_its_own_expensive_query_watchdog() {
+        use std::sync::atomic::Ordering::SeqCst;
+        use tidb_session::domain::configured_user_store::ConfiguredUserStore;
+        use tidb_session::domain::mock_store::MockStoreDomain;
+        use tidb_stats_handle_util::GLOBAL_AUTO_ANALYZE_PROCESS_LIST;
+
+        let configured = MockStoreDomain::create().unwrap();
+        let users = ConfiguredUserStore::parse("root\t%\tmysql_native_password\t\n")
+            .unwrap()
+            .with_global_vars(tidb_domain::global_sysvars::GlobalSysvars::new().with_keyspace_vardef());
+        let tenant = MockStoreDomain::create_with_users(Arc::new(users)).unwrap();
+        tenant.new_session().unwrap().run("set global tidb_max_auto_analyze_time = 1").unwrap();
+        assert_eq!(tenant.factory().vardef().max_auto_analyze_time().load(SeqCst), 1);
+        let configured_limit = tidb_vardef::MAX_AUTO_ANALYZE_TIME.load(SeqCst);
+        assert!(configured_limit == 0 || configured_limit > 60, "{configured_limit}");
+
+        // One auto-analyze process in each keyspace, both running for longer
+        // than the tenant's limit.
+        let auto_analyze = |store: &MockStoreDomain, id: u64| {
+            let target = Arc::new(RecordingKill::default());
+            let guard = store.factory().processes().register(
+                id,
+                String::new(),
+                "localhost".to_owned(),
+                "test".to_owned(),
+                Some(target.clone()),
+            );
+            store.factory().processes().statement_started(id, "analyze table test.t", "executing");
+            GLOBAL_AUTO_ANALYZE_PROCESS_LIST.tracker(id);
+            (guard, target)
+        };
+        let (_tenant_guard, tenant_target) = auto_analyze(&tenant, 7_700_001);
+        let (_configured_guard, configured_target) = auto_analyze(&configured, 7_700_002);
+        std::thread::sleep(Duration::from_millis(1_300));
+
+        // The configured keyspace's watchdog, as `ConcurrentSqlNode::bind`
+        // starts it, and the extra keyspace's, as its open starts it.
+        crate::sql_node::run_expensive_query_handle(
+            configured.factory().expensive_query_handle(),
+            configured.factory().session_manager(),
+        );
+        start_expensive_query_watchdog("tenant", tenant.factory());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tenant_target.0.load(SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Several ticks more, for the configured watchdog's chance.
+        std::thread::sleep(Duration::from_millis(500));
+        GLOBAL_AUTO_ANALYZE_PROCESS_LIST.untracker(7_700_001);
+        GLOBAL_AUTO_ANALYZE_PROCESS_LIST.untracker(7_700_002);
+        assert!(tenant_target.0.load(SeqCst) > 0, "the tenant's watchdog cancels its auto-analyze");
+        assert_eq!(configured_target.0.load(SeqCst), 0, "the configured keyspace's limit is its own");
+        configured.factory().close();
+        tenant.factory().close();
     }
 
     #[test]
