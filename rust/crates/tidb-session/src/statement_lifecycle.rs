@@ -850,8 +850,9 @@ impl StatementLifecycle<'_> {
             }
             LockKeysOutcome::TransactionError(error) => {
                 self.session.record_pessimistic_lock_error(error.code);
-                // The transaction is no longer usable; later statements and
-                // `ROLLBACK` report that state on their own.
+                // Go `finishStmt`'s `StmtRollback`: the transaction stays
+                // open, as client-go's `lockKeys` leaves it valid, and its
+                // `COMMIT` publishes the earlier statements' writes.
                 self.txn.buffer().restore(savepoint.clone());
                 Err(transactions::sql_error(error))
             }

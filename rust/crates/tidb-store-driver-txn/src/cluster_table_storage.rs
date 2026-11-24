@@ -111,7 +111,9 @@ pub enum LockKeysOutcome {
     /// The statement fails with this error and its locks are released; the
     /// transaction stays open (Go's statement-scoped 1205/1213 family).
     StatementError(LockSqlError),
-    /// The transaction itself is no longer usable.
+    /// The statement fails with this error, which is not one of the
+    /// statement-scoped lock errors above. The transaction stays open, as
+    /// client-go's `lockKeys` leaves it valid.
     TransactionError(LockSqlError),
 }
 
@@ -127,7 +129,8 @@ pub enum StatementLockFailure {
     },
     /// The statement fails with this error; the transaction stays open.
     Statement(LockSqlError),
-    /// The transaction itself is no longer usable.
+    /// The statement fails with this error (see
+    /// [`LockKeysOutcome::TransactionError`]); the transaction stays open.
     Transaction(LockSqlError),
 }
 
@@ -752,8 +755,10 @@ fn arm_fair_locking<S: StoreClient>(state: &mut SessionTransactionState<S>, fair
 
 /// Go `KVTxn.LockKeys` in a pessimistic transaction, as every statement lock
 /// takes it: fair locking armed, the locks acquired at the for-update
-/// timestamp, the lock duration observed, and the transaction ended when the
-/// failure is the transaction's. `None` when the transaction is not
+/// timestamp and the lock duration observed. A failure leaves the
+/// transaction open, as client-go's `lockKeys` leaves `txn.valid` (only
+/// `close` clears it); the session decides whether the transaction ends
+/// (Go `autoCommitAfterStmt`). `None` when the transaction is not
 /// pessimistic; the caller decides what that means.
 #[allow(clippy::too_many_arguments)]
 fn lock_pessimistic<S: StoreClient>(
@@ -791,9 +796,7 @@ fn lock_pessimistic<S: StoreClient>(
         wait,
         &call,
     );
-    if matches!(outcome, LockKeysOutcome::TransactionError(_)) {
-        let _ = finish_session_transaction(state);
-    } else {
+    if !matches!(outcome, LockKeysOutcome::TransactionError(_)) {
         // Go `LockKeysDetail.TotalTime` feeds the client-go
         // `pessimistic_lock_keys_duration` histogram (`adapter.go:588`),
         // charged per lock acquisition through the client's own registry.

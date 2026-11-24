@@ -1794,6 +1794,50 @@ fn a_held_record_lock_does_not_suppress_a_new_duplicate_assertion() {
     );
 }
 
+/// client-go `KVTxn.lockKeys` returns a non-retryable lock error without
+/// invalidating the transaction, and Go's `autoCommitAfterStmt` rolls an
+/// explicit transaction back only for `shouldRollbackTxnOnError`'s deadlock or
+/// shared-lock loss: the failed statement is rolled back (`StmtRollback`),
+/// the transaction keeps its earlier writes, and `COMMIT` commits them.
+#[test]
+fn commit_after_aborted_pessimistic_lock_commits_earlier_writes_without_panic() {
+    let (stack, _users) = cop_backed_stack();
+    let mut session = stack.factory.open_session(session_context(126)).unwrap();
+    rows(
+        &mut session,
+        "CREATE TABLE test.aborted_lock (id INT PRIMARY KEY, v VARCHAR(10))",
+    );
+    session
+        .node_conn()
+        .control_transaction("BEGIN PESSIMISTIC")
+        .unwrap();
+    session
+        .node_conn()
+        .execute_write("INSERT INTO test.aborted_lock VALUES (1,'a')")
+        .unwrap();
+    // client-go `pessimisticLockMutations`' `beforePessimisticLock`
+    // `return("fail")`: a non-retryable error from AcquirePessimisticLock, as
+    // a store answering `KeyError.abort` gives.
+    tikv_client::tikv::enable_failpoints();
+    let fail = tidb_failpoint::enable_for_test("tikvclient/beforePessimisticLock", "return(\"fail\")");
+    let error = session
+        .node_conn()
+        .execute_write("INSERT INTO test.aborted_lock VALUES (2,'b')")
+        .unwrap_err();
+    drop(fail);
+    assert_eq!(error.code, 1105, "{error:?}");
+    assert!(
+        error.message.contains("injected failure at pessimistic lock"),
+        "{error:?}"
+    );
+    session.node_conn().control_transaction("COMMIT").unwrap();
+    assert_eq!(displayed(rows(&mut session, "SELECT 1")), [["1"]]);
+    assert_eq!(
+        displayed(rows(&mut session, "SELECT * FROM test.aborted_lock")),
+        [["1", "a"]]
+    );
+}
+
 #[test]
 fn system_table_hidden_ids_use_the_full_counter_key() {
     let (stack, _users) = cop_backed_stack();
