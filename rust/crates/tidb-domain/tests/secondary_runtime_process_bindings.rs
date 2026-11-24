@@ -15,7 +15,8 @@
 //! Opening another keyspace of a multi-keyspace node leaves the process's
 //! bindings to the configured keyspace alone
 //! (`rust/docs/design/2026-11-24-multi-keyspace-server.md`, §6.3): the cloud
-//! storage URI, the PD client option callbacks and the external timestamp.
+//! storage URI, the PD client option callbacks and the external timestamp
+//! (PD keeps one per cluster, so a tenant never writes it).
 //! Separate executable with one test: the bindings are process slots.
 
 use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering::SeqCst};
@@ -40,16 +41,20 @@ impl tidb_variable::vars::PdRegionPolicy for RecordingPd {
     }
 }
 
-/// A store's external timestamp.
+/// A store's view of the PD cluster's external timestamp, recording writes.
 #[derive(Debug, Default)]
-struct Store(AtomicU64);
+struct Store {
+    ts: AtomicU64,
+    sets: Mutex<Vec<u64>>,
+}
 
 impl tidb_variable::vars::ExternalTimestampProvider for Store {
     fn get(&self) -> Result<u64, String> {
-        Ok(self.0.load(SeqCst))
+        Ok(self.ts.load(SeqCst))
     }
     fn set(&self, ts: u64) -> Result<(), String> {
-        self.0.store(ts, SeqCst);
+        self.sets.lock().unwrap().push(ts);
+        self.ts.store(ts, SeqCst);
         Ok(())
     }
 }
@@ -68,13 +73,15 @@ fn a_secondary_open_keeps_the_process_bindings() {
     *tidb_vardef::CLOUD_STORAGE_URI.write().unwrap() = "local:///tmp/configured-uri".to_owned();
 
     // Another keyspace opens with NO stored URI: its rebuild loads the
-    // default (empty) value.
+    // default (empty) value. It has a stored `tidb_external_ts`, which its
+    // rebuild must not write to PD: PD keeps one external timestamp per
+    // cluster, so the tenant's row would move every keyspace's.
     let tenant = GlobalSysvars::new().with_keyspace_vardef();
     let tenant_pd = Arc::new(RecordingPd::default());
     let tenant_store = Arc::new(Store::default());
     tenant.set_external_timestamp_provider(tenant_store.clone());
     tenant.set_pd_region_policy(tenant_pd.clone());
-    tenant.load_from_cluster(Vec::<(String, String)>::new());
+    tenant.load_from_cluster(vec![("tidb_external_ts".to_owned(), "2000".to_owned())]);
     tenant.rebuild_sys_var_cache().unwrap();
     tenant.arm_domain_hooks();
     assert_eq!(*tidb_vardef::CLOUD_STORAGE_URI.read().unwrap(), "local:///tmp/configured-uri");
@@ -85,11 +92,18 @@ fn a_secondary_open_keeps_the_process_bindings() {
     assert_eq!(configured_pd.rpc_concurrency.load(SeqCst), 4);
     assert!(tenant_pd.calls.lock().unwrap().is_empty(), "{:?}", tenant_pd.calls.lock().unwrap());
 
-    // Each keyspace's `tidb_external_ts` is its own store's.
+    // The tenant's rebuild wrote no external timestamp.
+    assert!(tenant_store.sets.lock().unwrap().is_empty(), "{:?}", tenant_store.sets.lock().unwrap());
+    assert!(configured_store.sets.lock().unwrap().is_empty(), "{:?}", configured_store.sets.lock().unwrap());
+
+    // Only the configured keyspace writes the cluster's external timestamp
+    // (a tenant's `SET GLOBAL` is refused before it reaches the table); a
+    // write that reaches a tenant's table anyway runs no hook.
     configured.set("tidb_external_ts", "1000".to_owned()).unwrap();
-    tenant.set("tidb_external_ts", "2000".to_owned()).unwrap();
-    assert_eq!(configured_store.0.load(SeqCst), 1000);
-    assert_eq!(tenant_store.0.load(SeqCst), 2000);
+    assert_eq!(*configured_store.sets.lock().unwrap(), [1000]);
+    let _ = tenant.set("tidb_external_ts", "3000".to_owned());
+    tenant.rebuild_sys_var_cache().unwrap();
+    assert!(tenant_store.sets.lock().unwrap().is_empty(), "{:?}", tenant_store.sets.lock().unwrap());
+    assert_eq!(*configured_store.sets.lock().unwrap(), [1000]);
     assert_eq!(configured.get("tidb_external_ts").unwrap(), "1000");
-    assert_eq!(tenant.get("tidb_external_ts").unwrap(), "2000");
 }

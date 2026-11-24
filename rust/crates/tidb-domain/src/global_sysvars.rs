@@ -115,9 +115,12 @@ pub struct GlobalSysvars {
     /// statics to (multi-keyspace design §6.3): the process statics, or the
     /// keyspace's own on a multi-keyspace node's other keyspaces.
     vardef: Arc<tidb_vardef::VardefSnapshot>,
-    /// The store `tidb_external_ts` reads and writes for a keyspace that owns
-    /// its vardef values (its domain installs it); a table over the process
-    /// statics uses the process slot. Shared by every clone.
+    /// The store `tidb_external_ts` reads from for a keyspace that owns its
+    /// vardef values (its domain installs it); a table over the process
+    /// statics uses the process slot. Read-only: PD keeps one external
+    /// timestamp per cluster, not per keyspace, so `tidb_external_ts` is a
+    /// process variable (design §6.3) that only the configured keyspace
+    /// writes. Shared by every clone.
     external_timestamp: Arc<std::sync::OnceLock<Arc<dyn tidb_variable::vars::ExternalTimestampProvider>>>,
 }
 
@@ -419,8 +422,9 @@ impl GlobalSysvars {
         self
     }
 
-    /// The store `tidb_external_ts` of this table's keyspace lives in, for a
-    /// keyspace that owns its vardef values (design §6.3).
+    /// The store this table's keyspace reads `tidb_external_ts` from, for a
+    /// keyspace that owns its vardef values (design §6.3). The value is the
+    /// PD cluster's; the keyspace never writes it.
     pub fn set_external_timestamp_provider(&self, provider: Arc<dyn tidb_variable::vars::ExternalTimestampProvider>) {
         let _ = self.external_timestamp.set(provider);
     }
@@ -1051,15 +1055,6 @@ impl GlobalSysvars {
         if !self.publishes_runtime_settings
             || !self.domain_hooks.load(std::sync::atomic::Ordering::SeqCst)
         {
-            return;
-        }
-        // `tidb_external_ts` of a keyspace that owns its vardef values lives in
-        // its own store (design §6.3), not behind the process slot.
-        if let Some(provider) = self.own_external_timestamp(name) {
-            let zone = tidb_variable::vars::SessionVars::new().session_time_zone();
-            if let Ok(ts) = tidb_variable::vars::parse_read_timestamp(value, &zone, true) {
-                let _ = provider.set(ts);
-            }
             return;
         }
         // A keyspace that owns its vardef values never writes the process's

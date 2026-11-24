@@ -383,6 +383,11 @@ fn a_tenant_cannot_set_process_variables() {
         assert_eq!(code, 1227, "{sql}: {message}");
         assert!(message.contains("RESTRICTED_VARIABLES_ADMIN"), "{sql}: {message}");
     }
+    // PD keeps one external timestamp per cluster, not per keyspace: a
+    // tenant cannot move it for every keyspace.
+    let (code, message) =
+        refusal(&mut session, "set global tidb_external_ts = 1000").expect("set global tidb_external_ts ran");
+    assert_eq!(code, 1227, "{message}");
     // The refused SET reached no process switch.
     assert_eq!(tikv_client::resource_control_enabled(), resource_control_client);
     // The keyspace's own variables, and the session's.

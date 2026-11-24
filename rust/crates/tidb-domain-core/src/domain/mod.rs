@@ -1042,8 +1042,10 @@ impl Domain {
         // Go `initDomainSysVars`: `variable.SetExternalTimestamp` /
         // `GetExternalTimestamp` over this domain's store. The process slot
         // is the configured keyspace's; a keyspace that owns its vardef values
-        // answers `tidb_external_ts` from its own store (design §6.3), so a
-        // later keyspace's domain does not take the slot over.
+        // reads `tidb_external_ts` through its own store (design §6.3), so a
+        // later keyspace's domain does not take the slot over. PD keeps one
+        // external timestamp per cluster, so only the configured keyspace
+        // writes it: for every other keyspace it is a process variable.
         let external_timestamp = Arc::new(ClusterExternalTimestamp(Arc::clone(&transactions)));
         if global_vars.vardef().is_per_keyspace() {
             global_vars.set_external_timestamp_provider(external_timestamp);

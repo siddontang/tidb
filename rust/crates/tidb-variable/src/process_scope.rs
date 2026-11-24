@@ -135,7 +135,7 @@ pub const HOOK_DESTINATIONS: &[HookDestination] = &[
     HookDestination { sysvar: "tidb_enable_tso_follower_proxy", scope: HookScope::Process, writes: "the process vardef static `ENABLE_TSO_FOLLOWER_PROXY`" },
     HookDestination { sysvar: "tidb_expensive_query_time_threshold", scope: HookScope::Process, writes: "the process vardef static `EXPENSIVE_QUERY_TIME_THRESHOLD`" },
     HookDestination { sysvar: "tidb_expensive_txn_time_threshold", scope: HookScope::Process, writes: "the process vardef static `EXPENSIVE_TXN_TIME_THRESHOLD`" },
-    HookDestination { sysvar: "tidb_external_ts", scope: HookScope::Keyspace, writes: "the keyspace store's external timestamp (its own provider; the process slot is the configured keyspace's)" },
+    HookDestination { sysvar: "tidb_external_ts", scope: HookScope::Process, writes: "the PD external timestamp, which is cluster-scoped, not keyspace-scoped" },
     HookDestination { sysvar: "tidb_force_priority", scope: HookScope::Process, writes: "the process vardef static `FORCE_PRIORITY`" },
     HookDestination { sysvar: "tidb_general_log", scope: HookScope::Process, writes: "the process vardef static `PROCESS_GENERAL_LOG`" },
     HookDestination { sysvar: "tidb_generate_binary_plan", scope: HookScope::Process, writes: "the process log and trace" },
@@ -262,7 +262,7 @@ mod tests {
             let is_kept = kept.contains(&hook.sysvar);
             match hook.scope {
                 HookScope::Keyspace => assert!(
-                    is_kept || hook.writes.starts_with("none") || hook.writes.starts_with("the keyspace store"),
+                    is_kept || hook.writes.starts_with("none"),
                     "{hook:?}"
                 ),
                 HookScope::Process => assert!(!is_kept, "{hook:?}"),
@@ -282,6 +282,9 @@ mod tests {
         assert!(is_process_variable("tidb_mem_quota_analyze"));
         assert!(is_process_variable("tidb_top_sql_max_time_series_count"));
         assert!(is_process_variable("tidb_enable_resource_control"));
+        // The PD cluster's state: PD keeps one external timestamp per
+        // cluster, not per keyspace.
+        assert!(is_process_variable("tidb_external_ts"));
         // A vardef global static not yet kept per keyspace.
         assert!(is_process_variable("tidb_ddl_error_count_limit"));
         assert!(is_process_variable("tidb_cloud_storage_uri"));
