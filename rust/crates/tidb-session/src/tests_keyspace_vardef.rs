@@ -191,3 +191,35 @@ fn add_index_takes_the_keyspace_reorg_write_speed() {
     let configured_comments = job_comments(&configured);
     assert!(!configured_comments.contains("max_write_speed"), "{configured_comments}");
 }
+
+/// Resource-control strict mode (3c): `SET RESOURCE GROUP` needs
+/// `RESOURCE_GROUP_ADMIN` or `RESOURCE_GROUP_USER` while the session's
+/// keyspace keeps `tidb_resource_control_strict_mode` on. A tenant that
+/// turns it off lets its users switch groups; the configured keyspace
+/// (strict, the default) still refuses its own.
+#[test]
+fn set_resource_group_follows_the_keyspace_strict_mode() {
+    let users = ConfiguredUserStore::parse("root\t%\tmysql_native_password\t\n")
+        .unwrap()
+        .with_global_vars(tidb_domain::global_sysvars::GlobalSysvars::new().with_keyspace_vardef());
+    let tenant = MockStoreDomain::create_with_users(Arc::new(users)).unwrap();
+    let configured = MockStoreDomain::create().unwrap();
+    let mut tenant_admin = tenant.new_session().unwrap();
+    tenant_admin.run("set global tidb_resource_control_strict_mode = off").unwrap();
+    assert!(
+        tidb_vardef::ENABLE_RESOURCE_CONTROL_STRICT_MODE.load(std::sync::atomic::Ordering::SeqCst),
+        "the process value is untouched"
+    );
+
+    let switch_group = |store: &Arc<MockStoreDomain>| {
+        let mut admin = store.new_session().unwrap();
+        admin.run("create user if not exists 'u'@'%'").unwrap();
+        let mut user = store.new_session().unwrap();
+        user.set_user("u@%".to_owned(), "u@127.0.0.1".to_owned());
+        user.run("set resource group default")
+            .map(drop)
+            .map_err(|error| error.to_mysql_error().code)
+    };
+    assert_eq!(switch_group(&tenant), Ok(()));
+    assert_eq!(switch_group(&configured), Err(1227));
+}

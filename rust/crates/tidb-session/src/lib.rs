@@ -4123,6 +4123,10 @@ impl tidb_planner::plan_builder::stmt_build::SessionPlanContext for Session {
 
     fn keyspace_name(&self) -> String { self.keyspace_context().name().to_owned() }
 
+    fn resource_control_strict_mode(&self) -> bool {
+        self.vars.vardef().enable_resource_control_strict_mode().load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn refresh_snapshot_info_schema(
         &self,
         ts: u64,

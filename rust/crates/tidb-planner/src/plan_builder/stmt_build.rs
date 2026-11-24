@@ -51,6 +51,12 @@ pub trait SessionPlanContext {
         tidb_config::config_tree::config::get_global_keyspace_name()
     }
 
+    /// Go `vardef.EnableResourceControlStrictMode.Load()` for the keyspace
+    /// the session acts in (multi-keyspace design §6.3).
+    fn resource_control_strict_mode(&self) -> bool {
+        tidb_vardef::ENABLE_RESOURCE_CONTROL_STRICT_MODE.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Go `gcutil.ValidateSnapshotWithGCSafePoint(ts, GetGCSafePoint(sctx))`
     /// and `staleread.GetSessionSnapshotInfoSchema(sctx, ts)`: the schema an
     /// AS OF refresh's MIN / MAX lookup plans over.
@@ -525,9 +531,11 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
                     }
                 }
                 SessionStmt::SetResourceGroup(_) => {
-                    if tidb_vardef::ENABLE_RESOURCE_CONTROL_STRICT_MODE
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                    {
+                    let strict_mode = self.session_ctx.map_or_else(
+                        || tidb_vardef::ENABLE_RESOURCE_CONTROL_STRICT_MODE.load(std::sync::atomic::Ordering::SeqCst),
+                        |session| session.resource_control_strict_mode(),
+                    );
+                    if strict_mode {
                         self.visit_info.push(dynamic_visit(
                             &["RESOURCE_GROUP_ADMIN", "RESOURCE_GROUP_USER"],
                             false,
