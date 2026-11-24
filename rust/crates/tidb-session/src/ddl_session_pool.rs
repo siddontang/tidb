@@ -677,6 +677,8 @@ impl ClusterTransactions for StepTransactions {
     fn kv_storage(&self) -> Arc<dyn tidb_txnkv::kv_storage::Storage> { self.inner.kv_storage() }
     /// Go `session.GetStore().GetCodec().GetKeyspaceID`.
     fn keyspace_id(&self) -> u32 { self.inner.keyspace_id() }
+    /// Go `session.GetStore().GetKeyspace`.
+    fn store_keyspace(&self) -> String { self.inner.store_keyspace() }
     fn fresh_timestamp(&self) -> Result<u64, String> {
         self.inner.fresh_timestamp()
     }

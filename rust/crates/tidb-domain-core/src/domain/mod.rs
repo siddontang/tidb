@@ -638,9 +638,9 @@ pub type BindingHandleSlot =
 pub struct Domain {
     /// Go `Domain.store.GetKeyspace`: installed from the opened store.
     store_keyspace: std::sync::OnceLock<String>,
-    /// The keyspace this domain's runtime serves (design §6.1), when the
-    /// runtime bound one; see [`Self::keyspace_context`].
-    keyspace: std::sync::OnceLock<Arc<tidb_keyspace::KeyspaceContext>>,
+    /// The keyspace this domain's sessions act for (design §6.1): the one
+    /// its runtime bound, else its store's; see [`Self::keyspace_context`].
+    keyspace: std::sync::OnceLock<Option<Arc<tidb_keyspace::KeyspaceContext>>>,
     cross_ks_runtimes: std::sync::OnceLock<cross_ks::CrossKsRuntimes>,
     /// Go `Domain.unprefixedEtcdCli`: cluster-wide metadata client.
     unprefixed_etcd_client: std::sync::OnceLock<Arc<tidb_pd_client::EtcdClient>>,
@@ -1847,17 +1847,22 @@ impl Domain {
     /// Binds the keyspace identity this domain's runtime serves, once,
     /// before its sessions open.
     pub fn install_keyspace_context(&self, keyspace: tidb_keyspace::KeyspaceContext) {
-        self.keyspace.set(Arc::new(keyspace)).expect("keyspace identity installed once");
+        self.keyspace.set(Some(Arc::new(keyspace))).expect("keyspace identity installed once");
     }
 
     /// The keyspace this domain's sessions and background work act for:
     /// their slow-log and statement-summary keyspace, resource-group tags,
-    /// username policy and IMPORT INTO keys. `None` for a domain whose
-    /// runtime bound none (a test stack that names no keyspace); its readers
-    /// fall back to the process's configured keyspace
+    /// username policy and IMPORT INTO keys. A domain its runtime bound no
+    /// identity to (an internal domain over a store: the DDL and system
+    /// session pools, the bootstrap's variable loader, a cross-keyspace
+    /// domain) acts for its store's keyspace. `None` only over an API-V1
+    /// store, which names no keyspace; its readers fall back to the
+    /// process's configured keyspace
     /// ([`tidb_keyspace::KeyspaceContext::unbound`]).
     pub fn keyspace_context(&self) -> Option<&Arc<tidb_keyspace::KeyspaceContext>> {
-        self.keyspace.get()
+        self.keyspace
+            .get_or_init(|| tidb_keyspace::KeyspaceContext::of_store(&*self.transactions.store_keyspace(), self.transactions.keyspace_id()).map(Arc::new))
+            .as_ref()
     }
 
     /// Go `Domain.Init`: retains a handle without a keyspace namespace.

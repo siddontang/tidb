@@ -462,10 +462,19 @@ impl Session {
 impl NodeConn {
     /// Go `session.GetStore().GetCodec().GetKeyspaceID`.
     pub(crate) fn keyspace_id(&self) -> u32 { self.transactions.keyspace_id() }
-    /// The keyspace identity of the domain this connection runs on, when its
-    /// runtime bound one (design §6.1).
+    /// The keyspace this connection acts for (design §6.1): a cross-keyspace
+    /// target store's, else its domain's, else its own store's. `None` only
+    /// over an API-V1 store.
     pub(crate) fn keyspace_context(&self) -> Option<Arc<tidb_keyspace::KeyspaceContext>> {
-        self.domain.as_ref().and_then(|domain| domain.keyspace_context().cloned())
+        if let Some(target) = &self.cross_ks_store {
+            return tidb_keyspace::KeyspaceContext::of_store(&target.keyspace, target.transactions.keyspace_id())
+                .map(Arc::new);
+        }
+        if let Some(domain) = &self.domain {
+            return domain.keyspace_context().cloned();
+        }
+        tidb_keyspace::KeyspaceContext::of_store(&self.transactions.store_keyspace(), self.transactions.keyspace_id())
+            .map(Arc::new)
     }
     /// Go `session.GetLatestInfoSchema`.
     pub(crate) fn latest_info_schema(&self) -> Arc<SessionExtendedInfoSchema> {self.catalog.get_latest()}

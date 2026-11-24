@@ -205,6 +205,9 @@ pub trait ClusterTransactions: Send + Sync {
 
     /// Go `kv.Storage.GetCodec().GetKeyspaceID`; API V1 uses NullspaceID.
     fn keyspace_id(&self) -> u32 { u32::MAX }
+    /// Go `kv.Storage.GetKeyspace`: the keyspace the store serves; empty
+    /// for an API-V1 store.
+    fn store_keyspace(&self) -> String { String::new() }
     /// Go `session.store`: the same transaction authority used by this owner.
     fn kv_storage(&self) -> Arc<dyn tidb_txnkv::kv_storage::Storage>;
     /// A fresh TSO from the store's oracle (Go `GetOracle().GetTimestamp`):
@@ -1058,6 +1061,10 @@ where
     /// Go `kv.Storage.GetCodec().GetKeyspaceID` from the opened store.
     fn keyspace_id(&self) -> u32 {
         self.opener.store().store().keyspace().context_keyspace_id().unwrap_or(u32::MAX)
+    }
+    /// Go `kv.Storage.GetKeyspace` from the opened store.
+    fn store_keyspace(&self) -> String {
+        self.opener.store().get_keyspace().to_owned()
     }
     fn kv_storage(&self) -> Arc<dyn tidb_txnkv::kv_storage::Storage> {self.opener.clone()}
     fn fresh_timestamp(&self) -> Result<u64, String> {

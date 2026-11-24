@@ -235,6 +235,13 @@ impl KeyspaceContext {
         Self { name, id, name_bytes }
     }
 
+    /// The keyspace a store serves, from Go `kv.Storage.GetKeyspace` and
+    /// `GetCodec().GetKeyspaceID()` (`u32::MAX`, the null space, for none);
+    /// `None` for a store that names no keyspace (API V1).
+    pub fn of_store(name: &str, id: u32) -> Option<Self> {
+        (!name.is_empty()).then(|| Self::new(name, (id != u32::MAX).then_some(id)))
+    }
+
     /// The process's configured keyspace (Go `GetKeyspaceNameBySettings`):
     /// the identity of a single-keyspace node.
     pub fn from_settings() -> Self {

@@ -260,6 +260,29 @@ fn init_global_var_from_system_db_loads_the_collation_switch() {
     assert!(tidb_datatype::new_collation_enabled());
 }
 
+/// On a multi-keyspace node every session acts for a keyspace it carries
+/// (multi-keyspace design §6.1), including the internal ones no runtime bound
+/// an identity to: the bootstrap's variable loader runs on a domain of its own
+/// over the store, and its session acts for that store's keyspace instead of
+/// reading the process's configured one (which a debug assertion refuses).
+#[test]
+fn internal_sessions_act_for_their_store_keyspace_on_a_multi_keyspace_node() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // A classic store names no keyspace; multi-keyspace serving is nextgen only.
+        return;
+    }
+    let (stack, _users) = cop_backed_stack();
+    tidb_config::config_tree::config::update_global(|config| config.keyspace_name = "keyspace1".into());
+    tidb_keyspace::set_multi_keyspace_mode(true);
+
+    crate::domain::real_tikv_node::init_global_var_from_system_db(&stack.opener).expect("the variables load");
+    let mut se = stack.factory.open_session(session_context(98)).expect("session opens");
+    assert_eq!(se.keyspace_context().name(), tidb_keyspace::SYSTEM);
+    assert_eq!(displayed(rows(&mut se, "select 1")), vec![vec!["1"]]);
+
+    tidb_keyspace::set_multi_keyspace_mode(false);
+}
+
 #[test]
 fn upgrade_to_ver242_writes_the_cluster_id_like_go() {
     let (stack, _users) = cop_backed_stack();
