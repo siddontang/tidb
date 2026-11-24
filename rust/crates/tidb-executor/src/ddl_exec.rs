@@ -178,6 +178,11 @@ pub trait DdlExec {
     /// statement lowered to the job(s) the cluster runs. Every refusal here
     /// comes after the implicit commit, as Go's do.
     fn execute_ddl(&mut self, sql: &str, stmt: &Stmt) -> Result<(), SqlQueryError> {
+        // A multi-keyspace node writes no PD state or AutoID service for a
+        // tenant until those services are per keyspace (design §10 phase 2).
+        if let Stmt::Ddl(ddl) = stmt {
+            crate::multi_keyspace::refuse_pd_backed_ddl(ddl).map_err(map_error)?;
+        }
         // Go `DDLExec.executeCleanupTableLock` after the planner's
         // SUPER check: the `IsCleanup` unlock job, none when no named
         // table is locked.

@@ -21,7 +21,9 @@
 //! last: the import store and the DXF task managers, the BRIE node and job
 //! queue, and the global external storage (phase 3f moves them into each
 //! keyspace runtime). Each statement checks here before it consults any of
-//! them.
+//! them. So do the DDL statements whose effect lives in PD (resource groups,
+//! placement, label rules, TiFlash replicas) or in the AutoID service
+//! (`AUTO_ID_CACHE=1`).
 
 use crate::DriverError;
 
@@ -38,4 +40,79 @@ pub fn refuse_on_multi_keyspace_node(feature: &str) -> Result<(), DriverError> {
     Err(DriverError::from(tidb_plannererrors::ERR_NOT_SUPPORTED_YET.gen_with_stack_by_args(&[
         format!("{feature} on a multi-keyspace node").into(),
     ])))
+}
+
+/// The PD-backed part of `ddl`, if any: the feature a multi-keyspace node
+/// refuses for it (design §10 phase 2). Resource groups, placement policies,
+/// label rules (`ATTRIBUTES`) and TiFlash replicas are written through the
+/// process's PD clients, which belong to whichever keyspace opened last
+/// (phase 3b); an `AUTO_ID_CACHE=1` table allocates through the AutoID
+/// service only the configured keyspace runs (phase 3f).
+#[must_use]
+pub fn pd_backed_ddl_feature(ddl: &tidb_ast::DdlStmt) -> Option<&'static str> {
+    use tidb_ast::{AddPartitionSpec, AlterPartitionAction, AlterTableAction, DatabaseOption, DdlStmt};
+    let database_options = |options: &[DatabaseOption]| {
+        options.iter().find_map(|option| match option {
+            DatabaseOption::PlacementPolicy(_) => Some("PLACEMENT POLICY"),
+            DatabaseOption::SetTiFlashReplica { .. } => Some("SET TIFLASH REPLICA"),
+            _ => None,
+        })
+    };
+    match ddl {
+        DdlStmt::CreateResourceGroup(_) | DdlStmt::AlterResourceGroup(_) | DdlStmt::DropResourceGroup(_) => {
+            Some("RESOURCE GROUP DDL")
+        }
+        DdlStmt::CreatePlacementPolicy(_) | DdlStmt::AlterPlacementPolicy(_) | DdlStmt::DropPlacementPolicy(_) => {
+            Some("PLACEMENT POLICY DDL")
+        }
+        DdlStmt::CreateDatabase { options, .. } | DdlStmt::AlterDatabase { options, .. } => database_options(options),
+        DdlStmt::CreateTable(create) => table_options_feature(&create.table_options)
+            .or_else(|| create.partitioning.as_ref().and_then(|p| partition_definitions_feature(&p.definitions))),
+        DdlStmt::AlterTable(alter) => alter.actions.iter().find_map(|action| match action {
+            AlterTableAction::SetTableOptions { options } => table_options_feature(options),
+            AlterTableAction::SetTiFlashReplica { .. } => Some("SET TIFLASH REPLICA"),
+            AlterTableAction::SetAttributes(_) => Some("ATTRIBUTES"),
+            AlterTableAction::Partition(partition) => match partition {
+                AlterPartitionAction::SetAttributes { .. } => Some("ATTRIBUTES"),
+                AlterPartitionAction::SetOptions { options, .. } => table_options_feature(options),
+                AlterPartitionAction::Add { spec: AddPartitionSpec::Definitions(definitions), .. }
+                | AlterPartitionAction::Reorganize { definitions, .. } => partition_definitions_feature(definitions),
+                AlterPartitionAction::Repartition(partitioning) => {
+                    partition_definitions_feature(&partitioning.definitions)
+                }
+                _ => None,
+            },
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn table_options_feature(options: &[tidb_ast::TableOption]) -> Option<&'static str> {
+    options.iter().find_map(|option| match option {
+        tidb_ast::TableOption::PlacementPolicy(_) => Some("PLACEMENT POLICY"),
+        tidb_ast::TableOption::AutoIdCache(value) if value.trim().parse::<u64>() == Ok(1) => Some("AUTO_ID_CACHE=1"),
+        _ => None,
+    })
+}
+
+fn partition_definitions_feature(definitions: &[tidb_ast::PartitionDefinition]) -> Option<&'static str> {
+    definitions.iter().find_map(|definition| {
+        table_options_feature(&definition.options).or_else(|| {
+            definition.sub_partitions.iter().find_map(|sub| table_options_feature(&sub.options))
+        })
+    })
+}
+
+/// [`refuse_on_multi_keyspace_node`] for a DDL statement whose effect lives
+/// in PD or the AutoID service ([`pd_backed_ddl_feature`]).
+///
+/// # Errors
+///
+/// The node serves several keyspaces and `ddl` is PD-backed.
+pub fn refuse_pd_backed_ddl(ddl: &tidb_ast::DdlStmt) -> Result<(), DriverError> {
+    match pd_backed_ddl_feature(ddl) {
+        Some(feature) => refuse_on_multi_keyspace_node(feature),
+        None => Ok(()),
+    }
 }

@@ -348,6 +348,118 @@ fn a_multi_keyspace_node_refuses_import_br_and_plan_replayer() {
     tidb_dxf_importinto::set_import_store(None);
 }
 
+/// A PD client that counts the calls it gets.
+#[derive(Debug, Default)]
+struct CountingPd(std::sync::atomic::AtomicUsize);
+
+impl CountingPd {
+    fn calls(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn count(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl tidb_domain_infosync::placement_manager::PlacementManager for CountingPd {
+    fn get_rule_bundle(&self, name: &str) -> Result<tidb_placement::Bundle, String> {
+        self.count();
+        Ok(tidb_placement::Bundle { id: name.to_owned(), ..Default::default() })
+    }
+    fn put_rule_bundles(&self, _bundles: &[tidb_placement::Bundle]) -> Result<(), String> {
+        self.count();
+        Ok(())
+    }
+}
+
+impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for CountingPd {
+    fn add_resource_group(&self, _group: tidb_proto::resource_manager::ResourceGroup) -> Result<String, String> {
+        self.count();
+        Ok("Success!".to_owned())
+    }
+    fn modify_resource_group(&self, _group: tidb_proto::resource_manager::ResourceGroup) -> Result<String, String> {
+        self.count();
+        Ok("Success!".to_owned())
+    }
+    fn delete_resource_group(&self, _name: &str) -> Result<String, String> {
+        self.count();
+        Ok("Success!".to_owned())
+    }
+}
+
+/// A multi-keyspace node refuses the DDL whose effect lives in PD --
+/// resource groups, placement policies and options, label rules
+/// (`ATTRIBUTES`), TiFlash replicas -- and `AUTO_ID_CACHE=1` tables, whose
+/// IDs come from the AutoID service only the configured keyspace runs, with
+/// `ER_NOT_SUPPORTED_YET` (1235) before any PD client is called (design §10
+/// phase 2, until 3b and 3f make them per keyspace). The counting placement
+/// manager and resource-manager client see no call, and no table, policy
+/// or group is created. A single-keyspace node runs the same statements:
+/// the resource-group DDL reaches its client.
+#[test]
+fn a_multi_keyspace_node_refuses_pd_backed_ddl() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
+    let store = MockStoreDomain::create().unwrap();
+    let mut session = store.new_session().unwrap();
+    for sql in ["use test", "create table t (a int) partition by range (a) (partition p0 values less than (10))"] {
+        session.run(sql).unwrap();
+    }
+    let pd = std::sync::Arc::new(CountingPd::default());
+    let placement = tidb_domain_infosync::placement_manager::placement_manager();
+    tidb_domain_infosync::placement_manager::init_placement_manager(Some(pd.clone()));
+    tidb_domain_infosync::resource_manager_client::init_resource_manager_client(Some(pd.clone()));
+
+    let statements = [
+        "create resource group rg1 ru_per_sec = 100",
+        "alter resource group default ru_per_sec = 100",
+        "drop resource group if exists rg1",
+        "create placement policy p1 followers = 1",
+        "alter placement policy p1 followers = 2",
+        "drop placement policy if exists p1",
+        "create database d1 placement policy = p1",
+        "alter database test placement policy = default",
+        "alter database test set tiflash replica 1",
+        "create table t1 (a int) placement policy = p1",
+        "create table t2 (a int) partition by range (a) (partition p0 values less than (10) placement policy = p1)",
+        "alter table t placement policy = default",
+        "alter table t partition p0 placement policy = default",
+        "alter table t set tiflash replica 1",
+        "alter table t attributes = 'merge_option=deny'",
+        "alter table t partition p0 attributes = 'merge_option=deny'",
+        "create table t3 (a int primary key auto_increment) auto_id_cache = 1",
+        "alter table t auto_id_cache = 1",
+    ];
+    tidb_keyspace::set_multi_keyspace_mode(true);
+    for sql in statements {
+        let (code, message) = refusal(&mut session, sql).unwrap_or_else(|| panic!("{sql} ran"));
+        assert_eq!(code, 1235, "{sql}: {message}");
+        assert!(message.ends_with("on a multi-keyspace node'"), "{sql}: {message}");
+    }
+    assert_eq!(pd.calls(), 0);
+    let created = row_text(session.run(
+        "select count(*) from information_schema.tables where table_schema in ('test', 'd1') and table_name in ('t1', 't2', 't3')",
+    ));
+    assert_eq!(created, [["0"]]);
+    // The tenant's other DDL runs.
+    assert_eq!(refusal(&mut session, "create table t4 (a int) auto_id_cache = 100"), None);
+    assert_eq!(refusal(&mut session, "alter table t4 add column b int"), None);
+
+    // A single-keyspace node runs them as before.
+    tidb_keyspace::set_multi_keyspace_mode(false);
+    for sql in ["create resource group rg1 ru_per_sec = 100", "drop resource group rg1"] {
+        assert_eq!(refusal(&mut session, sql), None, "{sql}");
+    }
+    assert!(pd.calls() > 0);
+    tidb_domain_infosync::placement_manager::init_placement_manager(Some(placement));
+    tidb_domain_infosync::resource_manager_client::init_resource_manager_client(Some(std::sync::Arc::new(
+        tidb_domain_infosync::resource_manager_client::MockResourceManagerClient::new(),
+    )));
+}
+
 /// A tenant of a multi-keyspace node sets its keyspace's GLOBAL variables
 /// but not the process's (design §6.3): a variable whose value is the
 /// process's memory, log, PD client or watchdog, or one Go scopes to the
