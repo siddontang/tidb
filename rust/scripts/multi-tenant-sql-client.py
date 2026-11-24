@@ -4,7 +4,8 @@
 Run directly with PyMySQL installed. Set TIDB_MULTI_KEYSPACE_DEV_ROOT_PASSWORD
 to the test password for both accounts. TIDB_TEST_HOST / TIDB_TEST_PORT select
 the listener. TIDB_TEST_TENANT_A / TIDB_TEST_TENANT_B select the keyspaces.
-Each case creates and removes its own databases.
+Each case creates and removes its own databases. Use dedicated development
+tenants with similar DDL histories for the physical table-ID collision case.
 """
 
 import os
@@ -17,12 +18,12 @@ import pymysql
 
 
 class TenantSQLTests(unittest.TestCase):
-    def connect(self, tenant):
+    def connect(self, tenant, account="root", password=None):
         db = pymysql.connect(
             host=os.getenv("TIDB_TEST_HOST", "127.0.0.1"),
             port=int(os.getenv("TIDB_TEST_PORT", "4000")),
-            user=tenant + ".root",
-            password=os.environ["TIDB_MULTI_KEYSPACE_DEV_ROOT_PASSWORD"],
+            user=tenant + "." + account,
+            password=os.environ["TIDB_MULTI_KEYSPACE_DEV_ROOT_PASSWORD"] if password is None else password,
             autocommit=True, connect_timeout=10, read_timeout=40, write_timeout=15,
         )
         self.addCleanup(db.close)
@@ -111,6 +112,156 @@ class TenantSQLTests(unittest.TestCase):
         self.assertEqual(self.marker(b), ((2,),))
         a.execute("COMMIT")
         self.assertEqual(self.marker(a), ((99,),))
+
+    def test_table_and_column_catalogs_only_show_local_objects(self):
+        for name, cursor in zip(("alpha", "beta"), self.clients):
+            cursor.execute(f"CREATE TABLE {name} (col_{name} INT)")
+        for name, cursor in zip(("alpha", "beta"), self.clients):
+            cursor.execute("SHOW TABLES")
+            self.assertEqual({row[0] for row in cursor}, {"t", name})
+            cursor.execute("SELECT table_name, column_name FROM information_schema.columns "
+                           "WHERE table_schema = %s", (self.schema,))
+            self.assertCountEqual(cursor.fetchall(), [
+                ("t", "id"), ("t", "marker"), (name, "col_" + name),
+            ])
+
+    def test_private_database_is_visible_only_to_its_owner(self):
+        private = self.schema + "_private"
+        a, b = self.clients
+        a.execute("CREATE DATABASE " + private)
+        self.addCleanup(a.execute, "DROP DATABASE " + private)
+        a.execute(f"CREATE TABLE {private}.only_here (id INT PRIMARY KEY)")
+        a.execute(f"INSERT INTO {private}.only_here VALUES (37)")
+        a.execute(f"SELECT id FROM {private}.only_here")
+        self.assertEqual(a.fetchall(), ((37,),))
+        for cursor, expected in ((a, ((private,),)), (b, ())):
+            cursor.execute("SELECT schema_name FROM information_schema.schemata "
+                           "WHERE schema_name = %s", (private,))
+            self.assertEqual(cursor.fetchall(), expected)
+        with self.assertRaises(pymysql.MySQLError) as missing:
+            b.execute("USE " + private)
+        self.assertEqual(missing.exception.args[0], 1049)
+        self.assertEqual(self.marker(b), ((2,),))
+
+    def test_unique_constraint_and_failed_statement_are_tenant_local(self):
+        for cursor in self.clients:
+            cursor.execute("CREATE TABLE tickets (id INT PRIMARY KEY, tag INT UNIQUE)")
+            cursor.execute("INSERT INTO tickets VALUES (1, 100)")
+        a, b = self.clients
+        with self.assertRaises(pymysql.MySQLError) as duplicate:
+            a.execute("INSERT INTO tickets VALUES (2, 100)")
+        self.assertEqual(duplicate.exception.args[0], 1062)
+        b.execute("UPDATE tickets SET tag = 200 WHERE id = 1")
+        b.execute("INSERT INTO tickets VALUES (2, 100)")
+        for cursor, expected in ((a, ((1, 100),)), (b, ((1, 200), (2, 100)))):
+            cursor.execute("SELECT id, tag FROM tickets ORDER BY id")
+            self.assertEqual(cursor.fetchall(), expected)
+
+    def test_secondary_index_ranges_and_indexed_updates(self):
+        for tenant_id, cursor in enumerate(self.clients, start=1):
+            cursor.execute("CREATE TABLE indexed_rows "
+                           "(id INT PRIMARY KEY, bucket INT, payload INT, INDEX by_bucket (bucket))")
+            cursor.executemany("INSERT INTO indexed_rows VALUES (%s, %s, %s)",
+                               [(i, i // 2, 100 * tenant_id + i) for i in range(8)])
+        self.clients[0].execute("UPDATE indexed_rows SET bucket = 9 WHERE id = 3")
+        for tenant_id, cursor in enumerate(self.clients, start=1):
+            query = ("SELECT id, payload FROM indexed_rows FORCE INDEX (by_bucket) "
+                     "WHERE bucket BETWEEN 1 AND 2 ORDER BY id")
+            cursor.execute("EXPLAIN " + query)
+            self.assertTrue(any("IndexRangeScan" in row[0] and "by_bucket" in row[3]
+                                for row in cursor.fetchall()))
+            cursor.execute(query)
+            ids = [2, 4, 5] if tenant_id == 1 else [2, 3, 4, 5]
+            self.assertEqual(cursor.fetchall(), tuple((i, 100 * tenant_id + i) for i in ids))
+
+    def test_join_results_after_truncate_and_reinsert(self):
+        for cursor in self.clients:
+            cursor.execute("CREATE TABLE detail (id INT PRIMARY KEY, qty INT)")
+        a, b = self.clients
+        a.execute("INSERT INTO detail VALUES (1, 10)")
+        b.execute("INSERT INTO detail VALUES (1, 20)")
+        query = "SELECT t.marker, detail.qty FROM t JOIN detail ON t.id = detail.id"
+        a.execute("TRUNCATE TABLE detail")
+        a.execute(query)
+        self.assertEqual(a.fetchall(), ())
+        b.execute(query)
+        self.assertEqual(b.fetchall(), ((2, 20),))
+        a.execute("INSERT INTO detail VALUES (1, 30)")
+        for cursor, expected in ((a, (1, 30)), (b, (2, 20))):
+            cursor.execute(query)
+            self.assertEqual(cursor.fetchall(), (expected,))
+
+    def test_tenant_accounts_with_independent_table_grants(self):
+        # The logical account name and schema match. Credentials and grants differ.
+        account = "u" + uuid.uuid4().hex[:12]
+        passwords = [uuid.uuid4().hex for _ in self.tenants]
+        for index, (tenant, admin) in enumerate(zip(self.tenants, self.clients)):
+            user = tenant + "." + account
+            admin.execute("CREATE USER %s@'%%' IDENTIFIED BY %s", (user, passwords[index]))
+            self.addCleanup(admin.execute, "DROP USER %s@'%%'", (user,))
+            privileges = "SELECT" if index == 0 else "SELECT, UPDATE"
+            admin.execute(f"GRANT {privileges} ON {self.schema}.t TO %s@'%%'", (user,))
+
+        for index, tenant in enumerate(self.tenants):
+            with self.assertRaises(pymysql.MySQLError) as denied:
+                self.connect(tenant, account, passwords[1 - index])
+            self.assertEqual(denied.exception.args[0], 1045)
+            client = self.connect(tenant, account, passwords[index]).cursor()
+            self.addCleanup(client.close)
+            client.execute("USE " + self.schema)
+            self.assertEqual(self.marker(client), ((index + 1,),))
+            if index == 0:
+                with self.assertRaises(pymysql.MySQLError) as denied:
+                    client.execute("UPDATE t SET marker = 19 WHERE id = 1")
+                self.assertEqual(denied.exception.args[0], 8121)
+            else:
+                client.execute("UPDATE t SET marker = 29 WHERE id = 1")
+        self.assertEqual(self.marker(self.clients[0]), ((1,),))
+        self.assertEqual(self.marker(self.clients[1]), ((29,),))
+
+    def test_identical_physical_table_ids_keep_row_and_index_keys_separate(self):
+        def table_id(cursor, name):
+            cursor.execute("SELECT tidb_table_id FROM information_schema.tables "
+                           "WHERE table_schema = %s AND table_name = %s", (self.schema, name))
+            value, = cursor.fetchone()
+            return int(value)
+
+        # Exercise a genuine collision using only DDL inside our scratch schemas.
+        # Each CREATE normally consumes a table ID and job ID. A DROP consumes
+        # a job ID and lets the two sequences meet if their parities differ.
+        names = ["t", "t"]
+        ids = [table_id(cursor, "t") for cursor in self.clients]
+        for step in range(24):
+            if ids[0] == ids[1]:
+                break
+            lag = 0 if ids[0] < ids[1] else 1
+            cursor = self.clients[lag]
+            if abs(ids[0] - ids[1]) % 2:
+                cursor.execute("DROP TABLE " + names[lag])
+            names[lag] = "collision_" + str(step)
+            cursor.execute(f"CREATE TABLE {names[lag]} (id INT PRIMARY KEY, marker INT)")
+            ids[lag] = table_id(cursor, names[lag])
+        self.assertEqual(*ids, msg="Use dedicated tenants with similar DDL histories for this fixture")
+
+        index_ids = []
+        for index, (cursor, name) in enumerate(zip(self.clients, names)):
+            cursor.execute(f"DELETE FROM {name}")
+            cursor.execute(f"CREATE UNIQUE INDEX by_marker ON {name} (marker)")
+            cursor.execute("SELECT index_id FROM information_schema.tidb_indexes "
+                           "WHERE table_schema = %s AND table_name = %s AND key_name = 'by_marker'",
+                           (self.schema, name))
+            index_id, = cursor.fetchone()
+            index_ids.append(int(index_id))
+            cursor.execute(f"INSERT INTO {name} VALUES (1, 70), (2, %s)", (80 + index,))
+        self.assertEqual(*index_ids)
+        for index, (cursor, name) in enumerate(zip(self.clients, names)):
+            cursor.execute(f"SELECT id, marker FROM {name} ORDER BY id")
+            self.assertEqual(cursor.fetchall(), ((1, 70), (2, 80 + index)))
+        a, b = self.clients
+        a.execute(f"DELETE FROM {names[0]} WHERE marker = 70")
+        for cursor, name, expected in ((a, names[0], ()), (b, names[1], ((1,),))):
+            cursor.execute(f"SELECT id FROM {name} FORCE INDEX (by_marker) WHERE marker = 70")
+            self.assertEqual(cursor.fetchall(), expected)
 
     def test_concurrent_updates_use_independent_rows(self):
         ready = Barrier(2)
