@@ -223,3 +223,52 @@ fn set_resource_group_follows_the_keyspace_strict_mode() {
     assert_eq!(switch_group(&tenant), Ok(()));
     assert_eq!(switch_group(&configured), Err(1227));
 }
+
+/// Password policy (3c): `validate_password.*` and `password_history` are
+/// the keyspace's. A tenant that turns validation on with a 12-character
+/// minimum and keeps one password of history refuses a short password
+/// (1819) and a reused one (3638); the configured keyspace, at the
+/// defaults, accepts both, and the process statics are untouched.
+#[test]
+fn password_policy_follows_the_keyspace() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let users = ConfiguredUserStore::parse("root\t%\tmysql_native_password\t\n")
+        .unwrap()
+        .with_global_vars(tidb_domain::global_sysvars::GlobalSysvars::new().with_keyspace_vardef());
+    let tenant = MockStoreDomain::create_with_users(Arc::new(users)).unwrap();
+    let configured = MockStoreDomain::create().unwrap();
+    let (length, history) = (
+        tidb_vardef::PASSWORD_VALIDATION_LENGTH.load(SeqCst),
+        tidb_vardef::PASSWORD_HISTORY.load(SeqCst),
+    );
+    let mut tenant_admin = tenant.new_session().unwrap();
+    for sql in [
+        "set global validate_password.enable = on",
+        "set global validate_password.length = 12",
+        "set global password_history = 1",
+    ] {
+        tenant_admin.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    assert_eq!(tidb_vardef::PASSWORD_VALIDATION_LENGTH.load(SeqCst), length, "the process value is untouched");
+    assert_eq!(tidb_vardef::PASSWORD_HISTORY.load(SeqCst), history, "the process value is untouched");
+
+    let code = |store: &Arc<MockStoreDomain>, sql: &str| {
+        store
+            .new_session()
+            .unwrap()
+            .run(sql)
+            .map(drop)
+            .map_err(|error| error.to_mysql_error().code)
+    };
+    // A password that satisfies the default policy but not the tenant's
+    // length.
+    let short = "create user 'pw'@'%' identified by 'Aa1!aaaa'";
+    assert_eq!(code(&tenant, short), Err(1819));
+    assert_eq!(code(&configured, short), Ok(()));
+    let long = "create user 'pw2'@'%' identified by 'Aa1!aaaaaaaa'";
+    assert_eq!(code(&tenant, long), Ok(()));
+    let reuse = "alter user 'pw2'@'%' identified by 'Aa1!aaaaaaaa'";
+    assert_eq!(code(&tenant, reuse), Err(3638));
+    assert_eq!(code(&configured, "create user 'pw2'@'%' identified by 'Aa1!aaaaaaaa'"), Ok(()));
+    assert_eq!(code(&configured, reuse), Ok(()));
+}
