@@ -1782,13 +1782,13 @@ pub(super) fn tidb_enable_async_merge_global_stats(
 /// Go master `tidb_enable_async_merge_global_stats`'s `GetSession` /
 /// `GetGlobal`: ON, whatever `upgradeToVer177` persisted on an upgraded
 /// cluster (persisted values are read without `Validation`).
-pub(crate) fn always_on() -> Result<String, crate::vars::VarError> {
+pub(crate) fn always_on(_: &tidb_vardef::VardefSnapshot) -> Result<String, crate::vars::VarError> {
     Ok("ON".to_owned())
 }
 
 /// [`always_on`] as a `GetSession` hook.
 pub(crate) fn always_on_session(_: &crate::vars::SessionVars) -> Result<String, crate::vars::VarError> {
-    always_on()
+    Ok("ON".to_owned())
 }
 
 /// Go master `tidb_enable_historical_stats` /

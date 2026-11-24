@@ -196,7 +196,7 @@ pub fn build_fk_info(
         on_delete: on_delete.into(),
         on_update: on_update.into(),
         state: SchemaState::PUBLIC,
-        version: if tidb_vardef::ENABLE_FOREIGN_KEY.load(std::sync::atomic::Ordering::SeqCst) { FK_VERSION1 } else { 0 },
+        version: if tidb_vardef::snapshot::current().enable_foreign_key().load(std::sync::atomic::Ordering::SeqCst) { FK_VERSION1 } else { 0 },
         ..FKInfo::default()
     })
 }

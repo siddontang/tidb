@@ -325,7 +325,7 @@ impl Opener {
         // service only, so extra keyspaces do not campaign for it.
         config.report_status = false;
         let (runtime, authority) =
-            KeyspaceRuntime::open(&config, Arc::clone(&self.spill_storage), self.memory_arbitrator.clone())?;
+            KeyspaceRuntime::open(&config, Arc::clone(&self.spill_storage), self.memory_arbitrator.clone(), true)?;
         if let Some((manager, variables)) = self.tls.lock().expect("registry tls").clone() {
             runtime.stack.factory.install_tls_manager(manager, variables);
         }

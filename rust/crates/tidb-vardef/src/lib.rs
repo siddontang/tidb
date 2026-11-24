@@ -447,16 +447,26 @@ pub fn set_plan_replayer_file_retention_time(nanoseconds: i64) {
 /// Loads Go `vardef.OOMAction`.
 #[must_use]
 pub fn oom_action() -> &'static str {
-    if OOM_ACTION.load(Ordering::SeqCst) == OOM_ACTION_LOG {
+    oom_action_of(&OOM_ACTION)
+}
+
+/// Stores Go `vardef.OOMAction` after sysvar validation.
+pub fn set_oom_action(value: &str) {
+    store_oom_action(&OOM_ACTION, value);
+}
+
+/// The `OOMAction` an `OOM_ACTION` cell holds.
+fn oom_action_of(cell: &AtomicU8) -> &'static str {
+    if cell.load(Ordering::SeqCst) == OOM_ACTION_LOG {
         tidb_vars::OOM_ACTION_LOG
     } else {
         tidb_vars::OOM_ACTION_CANCEL
     }
 }
 
-/// Stores Go `vardef.OOMAction` after sysvar validation.
-pub fn set_oom_action(value: &str) {
-    OOM_ACTION.store(
+/// Stores `value` into an `OOM_ACTION` cell.
+fn store_oom_action(cell: &AtomicU8, value: &str) {
+    cell.store(
         if value.eq_ignore_ascii_case(tidb_vars::OOM_ACTION_LOG) {
             OOM_ACTION_LOG
         } else {
@@ -504,6 +514,8 @@ pub mod defaults;
 /// leaf, and because it is pure policy over those same constants.
 pub mod global_sysvar_initial;
 pub mod modes;
+pub mod snapshot;
+pub use snapshot::VardefSnapshot;
 pub mod option_values;
 pub mod tidb_vars;
 pub mod txn_mode;

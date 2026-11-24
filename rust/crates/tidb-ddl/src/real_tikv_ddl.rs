@@ -1576,6 +1576,9 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
     owner_id: &str,
 ) -> Result<DdlPhaseOutcome, ClusterDdlError> {
     (phase.check_owner)().map_err(ClusterDdlError::SchemaSync)?;
+    // The step reads its keyspace's vardef values (multi-keyspace design
+    // §6.3): the DDL runs for the keyspace of the store it opens.
+    let _vardef = tidb_vardef::snapshot::enter(tidb_vardef::snapshot::for_keyspace(opener.store().get_keyspace()));
     // Go `transitOneJobStepAndWaitSync` checks the previous schema barrier
     // before `transitOneJobStep`'s hook and prepareTxn. A cancellation in
     // beforeTransitOneJobStep must be visible at the new transaction's TSO.

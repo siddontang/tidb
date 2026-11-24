@@ -1640,6 +1640,9 @@ fn serve_connection_inner<F: QuerySessionFactory>(
     // On a multi-keyspace node the connection's records carry its tenant
     // (design §6.1); its thread serves it to the end.
     let _tenant = tidb_keyspace::is_multi_keyspace_mode().then(|| tidb_logutil::enter_tenant(keyspace.name()));
+    // The code below the session tiers (the DDL a statement submits) reads
+    // the keyspace's vardef values on this thread (design §6.3).
+    let _vardef = factory.vardef().map(tidb_vardef::snapshot::enter);
     let decision = check_auth_plugin(
         &server_plugin,
         &mut client_plugin,

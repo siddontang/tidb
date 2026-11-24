@@ -141,7 +141,7 @@ pub(super) fn on_truncate_table(
         &schema,
         stored.name.original(),
         &[(schema.clone(), stored.name.original().to_owned())],
-        fk_check && tidb_vardef::ENABLE_FOREIGN_KEY.load(std::sync::atomic::Ordering::Relaxed),
+        fk_check && tidb_vardef::snapshot::current().enable_foreign_key().load(std::sync::atomic::Ordering::Relaxed),
     ) {
         return Err(cancel_ddl_job(active, truncate_referenced(&referred)));
     }

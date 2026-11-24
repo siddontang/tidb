@@ -4138,7 +4138,7 @@ fn plan_persisted_drop_schema_job_step(
     let mut affinity_groups = crate::ddl_affinity::AffinityGroupUpdate::default();
     let mut label_rules = LabelRuleSteps::new();
     if db_info.state == SchemaState::PUBLIC
-        && tidb_vardef::ENABLE_FOREIGN_KEY.load(std::sync::atomic::Ordering::Relaxed)
+        && tidb_vardef::snapshot::current().enable_foreign_key().load(std::sync::atomic::Ordering::Relaxed)
     {
         // Go `checkDatabaseHasForeignKeyReferredInOwner`.
         let fk_check = tidb_model::get_drop_schema_args(&mut active.job)
@@ -4345,7 +4345,7 @@ fn plan_persisted_drop_table_job_step(
             &schema_name,
             &table_name,
             &ignored,
-            fk_check && tidb_vardef::ENABLE_FOREIGN_KEY.load(std::sync::atomic::Ordering::Relaxed),
+            fk_check && tidb_vardef::snapshot::current().enable_foreign_key().load(std::sync::atomic::Ordering::Relaxed),
         ) {
             return Err(cancel_ddl_job(
                 active,

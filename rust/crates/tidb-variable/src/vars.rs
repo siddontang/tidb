@@ -403,6 +403,10 @@ pub struct SessionVars {
     /// which the session installs when it is created (Go `createSession`
     /// sets it to the session itself). `None` until then, Go's nil.
     pub(crate) globals: Option<Arc<dyn crate::GlobalVarAccessor>>,
+    /// The keyspace runtime's values of the vardef global statics
+    /// (multi-keyspace design §6.3), taken from the global tier the session
+    /// was created over; `None` reads the process statics.
+    vardef: Option<Arc<tidb_vardef::VardefSnapshot>>,
     /// Go `SessionVars.CommonGlobalLoaded`: whether the session has taken its
     /// copy of the global tier ([`Self::load_common_global_variables_if_needed`]).
     common_global_loaded: bool,
@@ -1007,6 +1011,7 @@ impl Default for SessionVars {
             optimizer_fix_control: OptimizerFixControl::default(),
             session_resolved: ResolvedGlobals::default(),
             globals: None,
+            vardef: None,
             common_global_loaded: false,
             first_read_globals: FirstReadGlobals::default(),
             prepared_stmt_entries: 0,
@@ -1171,6 +1176,11 @@ impl SessionVars {
     /// tier this session reads `@@global.x` from and, at its first statement,
     /// copies its own variables from.
     pub fn set_global_vars_accessor(&mut self, globals: Arc<dyn crate::GlobalVarAccessor>) {
+        // A keyspace that owns its vardef values keeps them through any later
+        // swap of the accessor (an account statement's scratch table).
+        if let Some(vardef) = globals.vardef() {
+            self.vardef = Some(vardef);
+        }
         self.globals = Some(globals);
         self.first_read_globals = FirstReadGlobals::default();
         self.common_global_loaded = false;
@@ -1715,7 +1725,7 @@ impl SessionVars {
             return self
                 .globals()
                 .get_by_registry_index(index)
-                .and_then(|value| global_get_hook(def, value).map(Cow::Owned));
+                .and_then(|value| global_get_hook(def, &self.vardef(), value).map(Cow::Owned));
         }
         // Go `GetSessionOrGlobalSystemVar`: a variable with a `GetSession`
         // hook answers from it ("shortcut to the getter").
@@ -1769,7 +1779,7 @@ impl SessionVars {
             return Some(Ok(Cow::Owned(value.clone())));
         }
         Some(self.globals().get_by_registry_index(index).and_then(|value| {
-            let value = global_get_hook(def, value)?;
+            let value = global_get_hook(def, &self.vardef(), value)?;
             first_reads.insert(index, value.clone());
             Ok(Cow::Owned(value))
         }))
@@ -1933,6 +1943,19 @@ impl SessionVars {
     /// the variable has no GLOBAL scope at all to read.
     pub fn get_global(&self, name: &str) -> Result<String, VarError> {
         self.globals().get_for_global_scope(name)
+    }
+
+    /// The session's keyspace runtime's values of the vardef global statics
+    /// (Go reads `vardef.X` process atomics): the process statics unless the
+    /// keyspace owns its values (multi-keyspace design §6.3).
+    pub fn vardef(&self) -> Arc<tidb_vardef::VardefSnapshot> {
+        self.vardef.clone().unwrap_or_else(tidb_vardef::snapshot::process)
+    }
+
+    /// Makes the session read and write `vardef` (a keyspace runtime's
+    /// `SetGlobal` hooks run over a session that carries it).
+    pub fn set_vardef(&mut self, vardef: Arc<tidb_vardef::VardefSnapshot>) {
+        self.vardef = Some(vardef);
     }
 
     /// Go `SessionVars.GlobalVarsAccessor`, which the session installs when
@@ -2160,7 +2183,7 @@ impl SessionVars {
         if !def.has_global_scope() {
             return Ok(default);
         }
-        if let Some(value) = def.get_global_from_hook() {
+        if let Some(value) = def.get_global_from_hook(&self.vardef()) {
             return value;
         }
         if let Some(stored) = self.globals().overrides().get(def.name) {
@@ -2334,8 +2357,9 @@ pub fn global_system_variable_initial_value(def: &SysVarDef) -> String {
 
 /// Go `SysVar.GetGlobalFromHook`: the variable's `GetGlobal` hook, else the
 /// stored GLOBAL value.
-pub fn global_get_hook(def: &SysVarDef, value: String) -> Result<String, VarError> {
-    def.get_global_from_hook().unwrap_or(Ok(value))
+/// `vardef` is the keyspace's values of the vardef global statics.
+pub fn global_get_hook(def: &SysVarDef, vardef: &tidb_vardef::VardefSnapshot, value: String) -> Result<String, VarError> {
+    def.get_global_from_hook(vardef).unwrap_or(Ok(value))
 }
 
 /// Go `SessionVars.GetRelatedTableForMDL().Store(id, ...)`: records one stored

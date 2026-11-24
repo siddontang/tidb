@@ -335,6 +335,7 @@ impl Session {
             tidb_executor::driver::plan_set_stmt(&set, catalog, &database, &ctx)
         })?;
         self.check_visit_infos(&visits)?;
+        refuse_process_variables_to_tenants(&set)?;
         // Go `ResetContextOfStmt`'s `sc.StmtType = "Set"` for this statement.
         self.vars.stmt_type_is_set = true;
         let result = tidb_executor::set::execute_set(self, &ctx, &plan);
@@ -978,4 +979,28 @@ fn dml_hints(dml: &DmlStmt) -> Option<&[Hint]> {
         | DmlStmt::DistributeTable(_)
         | DmlStmt::Call(_) => None,
     }
+}
+
+/// On a node serving several keyspaces a tenant sets its keyspace's GLOBAL
+/// variables only: a variable whose value belongs to the process (design
+/// §6.3) is set by the process configuration or the operator, so its `SET
+/// GLOBAL` / `SET INSTANCE` is refused before any assignment applies.
+fn refuse_process_variables_to_tenants(set: &tidb_ast::SetStmt) -> Result<(), DriverError> {
+    if !tidb_keyspace::is_multi_keyspace_mode() {
+        return Ok(());
+    }
+    for variable in &set.variables {
+        if !variable.is_system || !tidb_variable::process_scope::is_process_variable(&variable.name) {
+            continue;
+        }
+        let session_scoped = tidb_variable::sysvar::get_sys_var(&variable.name)
+            .is_some_and(|def| def.scope & tidb_variable::sysvar::SCOPE_SESSION != 0);
+        if variable.is_global || variable.is_instance || !session_scoped {
+            return Err(DriverError::from(
+                tidb_plannererrors::ERR_SPECIFIC_ACCESS_DENIED
+                    .gen_with_stack_by_args(&["RESTRICTED_VARIABLES_ADMIN".into()]),
+            ));
+        }
+    }
+    Ok(())
 }

@@ -913,6 +913,13 @@ impl Domain {
     pub fn global_vars(&self) -> GlobalSysvars {
         self.global_vars.clone()
     }
+
+    /// The values this domain's keyspace reads the vardef global statics
+    /// from (multi-keyspace design §6.3): its background loops' counterpart
+    /// of `SessionVars::vardef`.
+    pub fn vardef(&self) -> Arc<tidb_vardef::VardefSnapshot> {
+        self.global_vars.vardef()
+    }
 }
 
 impl Domain {

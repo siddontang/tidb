@@ -101,7 +101,7 @@ fn check_valid(
     fk_check: bool,
     in_owner: bool,
 ) -> Refusal<()> {
-    if !tidb_vardef::ENABLE_FOREIGN_KEY.load(std::sync::atomic::Ordering::SeqCst) {
+    if !tidb_vardef::snapshot::current().enable_foreign_key().load(std::sync::atomic::Ordering::SeqCst) {
         return Ok(());
     }
     let schema_l = schema.go_to_lower();

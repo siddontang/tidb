@@ -111,6 +111,10 @@ pub struct GlobalSysvars {
     resolved: Arc<RwLock<Arc<ResolvedGlobals>>>,
     /// Serializes rebuilds of `resolved`; see `refresh_resolved`.
     refresh_lock: Arc<Mutex<()>>,
+    /// The values this table's `SetGlobal` hooks write the vardef global
+    /// statics to (multi-keyspace design §6.3): the process statics, or the
+    /// keyspace's own on a multi-keyspace node's other keyspaces.
+    vardef: Arc<tidb_vardef::VardefSnapshot>,
 }
 
 #[derive(Clone, Debug)]
@@ -266,12 +270,17 @@ impl Default for GlobalSysvars {
             domain_hooks: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             resolved: Arc::new(RwLock::new(EMPTY_RESOLVED.with(|it| it.clone()))),
             refresh_lock: Arc::default(),
+            vardef: tidb_vardef::snapshot::process(),
         }
     }
 }
 
 /// Go `session`'s `GlobalVarAccessor` implementation over the domain.
 impl tidb_variable::GlobalVarAccessor for GlobalSysvars {
+    fn vardef(&self) -> Option<Arc<tidb_vardef::VardefSnapshot>> {
+        self.vardef.is_per_keyspace().then(|| Arc::clone(&self.vardef))
+    }
+
     fn run_set_global_hook(&self, name: &str, value: &str) -> Result<(), VarError> {
         let hook = self
             .set_global_hooks
@@ -391,8 +400,26 @@ impl GlobalSysvars {
         // copy are of the values it assigns, which a hook would replace with
         // the stored ones (Go hands SetGlobal the assigned value directly).
         self.set_global_hooks = other.set_global_hooks.clone();
+        self.vardef = Arc::clone(&other.vardef);
         self
     }
+
+    /// This table with values of its own for the vardef global statics: a
+    /// multi-keyspace node's keyspace other than its configured one (design
+    /// §6.3). Its `SetGlobal` hooks write them and its `GetGlobal` hooks read
+    /// them.
+    #[must_use]
+    pub fn with_keyspace_vardef(mut self) -> Self {
+        self.vardef = Arc::new(tidb_vardef::VardefSnapshot::per_keyspace());
+        self
+    }
+
+    /// The values this table's keyspace reads the vardef global statics
+    /// from: the process statics unless it owns its own.
+    pub fn vardef(&self) -> Arc<tidb_vardef::VardefSnapshot> {
+        Arc::clone(&self.vardef)
+    }
+
 
     /// Go `variable.RegisterSysVar`'s `GetGlobal` for `name`, from a package
     /// outside the registry.
@@ -605,7 +632,7 @@ impl GlobalSysvars {
             }
             // Go `SysVar.GetGlobal`: the variable's process-wide value is the
             // live table's answer (a scratch table answers what it stores).
-            if let Some(value) = def.get_global_from_hook() {
+            if let Some(value) = def.get_global_from_hook(&self.vardef) {
                 return value;
             }
         }
@@ -662,7 +689,7 @@ impl GlobalSysvars {
                 ]),
             ));
         }
-        self.get(name).and_then(|value| global_get_hook(def, value))
+        self.get(name).and_then(|value| global_get_hook(def, &self.vardef, value))
     }
 
     /// Rebuilds the read-mostly image from the cache's global view and the
@@ -822,7 +849,7 @@ impl GlobalSysvars {
             if let Some(value) = runtime_instance_value(self, def) {
                 return Ok(value);
             }
-            if let Some(value) = def.get_global_from_hook() {
+            if let Some(value) = def.get_global_from_hook(&self.vardef) {
                 return value;
             }
         }
@@ -998,7 +1025,10 @@ impl GlobalSysvars {
         // logged-and-ignored rebuild error.
         match get_sys_var(name).and_then(|def| def.set_global) {
             Some(set_global) => {
-                let _ = set_global(&mut tidb_variable::vars::SessionVars::new(), value);
+                // The hook writes this table's keyspace's vardef values.
+                let mut vars = tidb_variable::vars::SessionVars::new();
+                vars.set_vardef(Arc::clone(&self.vardef));
+                let _ = set_global(&mut vars, value);
             }
             None => {
                 let _ = tidb_variable::GlobalVarAccessor::run_set_global_hook(self, name, value);

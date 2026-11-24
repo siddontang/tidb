@@ -1931,7 +1931,7 @@ fn adjust_foreign_key_children(
     new: &tidb_model::ColumnInfo,
     old: &tidb_model::ColumnInfo,
 ) -> Result<Vec<(i64, TableInfo)>, DdlPlanError> {
-    if !tidb_vardef::ENABLE_FOREIGN_KEY.load(std::sync::atomic::Ordering::SeqCst)
+    if !tidb_vardef::snapshot::current().enable_foreign_key().load(std::sync::atomic::Ordering::SeqCst)
         || new.name.lowercase() == old.name.lowercase()
     {
         return Ok(Vec::new());

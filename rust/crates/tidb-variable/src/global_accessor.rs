@@ -30,6 +30,13 @@ use crate::VarError;
 /// Go `variable.GlobalVarAccessor`, with the typed reads this tier serves
 /// from the same object where Go loads `vardef` atomics.
 pub trait GlobalVarAccessor: crate::GlobalSysvarAccessor + std::fmt::Debug {
+    /// The keyspace's own values of the vardef global statics, when its
+    /// runtime owns them (multi-keyspace design §6.3); `None` is the process
+    /// statics.
+    fn vardef(&self) -> Option<std::sync::Arc<tidb_vardef::VardefSnapshot>> {
+        None
+    }
+
     /// Go `GetGlobalSysVar`.
     ///
     /// # Errors

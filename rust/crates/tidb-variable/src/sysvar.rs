@@ -617,7 +617,10 @@ pub type GetStateHook = fn(&crate::vars::SessionVars) -> Result<(String, bool), 
 /// which every GLOBAL read goes through, or Go's error. Go's closure also
 /// receives the context and the session, which none of the ported hooks
 /// read.
-pub type GetGlobalHook = fn() -> Result<String, crate::vars::VarError>;
+///
+/// The hook reads the keyspace's values of the vardef global statics from
+/// the snapshot it is handed (multi-keyspace design §6.3).
+pub type GetGlobalHook = fn(&tidb_vardef::VardefSnapshot) -> Result<String, crate::vars::VarError>;
 
 /// Go `SysVar.GetSession`: the session value a variable answers from the
 /// session's state rather than from `vars.systems` (`GetSessionFromHook`),
@@ -1286,9 +1289,12 @@ impl SysVarDef {
     /// `GetGlobal` answer, validated as Go validates it ("since some are read
     /// directly from tables") -- an out-of-range process value is clamped.
     #[must_use]
-    pub fn get_global_from_hook(&self) -> Option<Result<String, crate::vars::VarError>> {
+    pub fn get_global_from_hook(
+        &self,
+        vardef: &tidb_vardef::VardefSnapshot,
+    ) -> Option<Result<String, crate::vars::VarError>> {
         self.get_global.map(|get_global| {
-            get_global().map(|value| self.validate_with_relaxed_validation(&value, SCOPE_GLOBAL))
+            get_global(vardef).map(|value| self.validate_with_relaxed_validation(&value, SCOPE_GLOBAL))
         })
     }
 

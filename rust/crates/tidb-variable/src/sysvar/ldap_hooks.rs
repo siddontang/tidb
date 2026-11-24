@@ -138,7 +138,7 @@ const MASK_PWD: &str = "******";
 macro_rules! ldap_get_global {
     ($($name:ident => $body:expr;)*) => {
         $(
-            pub(super) fn $name() -> Result<String, crate::vars::VarError> {
+            pub(super) fn $name(_vardef: &tidb_vardef::VardefSnapshot) -> Result<String, crate::vars::VarError> {
                 Ok($body)
             }
         )*

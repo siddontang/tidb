@@ -18,6 +18,7 @@
 //! `UPDATE_MULTI_KEYSPACE_APPENDIX=1` to rewrite the appendix.
 
 use tidb_vardef::classification::{StaticScope, PROCESS_STATICS};
+use tidb_vardef::snapshot::SNAPSHOT_STATICS;
 use tidb_variable::sysvar::{get_sys_var, SCOPE_GLOBAL, SCOPE_INSTANCE, SCOPE_SESSION};
 
 const BEGIN: &str = "<!-- BEGIN generated: vardef classification -->";
@@ -45,11 +46,12 @@ fn registry_scope(sysvar: &str) -> String {
 fn appendix() -> String {
     let count = |scope| PROCESS_STATICS.iter().filter(|entry| entry.scope == scope).count();
     let mut out = format!(
-        "{BEGIN}\n\n{} statics: {} global, {} instance, {} internal.\n\n\
-         | Static | System variable | Registry scope | Class | Governs |\n\
-         | --- | --- | --- | --- | --- |\n",
+        "{BEGIN}\n\n{} statics: {} global ({} kept per keyspace so far), {} instance, {} internal.\n\n\
+         | Static | System variable | Registry scope | Class | Per keyspace | Governs |\n\
+         | --- | --- | --- | --- | --- | --- |\n",
         PROCESS_STATICS.len(),
         count(StaticScope::Global),
+        SNAPSHOT_STATICS.len(),
         count(StaticScope::Instance),
         count(StaticScope::Internal),
     );
@@ -58,8 +60,13 @@ fn appendix() -> String {
             Some(sysvar) => (format!("`{sysvar}`"), registry_scope(sysvar)),
             None => ("--".to_owned(), "--".to_owned()),
         };
+        let per_keyspace = match entry.scope {
+            StaticScope::Global if SNAPSHOT_STATICS.contains(&entry.name) => "yes",
+            StaticScope::Global => "not yet",
+            _ => "--",
+        };
         out.push_str(&format!(
-            "| `{}` | {sysvar} | {scope} | {} | {} |\n",
+            "| `{}` | {sysvar} | {scope} | {} | {per_keyspace} | {} |\n",
             entry.name,
             entry.scope.name(),
             entry.governs

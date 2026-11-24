@@ -134,7 +134,8 @@ pub(crate) fn run_cluster_session_node_with_spill(
     let tenant = multi_keyspace
         .is_some()
         .then(|| tidb_logutil::enter_tenant(&config.global_config.keyspace_name));
-    let (runtime, authority) = KeyspaceRuntime::open(&config, spill_storage, memory_arbitrator)?;
+    // The configured keyspace reads the process statics (design §6.3).
+    let (runtime, authority) = KeyspaceRuntime::open(&config, spill_storage, memory_arbitrator, false)?;
     drop(tenant);
     // Go `main`: `if deploymode.IsStarter() { externalWorkloadManager :=
     // initExternalWorkloadManager(ctx, storage); defer close... }`.

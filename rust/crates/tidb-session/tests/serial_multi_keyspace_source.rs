@@ -347,3 +347,53 @@ fn a_multi_keyspace_node_refuses_import_br_and_plan_replayer() {
     assert!(brie_queue.accesses() > brie_accesses);
     tidb_dxf_importinto::set_import_store(None);
 }
+
+/// A tenant of a multi-keyspace node sets its keyspace's GLOBAL variables
+/// but not the process's (design §6.3): a variable whose value is the
+/// process's memory, log, PD client or watchdog, or one Go scopes to the
+/// instance, answers `ER_SPECIFIC_ACCESS_DENIED_ERROR` (1227) for `SET
+/// GLOBAL` and `SET INSTANCE`. A single-keyspace node sets them as before.
+#[test]
+fn a_tenant_cannot_set_process_variables() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
+    let store = MockStoreDomain::create().unwrap();
+    let mut session = store.new_session().unwrap();
+    let process_variables = [
+        "set global tidb_enable_instance_plan_cache = on",
+        "set global tidb_schema_cache_size = 1073741824",
+        "set global tidb_memory_usage_alarm_ratio = 0.5",
+        "set global tidb_general_log = 1",
+        "set instance tidb_general_log = 1",
+        "set tidb_general_log = 1",
+        "set global tidb_expensive_query_time_threshold = 120",
+    ];
+
+    tidb_keyspace::set_multi_keyspace_mode(true);
+    for sql in process_variables {
+        let (code, message) = refusal(&mut session, sql).unwrap_or_else(|| panic!("{sql} ran"));
+        assert_eq!(code, 1227, "{sql}: {message}");
+        assert!(message.contains("RESTRICTED_VARIABLES_ADMIN"), "{sql}: {message}");
+    }
+    // The keyspace's own variables, and the session's.
+    for sql in ["set global tidb_enable_foreign_key = off", "set global tidb_enable_foreign_key = on", "set tidb_mem_quota_query = 1073741824"] {
+        assert_eq!(refusal(&mut session, sql), None, "{sql}");
+    }
+
+    tidb_keyspace::set_multi_keyspace_mode(false);
+    for sql in process_variables {
+        assert_eq!(refusal(&mut session, sql), None, "{sql}");
+    }
+    for sql in [
+        "set global tidb_enable_instance_plan_cache = default",
+        "set global tidb_schema_cache_size = default",
+        "set global tidb_memory_usage_alarm_ratio = default",
+        "set global tidb_general_log = 0",
+        "set global tidb_expensive_query_time_threshold = default",
+    ] {
+        assert_eq!(refusal(&mut session, sql), None, "{sql}");
+    }
+}

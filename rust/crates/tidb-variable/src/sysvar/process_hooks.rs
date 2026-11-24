@@ -32,10 +32,15 @@ fn on_off(value: bool) -> String {
     if value { "ON" } else { "OFF" }.to_owned()
 }
 
+/// `|vd, s|`: `vd` is the session's keyspace runtime's vardef snapshot
+/// (multi-keyspace design §6.3), which the hook writes the keyspace's
+/// statics through.
 macro_rules! set_global {
-    ($($name:ident => |$value:ident| $body:expr;)*) => {
+    ($($name:ident => |$vd:ident, $value:ident| $body:expr;)*) => {
         $(
-            pub(super) fn $name(_vars: &mut SessionVars, $value: &str) -> Result<(), VarError> {
+            #[allow(unused_variables)]
+            pub(super) fn $name(vars: &mut SessionVars, $value: &str) -> Result<(), VarError> {
+                let $vd = vars.vardef();
                 $body;
                 Ok(())
             }
@@ -43,10 +48,13 @@ macro_rules! set_global {
     };
 }
 
+/// `vd` in a body is the keyspace's vardef snapshot (multi-keyspace design
+/// §6.3), which the hook reads the keyspace's statics through.
 macro_rules! get_global {
-    ($($name:ident => $body:expr;)*) => {
+    (|$vd:ident| $($name:ident => $body:expr;)*) => {
         $(
-            pub(super) fn $name() -> Result<String, crate::vars::VarError> {
+            #[allow(unused_variables)]
+            pub(super) fn $name($vd: &tidb_vardef::VardefSnapshot) -> Result<String, crate::vars::VarError> {
                 Ok($body)
             }
         )*
@@ -54,92 +62,95 @@ macro_rules! get_global {
 }
 
 set_global! {
-    set_tidb_ttl_job_enable => |s| tidb_vardef::ENABLE_TTL_JOB.store(on(s), SeqCst);
+    set_tidb_ttl_job_enable => |vd, s| vd.enable_ttl_job().store(on(s), SeqCst);
     // Go: `strconv.ParseInt(s, 10, 64)` then `Store`; the registry has
     // validated the value, so the parse cannot fail.
-    set_tidb_ttl_scan_batch_size => |s| if let Ok(v) = s.parse::<i64>() {
-        tidb_vardef::TTL_SCAN_BATCH_SIZE.store(v, SeqCst);
+    set_tidb_ttl_scan_batch_size => |vd, s| if let Ok(v) = s.parse::<i64>() {
+        vd.ttl_scan_batch_size().store(v, SeqCst);
     };
-    set_tidb_ttl_delete_batch_size => |s| if let Ok(v) = s.parse::<i64>() {
-        tidb_vardef::TTL_DELETE_BATCH_SIZE.store(v, SeqCst);
+    set_tidb_ttl_delete_batch_size => |vd, s| if let Ok(v) = s.parse::<i64>() {
+        vd.ttl_delete_batch_size().store(v, SeqCst);
     };
-    set_tidb_ttl_delete_rate_limit => |s| if let Ok(v) = s.parse::<i64>() {
-        tidb_vardef::TTL_DELETE_RATE_LIMIT.store(v, SeqCst);
+    set_tidb_ttl_delete_rate_limit => |vd, s| if let Ok(v) = s.parse::<i64>() {
+        vd.ttl_delete_rate_limit().store(v, SeqCst);
     };
-    set_tidb_ttl_scan_worker_count => |s| if let Ok(v) = s.parse::<i64>() {
-        tidb_vardef::TTL_SCAN_WORKER_COUNT.store(v as i32, SeqCst);
+    set_tidb_ttl_scan_worker_count => |vd, s| if let Ok(v) = s.parse::<i64>() {
+        vd.ttl_scan_worker_count().store(v as i32, SeqCst);
     };
-    set_tidb_ttl_delete_worker_count => |s| if let Ok(v) = s.parse::<i64>() {
-        tidb_vardef::TTL_DELETE_WORKER_COUNT.store(v as i32, SeqCst);
+    set_tidb_ttl_delete_worker_count => |vd, s| if let Ok(v) = s.parse::<i64>() {
+        vd.ttl_delete_worker_count().store(v as i32, SeqCst);
     };
-    set_tidb_ttl_running_tasks => |s| if let Ok(v) = s.parse::<i64>() {
-        tidb_vardef::TTL_RUNNING_TASKS.store(v as i32, SeqCst);
+    set_tidb_ttl_running_tasks => |vd, s| if let Ok(v) = s.parse::<i64>() {
+        vd.ttl_running_tasks().store(v as i32, SeqCst);
     };
-    set_tidb_enable_foreign_key => |s| tidb_vardef::ENABLE_FOREIGN_KEY.store(on(s), SeqCst);
-    set_tidb_enable_row_level_checksum => |s| tidb_vardef::ENABLE_ROW_LEVEL_CHECKSUM.store(on(s), SeqCst);
-    set_tidb_enable_check_constraint => |s| tidb_vardef::ENABLE_CHECK_CONSTRAINT.store(on(s), SeqCst);
-    set_tidb_ddl_enable_fast_reorg => |s| tidb_vardef::ENABLE_FAST_REORG.store(on(s), SeqCst);
-    set_tidb_enable_auto_analyze => |s| tidb_vardef::RUN_AUTO_ANALYZE.store(on(s), SeqCst);
-    set_tidb_enable_instance_plan_cache => |s| tidb_vardef::ENABLE_INSTANCE_PLAN_CACHE.store(on(s), SeqCst);
-    set_tidb_resource_control_strict_mode => |s| {
-        tidb_vardef::ENABLE_RESOURCE_CONTROL_STRICT_MODE.store(on(s), SeqCst)
+    set_tidb_enable_foreign_key => |vd, s| vd.enable_foreign_key().store(on(s), SeqCst);
+    set_tidb_enable_row_level_checksum => |vd, s| vd.enable_row_level_checksum().store(on(s), SeqCst);
+    set_tidb_enable_check_constraint => |vd, s| vd.enable_check_constraint().store(on(s), SeqCst);
+    set_tidb_ddl_enable_fast_reorg => |vd, s| vd.enable_fast_reorg().store(on(s), SeqCst);
+    set_tidb_enable_auto_analyze => |vd, s| vd.run_auto_analyze().store(on(s), SeqCst);
+    set_tidb_enable_instance_plan_cache => |vd, s| tidb_vardef::ENABLE_INSTANCE_PLAN_CACHE.store(on(s), SeqCst);
+    set_tidb_resource_control_strict_mode => |vd, s| {
+        vd.enable_resource_control_strict_mode().store(on(s), SeqCst)
     };
-    set_tidb_enable_fast_create_table => |s| tidb_vardef::ENABLE_FAST_CREATE_TABLE.store(on(s), SeqCst);
-    set_tidb_accelerate_user_creation_update => |s| {
-        tidb_vardef::ACCELERATE_USER_CREATION_UPDATE.store(on(s), SeqCst)
+    set_tidb_enable_fast_create_table => |vd, s| vd.enable_fast_create_table().store(on(s), SeqCst);
+    set_tidb_accelerate_user_creation_update => |vd, s| {
+        vd.accelerate_user_creation_update().store(on(s), SeqCst)
     };
-    set_max_user_connections => |s| tidb_vardef::MAX_USER_CONNECTIONS_VALUE.store(
+    set_max_user_connections => |vd, s| vd.max_user_connections_value().store(
         crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_MAX_USER_CONNECTIONS) as u32,
         SeqCst,
     );
-    set_performance_schema_session_connect_attrs_size => |s| tidb_vardef::CONNECT_ATTRS_SIZE.store(
+    set_performance_schema_session_connect_attrs_size => |vd, s| vd.connect_attrs_size().store(
         crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_CONNECT_ATTRS_SIZE),
         SeqCst,
     );
     // Go: `vardef.DDLDiskQuota.Store(TidbOptUint64(val, DefTiDBDDLDiskQuota))`.
-    set_tidb_ddl_disk_quota => |s| tidb_vardef::DDL_DISK_QUOTA.store(
+    set_tidb_ddl_disk_quota => |vd, s| vd.ddl_disk_quota().store(
         s.parse::<u64>().unwrap_or(tidb_vardef::defaults::DEF_TIDB_DDL_DISK_QUOTA as u64),
         SeqCst,
     );
-    set_tidb_auto_analyze_concurrency => |s| tidb_vardef::AUTO_ANALYZE_CONCURRENCY.store(
+    set_tidb_auto_analyze_concurrency => |vd, s| vd.auto_analyze_concurrency().store(
         s.parse::<i64>().unwrap_or(tidb_vardef::defaults::DEF_TIDB_AUTO_ANALYZE_CONCURRENCY),
         SeqCst,
     );
-    set_tidb_max_auto_analyze_time => |s| if let Ok(v) = s.parse::<i64>() {
-        tidb_vardef::MAX_AUTO_ANALYZE_TIME.store(v, SeqCst);
+    set_tidb_max_auto_analyze_time => |vd, s| if let Ok(v) = s.parse::<i64>() {
+        vd.max_auto_analyze_time().store(v, SeqCst);
     };
-    set_tidb_stats_cache_mem_quota => |s| if let Ok(v) = s.parse::<i64>() {
+    set_tidb_stats_cache_mem_quota => |vd, s| if let Ok(v) = s.parse::<i64>() {
         tidb_vardef::STATS_CACHE_MEM_QUOTA.store(v, SeqCst);
     };
-    set_tidb_memory_usage_alarm_keep_record_num => |s| if let Ok(v) = s.parse::<i64>() {
+    set_tidb_memory_usage_alarm_keep_record_num => |vd, s| if let Ok(v) = s.parse::<i64>() {
         tidb_vardef::MEMORY_USAGE_ALARM_KEEP_RECORD_NUM.store(v, SeqCst);
     };
     // Go: `vardef.TxnEntrySizeLimit.Store(TidbOptUint64(val, Def))`.
-    set_tidb_txn_entry_size_limit => |s| tidb_vardef::TXN_ENTRY_SIZE_LIMIT.store(
+    set_tidb_txn_entry_size_limit => |vd, s| vd.txn_entry_size_limit().store(
         crate::varsutil::tidb_opt_uint64(s, tidb_vardef::defaults::DEF_TIDB_TXN_ENTRY_SIZE_LIMIT as u64),
         SeqCst,
     );
-    set_tidb_table_cache_lease => |s| if let Ok(v) = s.parse::<i64>() {
-        tidb_vardef::TABLE_CACHE_LEASE.store(v, SeqCst);
+    set_tidb_table_cache_lease => |vd, s| if let Ok(v) = s.parse::<i64>() {
+        vd.table_cache_lease().store(v, SeqCst);
     };
     // Go: `SetMaxDeltaSchemaCount(TidbOptInt64(val, Def))`.
-    set_tidb_max_delta_schema_count => |s| tidb_vardef::set_max_delta_schema_count(
+    set_tidb_max_delta_schema_count => |vd, s| tidb_vardef::set_max_delta_schema_count(
         crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_MAX_DELTA_SCHEMA_COUNT),
     );
     // Go `tidbOptPositiveInt32(val, Def...)` for the three DDL knobs.
-    set_tidb_ddl_flashback_concurrency => |s| tidb_vardef::set_ddl_flashback_concurrency(
+    set_tidb_ddl_flashback_concurrency => |vd, s| vd.ddl_flashback_concurrency().store(
         s.parse::<i32>().ok().filter(|cnt| *cnt > 0)
             .unwrap_or(tidb_vardef::defaults::DEF_TIDB_DDL_FLASHBACK_CONCURRENCY as i32),
+        SeqCst,
     );
-    set_tidb_ddl_reorg_worker_count => |s| tidb_vardef::set_ddl_reorg_worker_counter(
+    set_tidb_ddl_reorg_worker_count => |vd, s| vd.ddl_reorg_worker_counter().store(
         s.parse::<i32>().ok().filter(|cnt| *cnt > 0)
             .unwrap_or(tidb_vardef::defaults::DEF_TIDB_DDL_REORG_WORKER_COUNT as i32),
+        SeqCst,
     );
-    set_tidb_ddl_reorg_batch_size => |s| tidb_vardef::set_ddl_reorg_batch_size(
+    set_tidb_ddl_reorg_batch_size => |vd, s| vd.ddl_reorg_batch_size().store(
         s.parse::<i32>().ok().filter(|cnt| *cnt > 0)
             .unwrap_or(tidb_vardef::defaults::DEF_TIDB_DDL_REORG_BATCH_SIZE as i32),
+        SeqCst,
     );
-    set_tidb_ddl_error_count_limit => |s| tidb_vardef::set_ddl_error_count_limit(
+    set_tidb_ddl_error_count_limit => |vd, s| tidb_vardef::set_ddl_error_count_limit(
         s.parse::<i64>().unwrap_or(tidb_vardef::defaults::DEF_TIDB_DDL_ERROR_COUNT_LIMIT),
     );
 }
@@ -164,27 +175,27 @@ pub(super) fn set_tidb_instance_plan_cache_max_mem_size(
     Ok(())
 }
 
-get_global! {
-    get_tidb_ttl_job_enable => on_off(tidb_vardef::ENABLE_TTL_JOB.load(SeqCst));
-    get_tidb_ttl_scan_batch_size => tidb_vardef::TTL_SCAN_BATCH_SIZE.load(SeqCst).to_string();
-    get_tidb_ttl_delete_batch_size => tidb_vardef::TTL_DELETE_BATCH_SIZE.load(SeqCst).to_string();
-    get_tidb_ttl_delete_rate_limit => tidb_vardef::TTL_DELETE_RATE_LIMIT.load(SeqCst).to_string();
-    get_tidb_ttl_scan_worker_count => tidb_vardef::TTL_SCAN_WORKER_COUNT.load(SeqCst).to_string();
-    get_tidb_ttl_delete_worker_count => tidb_vardef::TTL_DELETE_WORKER_COUNT.load(SeqCst).to_string();
-    get_tidb_ttl_running_tasks => tidb_vardef::TTL_RUNNING_TASKS.load(SeqCst).to_string();
-    get_tidb_enable_foreign_key => on_off(tidb_vardef::ENABLE_FOREIGN_KEY.load(SeqCst));
-    get_tidb_enable_row_level_checksum => on_off(tidb_vardef::ENABLE_ROW_LEVEL_CHECKSUM.load(SeqCst));
-    get_tidb_enable_check_constraint => on_off(tidb_vardef::ENABLE_CHECK_CONSTRAINT.load(SeqCst));
-    get_tidb_ddl_enable_fast_reorg => on_off(tidb_vardef::ENABLE_FAST_REORG.load(SeqCst));
-    get_tidb_enable_auto_analyze => on_off(tidb_vardef::RUN_AUTO_ANALYZE.load(SeqCst));
+get_global! { |vd|
+    get_tidb_ttl_job_enable => on_off(vd.enable_ttl_job().load(SeqCst));
+    get_tidb_ttl_scan_batch_size => vd.ttl_scan_batch_size().load(SeqCst).to_string();
+    get_tidb_ttl_delete_batch_size => vd.ttl_delete_batch_size().load(SeqCst).to_string();
+    get_tidb_ttl_delete_rate_limit => vd.ttl_delete_rate_limit().load(SeqCst).to_string();
+    get_tidb_ttl_scan_worker_count => vd.ttl_scan_worker_count().load(SeqCst).to_string();
+    get_tidb_ttl_delete_worker_count => vd.ttl_delete_worker_count().load(SeqCst).to_string();
+    get_tidb_ttl_running_tasks => vd.ttl_running_tasks().load(SeqCst).to_string();
+    get_tidb_enable_foreign_key => on_off(vd.enable_foreign_key().load(SeqCst));
+    get_tidb_enable_row_level_checksum => on_off(vd.enable_row_level_checksum().load(SeqCst));
+    get_tidb_enable_check_constraint => on_off(vd.enable_check_constraint().load(SeqCst));
+    get_tidb_ddl_enable_fast_reorg => on_off(vd.enable_fast_reorg().load(SeqCst));
+    get_tidb_enable_auto_analyze => on_off(vd.run_auto_analyze().load(SeqCst));
     get_tidb_enable_instance_plan_cache => on_off(tidb_vardef::ENABLE_INSTANCE_PLAN_CACHE.load(SeqCst));
-    get_tidb_resource_control_strict_mode => on_off(tidb_vardef::ENABLE_RESOURCE_CONTROL_STRICT_MODE.load(SeqCst));
-    get_tidb_enable_fast_create_table => on_off(tidb_vardef::ENABLE_FAST_CREATE_TABLE.load(SeqCst));
-    get_max_user_connections => tidb_vardef::MAX_USER_CONNECTIONS_VALUE.load(SeqCst).to_string();
-    get_performance_schema_session_connect_attrs_size => tidb_vardef::CONNECT_ATTRS_SIZE.load(SeqCst).to_string();
-    get_tidb_ddl_disk_quota => tidb_vardef::DDL_DISK_QUOTA.load(SeqCst).to_string();
-    get_tidb_auto_analyze_concurrency => tidb_vardef::AUTO_ANALYZE_CONCURRENCY.load(SeqCst).to_string();
-    get_tidb_max_auto_analyze_time => tidb_vardef::MAX_AUTO_ANALYZE_TIME.load(SeqCst).to_string();
+    get_tidb_resource_control_strict_mode => on_off(vd.enable_resource_control_strict_mode().load(SeqCst));
+    get_tidb_enable_fast_create_table => on_off(vd.enable_fast_create_table().load(SeqCst));
+    get_max_user_connections => vd.max_user_connections_value().load(SeqCst).to_string();
+    get_performance_schema_session_connect_attrs_size => vd.connect_attrs_size().load(SeqCst).to_string();
+    get_tidb_ddl_disk_quota => vd.ddl_disk_quota().load(SeqCst).to_string();
+    get_tidb_auto_analyze_concurrency => vd.auto_analyze_concurrency().load(SeqCst).to_string();
+    get_tidb_max_auto_analyze_time => vd.max_auto_analyze_time().load(SeqCst).to_string();
     get_tidb_stats_cache_mem_quota => tidb_vardef::STATS_CACHE_MEM_QUOTA.load(SeqCst).to_string();
     get_tidb_memory_usage_alarm_keep_record_num => tidb_vardef::MEMORY_USAGE_ALARM_KEEP_RECORD_NUM.load(SeqCst).to_string();
     get_tidb_instance_plan_cache_max_mem_size => tidb_vardef::INSTANCE_PLAN_CACHE_MAX_MEM_SIZE.load(SeqCst).to_string();
@@ -196,33 +207,33 @@ fn opt_float64(value: &str, default: f64) -> f64 {
 }
 
 set_global! {
-    set_tidb_mem_oom_action => |s| tidb_vardef::set_oom_action(s);
-    set_tidb_memory_usage_alarm_ratio => |s| tidb_vardef::set_memory_usage_alarm_ratio(
+    set_tidb_mem_oom_action => |vd, s| vd.set_oom_action(s);
+    set_tidb_memory_usage_alarm_ratio => |vd, s| tidb_vardef::set_memory_usage_alarm_ratio(
         opt_float64(s, tidb_vardef::defaults::DEF_MEMORY_USAGE_ALARM_RATIO),
     );
     // Go: `atomic.StoreInt32(&vardef.ForcePriority, int32(mysql.Str2Priority(val)))`.
-    set_tidb_force_priority => |s| tidb_vardef::FORCE_PRIORITY
+    set_tidb_force_priority => |vd, s| tidb_vardef::FORCE_PRIORITY
         .store(tidb_mysql::priority_from_str(s).as_enum(), SeqCst);
     // Go: `tikvstore.TxnCommitBatchSize.Store(uint64(TidbOptInt64(val, Def)))`.
-    set_tidb_txn_commit_batch_size => |s| tikv_client::kv::TXN_COMMIT_BATCH_SIZE.store(
+    set_tidb_txn_commit_batch_size => |vd, s| tikv_client::kv::TXN_COMMIT_BATCH_SIZE.store(
         crate::varsutil::tidb_opt_int64(s, tikv_client::kv::DEF_TXN_COMMIT_BATCH_SIZE as i64) as u64,
         SeqCst,
     );
     // Go: `tikvstore.StoreLimit.Store(TidbOptInt64(val, DefTiDBStoreLimit))`.
-    set_tidb_store_limit => |s| tikv_client::kv::STORE_LIMIT.store(
+    set_tidb_store_limit => |vd, s| tikv_client::kv::STORE_LIMIT.store(
         crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_STORE_LIMIT),
         SeqCst,
     );
     // Go: starter mode keeps the internal TLS transport gate disabled.
-    set_require_secure_transport => |s| tidb_tls::REQUIRE_SECURE_TRANSPORT
+    set_require_secure_transport => |vd, s| tidb_tls::REQUIRE_SECURE_TRANSPORT
         .store(!tidb_config_deploymode::is_starter() && on(s), SeqCst);
-    set_tidb_check_mb4_value_in_utf8 => |s| tidb_config::config_tree::config::update_global(|config| {
+    set_tidb_check_mb4_value_in_utf8 => |vd, s| tidb_config::config_tree::config::update_global(|config| {
         config.instance.check_mb4_value_in_utf8 =
             tidb_config::config_tree::marshal::AtomicBool::new(on(s));
     });
     // Go: `vardef.ServiceScope.Store(strings.ToLower(s))` and the config's
     // `Instance.TiDBServiceScope`.
-    set_tidb_service_scope => |s| {
+    set_tidb_service_scope => |vd, s| {
         let new_value = s.to_lowercase();
         tidb_vardef::set_service_scope(new_value.clone());
         if tidb_config::config_tree::config::get_global_config().instance.tidb_service_scope != new_value {
@@ -232,9 +243,9 @@ set_global! {
         }
     };
     // Go: only a change reaches the resource-control switch.
-    set_tidb_enable_resource_control => |s| {
+    set_tidb_enable_resource_control => |vd, s| {
         let enable = on(s);
-        if tidb_vardef::ENABLE_RESOURCE_CONTROL.swap(enable, SeqCst) != enable {
+        if vd.enable_resource_control().swap(enable, SeqCst) != enable {
             crate::vars::set_global_resource_control(enable);
             tidb_logutil::bg_logger().info(
                 "set resource control",
@@ -247,11 +258,12 @@ set_global! {
 /// Go `tidb_ttl_job_schedule_window_start_time`'s `SetGlobal`:
 /// `time.ParseInLocation(FullDayTimeFormat, s, time.UTC)`.
 pub(super) fn set_tidb_ttl_job_schedule_window_start_time(
-    _vars: &mut SessionVars,
+    vars: &mut SessionVars,
     s: &str,
 ) -> Result<(), VarError> {
+    let vd = vars.vardef();
     let time = tidb_vardef::DayTime::parse(s).map_err(tidb_terror::MysqlError::unknown)?;
-    *tidb_vardef::TTL_JOB_SCHEDULE_WINDOW_START_TIME
+    *vd.ttl_job_schedule_window_start_time()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = time;
     Ok(())
@@ -259,11 +271,12 @@ pub(super) fn set_tidb_ttl_job_schedule_window_start_time(
 
 /// Go `tidb_ttl_job_schedule_window_end_time`'s `SetGlobal`.
 pub(super) fn set_tidb_ttl_job_schedule_window_end_time(
-    _vars: &mut SessionVars,
+    vars: &mut SessionVars,
     s: &str,
 ) -> Result<(), VarError> {
+    let vd = vars.vardef();
     let time = tidb_vardef::DayTime::parse(s).map_err(tidb_terror::MysqlError::unknown)?;
-    *tidb_vardef::TTL_JOB_SCHEDULE_WINDOW_END_TIME
+    *vd.ttl_job_schedule_window_end_time()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = time;
     Ok(())
@@ -305,8 +318,8 @@ pub(super) fn set_tidb_circuit_breaker_pd_metadata_error_rate_threshold_ratio(
     Ok(())
 }
 
-get_global! {
-    get_tidb_mem_oom_action => tidb_vardef::oom_action().to_owned();
+get_global! { |vd|
+    get_tidb_mem_oom_action => vd.oom_action_name().to_owned();
     get_tidb_txn_commit_batch_size => tikv_client::kv::TXN_COMMIT_BATCH_SIZE.load(SeqCst).to_string();
     get_tidb_store_limit => tikv_client::kv::STORE_LIMIT.load(SeqCst).to_string();
     // Go: starter mode intentionally exposes require_secure_transport as ON.
@@ -319,11 +332,11 @@ get_global! {
         tidb_config::config_tree::config::get_global_config().instance.check_mb4_value_in_utf8.load(),
     );
     get_tidb_service_scope => tidb_vardef::service_scope();
-    get_tidb_ttl_job_schedule_window_start_time => tidb_vardef::TTL_JOB_SCHEDULE_WINDOW_START_TIME
+    get_tidb_ttl_job_schedule_window_start_time => vd.ttl_job_schedule_window_start_time()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .format();
-    get_tidb_ttl_job_schedule_window_end_time => tidb_vardef::TTL_JOB_SCHEDULE_WINDOW_END_TIME
+    get_tidb_ttl_job_schedule_window_end_time => vd.ttl_job_schedule_window_end_time()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .format();
@@ -363,8 +376,8 @@ fn priority_to_str(priority: i32) -> String {
     .to_owned()
 }
 
-get_global! {
-    get_tidb_enable_resource_control => on_off(tidb_vardef::ENABLE_RESOURCE_CONTROL.load(SeqCst));
+get_global! { |vd|
+    get_tidb_enable_resource_control => on_off(vd.enable_resource_control().load(SeqCst));
     get_tidb_memory_usage_alarm_ratio => go_g(tidb_vardef::memory_usage_alarm_ratio());
     get_tidb_force_priority => priority_to_str(tidb_vardef::FORCE_PRIORITY.load(SeqCst));
 }
@@ -372,30 +385,30 @@ get_global! {
 set_global! {
     // Go `TiDBAnalyzeDefaultNumBuckets` / `TopN`: `strconv.ParseUint` then
     // `Store`; the registry's unsigned type has validated the value.
-    set_tidb_analyze_default_num_buckets => |s| if let Ok(v) = s.parse::<u64>() {
+    set_tidb_analyze_default_num_buckets => |vd, s| if let Ok(v) = s.parse::<u64>() {
         tidb_vardef::ANALYZE_DEFAULT_NUM_BUCKETS.store(v, SeqCst);
     };
-    set_tidb_analyze_default_num_top_n => |s| if let Ok(v) = s.parse::<u64>() {
+    set_tidb_analyze_default_num_top_n => |vd, s| if let Ok(v) = s.parse::<u64>() {
         tidb_vardef::ANALYZE_DEFAULT_NUM_TOP_N.store(v, SeqCst);
     };
-    set_tidb_enable_auto_analyze_priority_queue => |s| {
-        tidb_vardef::ENABLE_AUTO_ANALYZE_PRIORITY_QUEUE.store(on(s), SeqCst);
+    set_tidb_enable_auto_analyze_priority_queue => |vd, s| {
+        vd.enable_auto_analyze_priority_queue().store(on(s), SeqCst);
     };
     // Go: `oracles.EnableTSValidation.Store(TiDBOptOn(val))`.
-    set_tidb_enable_ts_validation => |s| {
+    set_tidb_enable_ts_validation => |vd, s| {
         tikv_client::oracle::oracles::ENABLE_TS_VALIDATION.store(on(s), SeqCst);
     };
     // Go: `tikvutil.CommitterConcurrency.Store(int32(TidbOptInt64(val, def)))`.
-    set_tidb_committer_concurrency => |s| tidb_tikvutil::COMMITTER_CONCURRENCY.store(
+    set_tidb_committer_concurrency => |vd, s| tidb_tikvutil::COMMITTER_CONCURRENCY.store(
         crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_COMMITTER_CONCURRENCY) as i32,
         SeqCst,
     );
 }
 
-get_global! {
+get_global! { |vd|
     get_tidb_analyze_default_num_buckets => tidb_vardef::ANALYZE_DEFAULT_NUM_BUCKETS.load(SeqCst).to_string();
     get_tidb_analyze_default_num_top_n => tidb_vardef::ANALYZE_DEFAULT_NUM_TOP_N.load(SeqCst).to_string();
-    get_tidb_enable_auto_analyze_priority_queue => on_off(tidb_vardef::ENABLE_AUTO_ANALYZE_PRIORITY_QUEUE.load(SeqCst));
+    get_tidb_enable_auto_analyze_priority_queue => on_off(vd.enable_auto_analyze_priority_queue().load(SeqCst));
     get_tidb_committer_concurrency => tidb_tikvutil::COMMITTER_CONCURRENCY.load(SeqCst).to_string();
     get_tidb_enable_metadata_lock => on_off(tidb_vardef::is_mdl_enabled(tidb_config_kerneltype::is_next_gen()));
     get_tidb_schema_cache_size => tidb_vardef::SCHEMA_CACHE_SIZE_ORIGIN_TEXT
@@ -440,7 +453,7 @@ pub(super) fn set_tidb_low_resolution_tso_update_interval(
     )))
 }
 
-get_global! {
+get_global! { |vd|
     // Go `strconv.FormatFloat(vardef.MaxTSOBatchWaitInterval.Load(), 'f', -1, 64)`.
     get_tidb_tso_client_batch_max_wait_time =>
         f64::from_bits(tidb_vardef::MAX_TSO_BATCH_WAIT_INTERVAL.load(SeqCst)).to_string();
@@ -452,22 +465,22 @@ get_global! {
 set_global! {
     // Go: `stmtsummaryv2.SetEnabled(TiDBOptOn(val))` and its siblings; the
     // registry has validated each value, so the parse cannot fail.
-    set_tidb_enable_stmt_summary => |s| tidb_stmtsummary::v2::stmtsummary::set_enabled(on(s));
-    set_tidb_stmt_summary_internal_query => |s| tidb_stmtsummary::v2::stmtsummary::set_enable_internal_query(on(s));
-    set_tidb_stmt_summary_refresh_interval => |s| if let Ok(v) = s.parse::<i64>() {
+    set_tidb_enable_stmt_summary => |vd, s| tidb_stmtsummary::v2::stmtsummary::set_enabled(on(s));
+    set_tidb_stmt_summary_internal_query => |vd, s| tidb_stmtsummary::v2::stmtsummary::set_enable_internal_query(on(s));
+    set_tidb_stmt_summary_refresh_interval => |vd, s| if let Ok(v) = s.parse::<i64>() {
         tidb_stmtsummary::v2::stmtsummary::set_refresh_interval(v);
     };
-    set_tidb_stmt_summary_history_size => |s| if let Ok(v) = s.parse::<i32>() {
+    set_tidb_stmt_summary_history_size => |vd, s| if let Ok(v) = s.parse::<i32>() {
         tidb_stmtsummary::v2::stmtsummary::set_history_size(v);
     };
-    set_tidb_stmt_summary_max_stmt_count => |s| if let Ok(v) = s.parse::<i64>() {
+    set_tidb_stmt_summary_max_stmt_count => |vd, s| if let Ok(v) = s.parse::<i64>() {
         tidb_stmtsummary::v2::stmtsummary::set_max_stmt_count(v);
     };
-    set_tidb_stmt_summary_max_sql_length => |s| if let Ok(v) = s.parse::<i32>() {
+    set_tidb_stmt_summary_max_sql_length => |vd, s| if let Ok(v) = s.parse::<i32>() {
         tidb_stmtsummary::v2::stmtsummary::set_max_sql_length(v);
     };
-    set_tidb_stmt_summary_persist_evicted => |s| tidb_stmtsummary::v2::stmtsummary::set_persist_evicted(on(s));
-    set_tidb_stmt_summary_group_by_user => |s| tidb_stmtsummary::v2::stmtsummary::set_group_by_user(on(s));
+    set_tidb_stmt_summary_persist_evicted => |vd, s| tidb_stmtsummary::v2::stmtsummary::set_persist_evicted(on(s));
+    set_tidb_stmt_summary_group_by_user => |vd, s| tidb_stmtsummary::v2::stmtsummary::set_group_by_user(on(s));
 }
 
 /// Go's memory-arbitration `SetGlobal` (`tidb_server_memory_limit`, its
@@ -490,7 +503,7 @@ process_memory_setting! {
     set_tidb_mem_arbitrator_soft_limit => tidb_vardef::tidb_vars::TIDB_MEM_ARBITRATOR_SOFT_LIMIT;
 }
 
-get_global! {
+get_global! { |vd|
     // Go: `vardef.CloudStorageURI.Load()`, redacted (`ast.RedactURL`).
     get_tidb_cloud_storage_uri => crate::cloud_storage::get_cloud_storage_uri();
 }
@@ -501,54 +514,54 @@ fn opt_positive_int32(value: &str, default: i32) -> i32 {
 }
 
 set_global! {
-    set_tidb_enable_tiflash_pipeline_model => |s| tidb_vardef::TI_FLASH_ENABLE_PIPELINE_MODE.store(on(s), SeqCst);
-    set_tidb_general_log => |s| tidb_vardef::PROCESS_GENERAL_LOG.store(on(s), SeqCst);
-    set_tidb_rc_read_check_ts => |s| tidb_vardef::ENABLE_RC_READ_CHECK_TS.store(on(s), SeqCst);
-    set_tidb_persist_analyze_options => |s| tidb_vardef::PERSIST_ANALYZE_OPTIONS.store(on(s), SeqCst);
-    set_tidb_stats_load_pseudo_timeout => |s| tidb_vardef::STATS_LOAD_PSEUDO_TIMEOUT.store(on(s), SeqCst);
-    set_tidb_enable_batch_dml => |s| tidb_vardef::ENABLE_BATCH_DML.store(on(s), SeqCst);
-    set_tidb_enable_noop_variables => |s| tidb_vardef::ENABLE_NOOP_VARIABLES.store(on(s), SeqCst);
-    set_tidb_enable_tmp_storage_on_oom => |s| tidb_vardef::ENABLE_TMP_STORAGE_ON_OOM.store(on(s), SeqCst);
-    set_tidb_enable_gc_aware_memory_track => |s| tidb_memory::ENABLE_GC_AWARE_MEMORY_TRACK.store(on(s), SeqCst);
+    set_tidb_enable_tiflash_pipeline_model => |vd, s| vd.ti_flash_enable_pipeline_mode().store(on(s), SeqCst);
+    set_tidb_general_log => |vd, s| tidb_vardef::PROCESS_GENERAL_LOG.store(on(s), SeqCst);
+    set_tidb_rc_read_check_ts => |vd, s| tidb_vardef::ENABLE_RC_READ_CHECK_TS.store(on(s), SeqCst);
+    set_tidb_persist_analyze_options => |vd, s| vd.persist_analyze_options().store(on(s), SeqCst);
+    set_tidb_stats_load_pseudo_timeout => |vd, s| vd.stats_load_pseudo_timeout().store(on(s), SeqCst);
+    set_tidb_enable_batch_dml => |vd, s| vd.enable_batch_dml().store(on(s), SeqCst);
+    set_tidb_enable_noop_variables => |vd, s| vd.enable_noop_variables().store(on(s), SeqCst);
+    set_tidb_enable_tmp_storage_on_oom => |vd, s| vd.enable_tmp_storage_on_oom().store(on(s), SeqCst);
+    set_tidb_enable_gc_aware_memory_track => |vd, s| tidb_memory::ENABLE_GC_AWARE_MEMORY_TRACK.store(on(s), SeqCst);
     // Go `gctuner.SetMaxGCPercent` / `SetMinGCPercent(uint32(TidbOptInt64(val, Def)))`.
-    set_tidb_gogc_tuner_max_value => |s| tidb_memory::gctuner::set_max_gc_percent(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_GOGC_MAX_VALUE) as u32);
-    set_tidb_gogc_tuner_min_value => |s| tidb_memory::gctuner::set_min_gc_percent(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_GOGC_MIN_VALUE) as u32);
+    set_tidb_gogc_tuner_max_value => |vd, s| tidb_memory::gctuner::set_max_gc_percent(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_GOGC_MAX_VALUE) as u32);
+    set_tidb_gogc_tuner_min_value => |vd, s| tidb_memory::gctuner::set_min_gc_percent(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_GOGC_MIN_VALUE) as u32);
     // Go `vardef.GOGCTunerThreshold.Store(factor)` (the tuner it feeds acts on Go's collector).
-    set_tidb_gogc_tuner_threshold => |s| tidb_vardef::set_gogc_tuner_threshold(opt_float64(s, tidb_vardef::defaults::DEF_TIDB_GOGC_TUNER_THRESHOLD));
+    set_tidb_gogc_tuner_threshold => |vd, s| tidb_vardef::set_gogc_tuner_threshold(opt_float64(s, tidb_vardef::defaults::DEF_TIDB_GOGC_TUNER_THRESHOLD));
     // Go `gctuner.GlobalMemoryLimitTuner.SetPercentage`.
-    set_tidb_server_memory_limit_gc_trigger => |s| tidb_memory::gctuner::set_memory_limit_percentage(opt_float64(s, tidb_vardef::defaults::DEF_TIDB_SERVER_MEMORY_LIMIT_GC_TRIGGER));
-    set_tidb_mem_quota_analyze => |s| tidb_memory::set_mem_quota_analyze(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_MEM_QUOTA_ANALYZE));
-    set_tidb_enable_binding_usage => |s| tidb_vardef::ENABLE_BINDING_USAGE.store(on(s), SeqCst);
-    set_tidb_mlog_log_slow_purge => |s| tidb_vardef::M_LOG_LOG_SLOW_PURGE.store(on(s), SeqCst);
-    set_tidb_ignore_inlist_plan_digest => |s| tidb_vardef::IGNORE_INLIST_PLAN_DIGEST.store(on(s), SeqCst);
-    set_tidb_enable_connection_event_log => |s| tidb_vardef::ENABLE_CONNECTION_EVENT_LOG.store(on(s), SeqCst);
-    set_tidb_enable_dist_task => |s| tidb_vardef::ENABLE_DIST_TASK.store(on(s), SeqCst);
-    set_validate_password_length => |s| tidb_vardef::PASSWORD_VALIDATION_LENGTH.store(crate::varsutil::tidb_opt_int64(s, 8 as i64) as i32, SeqCst);
-    set_validate_password_mixed_case_count => |s| tidb_vardef::PASSWORD_VALIDATION_MIXED_CASE_COUNT.store(crate::varsutil::tidb_opt_int64(s, 1 as i64) as i32, SeqCst);
-    set_validate_password_number_count => |s| tidb_vardef::PASSWORD_VALIDTAION_NUMBER_COUNT.store(crate::varsutil::tidb_opt_int64(s, 1 as i64) as i32, SeqCst);
-    set_validate_password_special_char_count => |s| tidb_vardef::PASSWORD_VALIDATION_SPECIAL_CHAR_COUNT.store(crate::varsutil::tidb_opt_int64(s, 1 as i64) as i32, SeqCst);
-    set_password_history => |s| tidb_vardef::PASSWORD_HISTORY.store(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_PASSWORD_REUSE_HISTORY as i64), SeqCst);
-    set_password_reuse_interval => |s| tidb_vardef::PASSWORD_REUSE_INTERVAL.store(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_PASSWORD_REUSE_TIME as i64), SeqCst);
-    set_tidb_mem_quota_binding_cache => |s| tidb_vardef::MEM_QUOTA_BINDING_CACHE.store(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_MEM_QUOTA_BINDING_CACHE as i64), SeqCst);
-    set_tidb_stats_load_sync_wait => |s| tidb_vardef::STATS_LOAD_SYNC_WAIT.store(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_STATS_LOAD_SYNC_WAIT as i64), SeqCst);
-    set_tidb_query_log_max_len => |s| tidb_vardef::QUERY_LOG_MAX_LEN.store(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_QUERY_LOG_MAX_LEN as i64) as i32, SeqCst);
-    set_tidb_paging_size_bytes => |s| if let Ok(v) = s.parse::<i64>() {
-        tidb_vardef::PAGING_SIZE_BYTES.store(v, SeqCst);
+    set_tidb_server_memory_limit_gc_trigger => |vd, s| tidb_memory::gctuner::set_memory_limit_percentage(opt_float64(s, tidb_vardef::defaults::DEF_TIDB_SERVER_MEMORY_LIMIT_GC_TRIGGER));
+    set_tidb_mem_quota_analyze => |vd, s| tidb_memory::set_mem_quota_analyze(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_MEM_QUOTA_ANALYZE));
+    set_tidb_enable_binding_usage => |vd, s| vd.enable_binding_usage().store(on(s), SeqCst);
+    set_tidb_mlog_log_slow_purge => |vd, s| vd.m_log_log_slow_purge().store(on(s), SeqCst);
+    set_tidb_ignore_inlist_plan_digest => |vd, s| vd.ignore_inlist_plan_digest().store(on(s), SeqCst);
+    set_tidb_enable_connection_event_log => |vd, s| tidb_vardef::ENABLE_CONNECTION_EVENT_LOG.store(on(s), SeqCst);
+    set_tidb_enable_dist_task => |vd, s| vd.enable_dist_task().store(on(s), SeqCst);
+    set_validate_password_length => |vd, s| vd.password_validation_length().store(crate::varsutil::tidb_opt_int64(s, 8 as i64) as i32, SeqCst);
+    set_validate_password_mixed_case_count => |vd, s| vd.password_validation_mixed_case_count().store(crate::varsutil::tidb_opt_int64(s, 1 as i64) as i32, SeqCst);
+    set_validate_password_number_count => |vd, s| vd.password_validtaion_number_count().store(crate::varsutil::tidb_opt_int64(s, 1 as i64) as i32, SeqCst);
+    set_validate_password_special_char_count => |vd, s| vd.password_validation_special_char_count().store(crate::varsutil::tidb_opt_int64(s, 1 as i64) as i32, SeqCst);
+    set_password_history => |vd, s| vd.password_history().store(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_PASSWORD_REUSE_HISTORY as i64), SeqCst);
+    set_password_reuse_interval => |vd, s| vd.password_reuse_interval().store(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_PASSWORD_REUSE_TIME as i64), SeqCst);
+    set_tidb_mem_quota_binding_cache => |vd, s| tidb_vardef::MEM_QUOTA_BINDING_CACHE.store(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_MEM_QUOTA_BINDING_CACHE as i64), SeqCst);
+    set_tidb_stats_load_sync_wait => |vd, s| vd.stats_load_sync_wait().store(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_STATS_LOAD_SYNC_WAIT as i64), SeqCst);
+    set_tidb_query_log_max_len => |vd, s| tidb_vardef::QUERY_LOG_MAX_LEN.store(crate::varsutil::tidb_opt_int64(s, tidb_vardef::defaults::DEF_TIDB_QUERY_LOG_MAX_LEN as i64) as i32, SeqCst);
+    set_tidb_paging_size_bytes => |vd, s| if let Ok(v) = s.parse::<i64>() {
+        vd.paging_size_bytes().store(v, SeqCst);
     };
-    set_tidb_expensive_query_time_threshold => |s| tidb_vardef::EXPENSIVE_QUERY_TIME_THRESHOLD.store(opt_positive_int32(s, tidb_vardef::defaults::DEF_TIDB_EXPENSIVE_QUERY_TIME_THRESHOLD as i32) as u64, SeqCst);
-    set_tidb_expensive_txn_time_threshold => |s| tidb_vardef::EXPENSIVE_TXN_TIME_THRESHOLD.store(opt_positive_int32(s, tidb_vardef::defaults::DEF_TIDB_EXPENSIVE_TXN_TIME_THRESHOLD as i32) as u64, SeqCst);
-    set_tidb_pprof_sql_cpu => |s| tidb_vardef::ENABLE_P_PROF_SQLCPU.store(opt_positive_int32(s, 0) > 0, SeqCst);
+    set_tidb_expensive_query_time_threshold => |vd, s| tidb_vardef::EXPENSIVE_QUERY_TIME_THRESHOLD.store(opt_positive_int32(s, tidb_vardef::defaults::DEF_TIDB_EXPENSIVE_QUERY_TIME_THRESHOLD as i32) as u64, SeqCst);
+    set_tidb_expensive_txn_time_threshold => |vd, s| tidb_vardef::EXPENSIVE_TXN_TIME_THRESHOLD.store(opt_positive_int32(s, tidb_vardef::defaults::DEF_TIDB_EXPENSIVE_TXN_TIME_THRESHOLD as i32) as u64, SeqCst);
+    set_tidb_pprof_sql_cpu => |vd, s| tidb_vardef::ENABLE_P_PROF_SQLCPU.store(opt_positive_int32(s, 0) > 0, SeqCst);
 }
 
-get_global! {
-    get_tidb_enable_tiflash_pipeline_model => on_off(tidb_vardef::TI_FLASH_ENABLE_PIPELINE_MODE.load(SeqCst));
+get_global! { |vd|
+    get_tidb_enable_tiflash_pipeline_model => on_off(vd.ti_flash_enable_pipeline_mode().load(SeqCst));
     get_tidb_general_log => on_off(tidb_vardef::PROCESS_GENERAL_LOG.load(SeqCst));
     get_tidb_rc_read_check_ts => on_off(tidb_vardef::ENABLE_RC_READ_CHECK_TS.load(SeqCst));
-    get_tidb_persist_analyze_options => on_off(tidb_vardef::PERSIST_ANALYZE_OPTIONS.load(SeqCst));
-    get_tidb_stats_load_pseudo_timeout => on_off(tidb_vardef::STATS_LOAD_PSEUDO_TIMEOUT.load(SeqCst));
-    get_tidb_enable_batch_dml => on_off(tidb_vardef::ENABLE_BATCH_DML.load(SeqCst));
-    get_tidb_enable_noop_variables => on_off(tidb_vardef::ENABLE_NOOP_VARIABLES.load(SeqCst));
-    get_tidb_enable_tmp_storage_on_oom => on_off(tidb_vardef::ENABLE_TMP_STORAGE_ON_OOM.load(SeqCst));
+    get_tidb_persist_analyze_options => on_off(vd.persist_analyze_options().load(SeqCst));
+    get_tidb_stats_load_pseudo_timeout => on_off(vd.stats_load_pseudo_timeout().load(SeqCst));
+    get_tidb_enable_batch_dml => on_off(vd.enable_batch_dml().load(SeqCst));
+    get_tidb_enable_noop_variables => on_off(vd.enable_noop_variables().load(SeqCst));
+    get_tidb_enable_tmp_storage_on_oom => on_off(vd.enable_tmp_storage_on_oom().load(SeqCst));
     get_tidb_enable_gc_aware_memory_track => on_off(tidb_memory::ENABLE_GC_AWARE_MEMORY_TRACK.load(SeqCst));
     get_tidb_gogc_tuner_max_value => tidb_memory::gctuner::max_gc_percent().to_string();
     get_tidb_gogc_tuner_min_value => tidb_memory::gctuner::min_gc_percent().to_string();
@@ -561,21 +574,21 @@ get_global! {
     get_tidb_mem_arbitrator_mode => tidb_memory::global_mem_arbitrator_work_mode_text();
     get_tidb_mem_arbitrator_soft_limit => tidb_memory::global_mem_arbitrator_soft_limit_text();
     get_tidb_mem_quota_analyze => tidb_memory::get_mem_quota_analyze().to_string();
-    get_tidb_enable_binding_usage => on_off(tidb_vardef::ENABLE_BINDING_USAGE.load(SeqCst));
-    get_tidb_mlog_log_slow_purge => on_off(tidb_vardef::M_LOG_LOG_SLOW_PURGE.load(SeqCst));
-    get_tidb_ignore_inlist_plan_digest => on_off(tidb_vardef::IGNORE_INLIST_PLAN_DIGEST.load(SeqCst));
+    get_tidb_enable_binding_usage => on_off(vd.enable_binding_usage().load(SeqCst));
+    get_tidb_mlog_log_slow_purge => on_off(vd.m_log_log_slow_purge().load(SeqCst));
+    get_tidb_ignore_inlist_plan_digest => on_off(vd.ignore_inlist_plan_digest().load(SeqCst));
     get_tidb_enable_connection_event_log => on_off(tidb_vardef::ENABLE_CONNECTION_EVENT_LOG.load(SeqCst));
-    get_tidb_enable_dist_task => on_off(tidb_vardef::ENABLE_DIST_TASK.load(SeqCst));
-    get_validate_password_length => tidb_vardef::PASSWORD_VALIDATION_LENGTH.load(SeqCst).to_string();
-    get_validate_password_mixed_case_count => tidb_vardef::PASSWORD_VALIDATION_MIXED_CASE_COUNT.load(SeqCst).to_string();
-    get_validate_password_number_count => tidb_vardef::PASSWORD_VALIDTAION_NUMBER_COUNT.load(SeqCst).to_string();
-    get_validate_password_special_char_count => tidb_vardef::PASSWORD_VALIDATION_SPECIAL_CHAR_COUNT.load(SeqCst).to_string();
-    get_password_history => tidb_vardef::PASSWORD_HISTORY.load(SeqCst).to_string();
-    get_password_reuse_interval => tidb_vardef::PASSWORD_REUSE_INTERVAL.load(SeqCst).to_string();
+    get_tidb_enable_dist_task => on_off(vd.enable_dist_task().load(SeqCst));
+    get_validate_password_length => vd.password_validation_length().load(SeqCst).to_string();
+    get_validate_password_mixed_case_count => vd.password_validation_mixed_case_count().load(SeqCst).to_string();
+    get_validate_password_number_count => vd.password_validtaion_number_count().load(SeqCst).to_string();
+    get_validate_password_special_char_count => vd.password_validation_special_char_count().load(SeqCst).to_string();
+    get_password_history => vd.password_history().load(SeqCst).to_string();
+    get_password_reuse_interval => vd.password_reuse_interval().load(SeqCst).to_string();
     get_tidb_mem_quota_binding_cache => tidb_vardef::MEM_QUOTA_BINDING_CACHE.load(SeqCst).to_string();
-    get_tidb_stats_load_sync_wait => tidb_vardef::STATS_LOAD_SYNC_WAIT.load(SeqCst).to_string();
+    get_tidb_stats_load_sync_wait => vd.stats_load_sync_wait().load(SeqCst).to_string();
     get_tidb_query_log_max_len => tidb_vardef::QUERY_LOG_MAX_LEN.load(SeqCst).to_string();
-    get_tidb_paging_size_bytes => tidb_vardef::PAGING_SIZE_BYTES.load(SeqCst).to_string();
+    get_tidb_paging_size_bytes => vd.paging_size_bytes().load(SeqCst).to_string();
     get_tidb_expensive_query_time_threshold => tidb_vardef::EXPENSIVE_QUERY_TIME_THRESHOLD.load(SeqCst).to_string();
     get_tidb_expensive_txn_time_threshold => tidb_vardef::EXPENSIVE_TXN_TIME_THRESHOLD.load(SeqCst).to_string();
     get_tidb_pprof_sql_cpu => if tidb_vardef::ENABLE_P_PROF_SQLCPU.load(SeqCst) { "1" } else { "0" }.to_owned();
@@ -583,22 +596,22 @@ get_global! {
 
 set_global! {
     // Go: `strconv.ParseFloat`, stored when it parses.
-    set_tidb_prepared_plan_cache_memory_guard_ratio => |s| if let Ok(v) = s.parse::<f64>() {
+    set_tidb_prepared_plan_cache_memory_guard_ratio => |vd, s| if let Ok(v) = s.parse::<f64>() {
         tidb_vardef::PREPARED_PLAN_CACHE_MEMORY_GUARD_RATIO.store(v.to_bits(), SeqCst);
     };
-    set_tidb_analyze_column_options => |s| {
-        *tidb_vardef::ANALYZE_COLUMN_OPTIONS.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
+    set_tidb_analyze_column_options => |vd, s| {
+        *vd.analyze_column_options().write().unwrap_or_else(std::sync::PoisonError::into_inner) =
             s.to_ascii_uppercase();
     };
-    set_tidb_advancer_check_point_lag_limit => |s| if let Ok(d) = tidb_config_configtypes::parse_duration(s) {
-        tidb_vardef::ADVANCER_CHECK_POINT_LAG_LIMIT.store(d, SeqCst);
+    set_tidb_advancer_check_point_lag_limit => |vd, s| if let Ok(d) = tidb_config_configtypes::parse_duration(s) {
+        vd.advancer_check_point_lag_limit().store(d, SeqCst);
     };
     // Go also resets the session's `TxnScope` to global on ON -> OFF; this
     // port has no local transaction scope.
-    set_tidb_enable_local_txn => |s| tidb_vardef::ENABLE_LOCAL_TXN.store(on(s), SeqCst);
+    set_tidb_enable_local_txn => |vd, s| vd.enable_local_txn().store(on(s), SeqCst);
 }
 
-get_global! {
+get_global! { |vd|
     get_tidb_prepared_plan_cache_memory_guard_ratio => tidb_goruntime::go_strconv::format_float(
         f64::from_bits(tidb_vardef::PREPARED_PLAN_CACHE_MEMORY_GUARD_RATIO.load(SeqCst)),
         b'f',
@@ -606,13 +619,13 @@ get_global! {
         64,
     );
     get_tidb_analyze_column_options => {
-        let value = tidb_vardef::ANALYZE_COLUMN_OPTIONS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let value = vd.analyze_column_options().read().unwrap_or_else(std::sync::PoisonError::into_inner);
         if value.is_empty() { tidb_vardef::defaults::DEF_TIDB_ANALYZE_COLUMN_OPTIONS.to_owned() } else { value.clone() }
     };
     get_tidb_advancer_check_point_lag_limit => tidb_config_configtypes::format_go_duration(
-        tidb_vardef::ADVANCER_CHECK_POINT_LAG_LIMIT.load(SeqCst),
+        vd.advancer_check_point_lag_limit().load(SeqCst),
     );
-    get_tidb_enable_local_txn => on_off(tidb_vardef::ENABLE_LOCAL_TXN.load(SeqCst));
+    get_tidb_enable_local_txn => on_off(vd.enable_local_txn().load(SeqCst));
     // Go: `BoolToOnOff(true)` / `vardef.On` / `"1"`.
     get_tidb_enable_column_tracking => on_off(true);
     get_tidb_opt_index_join_build_v2 => on_off(true);
@@ -622,7 +635,7 @@ get_global! {
 
 // Go's `GetGlobal` closures over the instance configuration
 // (`config.GetGlobalConfig().Instance`).
-get_global! {
+get_global! { |vd|
     get_max_connections => tidb_config::config_tree::config::get_global_config().instance.max_connections.to_string();
     get_tidb_enable_ddl => on_off(tidb_config::config_tree::config::get_global_config().instance.tidb_enable_ddl.load());
     get_tidb_enable_stats_owner => on_off(tidb_config::config_tree::config::get_global_config().instance.tidb_enable_stats_owner.load());
@@ -644,29 +657,29 @@ get_global! {
 }
 
 set_global! {
-    set_ddl_slow_threshold => |s| tidb_vardef::DDL_SLOW_OPR_THRESHOLD.store(opt_positive_int32(s, 300) as u32, SeqCst);
+    set_ddl_slow_threshold => |vd, s| tidb_vardef::DDL_SLOW_OPR_THRESHOLD.store(opt_positive_int32(s, 300) as u32, SeqCst);
 }
 
-get_global! {
+get_global! { |vd|
     get_ddl_slow_threshold => tidb_vardef::DDL_SLOW_OPR_THRESHOLD.load(SeqCst).to_string();
 }
 
 // Go's `SetGlobal` closures over the instance configuration.
 set_global! {
-    set_tidb_slow_log_threshold => |s| {
+    set_tidb_slow_log_threshold => |vd, s| {
         let value = crate::varsutil::tidb_opt_int64(s, 300) as u64;
         tidb_config::config_tree::config::update_global(|c| c.instance.slow_threshold = value);
     };
-    set_tidb_record_plan_in_slow_log => |s| {
+    set_tidb_record_plan_in_slow_log => |vd, s| {
         let value = crate::varsutil::tidb_opt_int64(s, 1) as u32;
         tidb_config::config_tree::config::update_global(|c| c.instance.record_plan_in_slow_log = value);
     };
-    set_tidb_enable_slow_log => |s| {
+    set_tidb_enable_slow_log => |vd, s| {
         let value = on(s);
         tidb_config::config_tree::config::update_global(|c| c.instance.enable_slow_log.0 = value);
     };
     // Go stores a copy of the configuration when the value changes.
-    set_tidb_enable_collect_execution_info => |s| {
+    set_tidb_enable_collect_execution_info => |vd, s| {
         let new_value = on(s);
         if tidb_config::config_tree::config::get_global_config().instance.enable_collect_execution_info.load()
             != new_value
@@ -676,28 +689,29 @@ set_global! {
             });
         }
     };
-    set_max_connections => |s| {
+    set_max_connections => |vd, s| {
         let value = crate::varsutil::tidb_opt_int64(s, 0) as u32;
         tidb_config::config_tree::config::update_global(|c| c.instance.max_connections = value);
     };
     // Go also switches the DDL / statistics owner (`switchDDL`,
     // `switchStats`), which the node does where it reads the switch.
-    set_tidb_enable_ddl => |s| {
+    set_tidb_enable_ddl => |vd, s| {
         let value = on(s);
         tidb_config::config_tree::config::update_global(|c| c.instance.tidb_enable_ddl.0 = value);
     };
-    set_tidb_enable_stats_owner => |s| {
+    set_tidb_enable_stats_owner => |vd, s| {
         let value = on(s);
         tidb_config::config_tree::config::update_global(|c| c.instance.tidb_enable_stats_owner.0 = value);
     };
     // Go also replaces the logger with the new file retention.
-    set_tidb_log_file_max_days => |s| if let Ok(max_age) = s.parse::<i32>() {
+    set_tidb_log_file_max_days => |vd, s| if let Ok(max_age) = s.parse::<i32>() {
         tidb_config::config_tree::config::update_global(|c| c.log.file.max_days = max_age as _);
     };
 }
 
 /// Go `tidb_ddl_reorg_max_write_speed`'s `SetGlobal`.
-pub(super) fn set_tidb_ddl_reorg_max_write_speed(_vars: &mut SessionVars, val: &str) -> Result<(), VarError> {
+pub(super) fn set_tidb_ddl_reorg_max_write_speed(vars: &mut SessionVars, val: &str) -> Result<(), VarError> {
+    let vd = vars.vardef();
     /// Go `units.PiB`.
     const PIB: i64 = 1 << 50;
     // Go `units.RAMInBytes`' error.
@@ -712,7 +726,7 @@ pub(super) fn set_tidb_ddl_reorg_max_write_speed(_vars: &mut SessionVars, val: &
             "invalid value for '{size}', it should be within [0, {PIB}]"
         )));
     }
-    tidb_vardef::DDL_REORG_MAX_WRITE_SPEED.store(size, SeqCst);
+    vd.ddl_reorg_max_write_speed().store(size, SeqCst);
     Ok(())
 }
 
@@ -730,8 +744,8 @@ pub(super) fn set_tidb_top_sql_max_meta_count(_vars: &mut SessionVars, s: &str) 
     Ok(())
 }
 
-get_global! {
-    get_tidb_ddl_reorg_max_write_speed => tidb_vardef::DDL_REORG_MAX_WRITE_SPEED.load(SeqCst).to_string();
+get_global! { |vd|
+    get_tidb_ddl_reorg_max_write_speed => vd.ddl_reorg_max_write_speed().load(SeqCst).to_string();
     get_tidb_top_sql_max_time_series_count => tidb_topsql_state::GLOBAL_STATE.max_statement_count.load(SeqCst).to_string();
     get_tidb_top_sql_max_meta_count => tidb_topsql_state::GLOBAL_STATE.max_collect.load(SeqCst).to_string();
 }
@@ -755,7 +769,7 @@ pub(super) fn set_tidb_trace_event(_vars: &mut SessionVars, value: &str) -> Resu
 
 /// Go `tidb_trace_event`'s `GetGlobal`: the running recorder's configuration
 /// re-marshalled, or empty.
-pub(super) fn get_tidb_trace_event() -> Result<String, crate::vars::VarError> {
+pub(super) fn get_tidb_trace_event(_vardef: &tidb_vardef::VardefSnapshot) -> Result<String, crate::vars::VarError> {
     Ok(tidb_traceevent::get_flight_recorder()
         .and_then(|recorder| serde_json::to_string(&recorder.config).ok())
         .unwrap_or_default())
@@ -768,7 +782,7 @@ pub(super) fn set_tidb_slow_log_max_per_sec(_vars: &mut SessionVars, value: &str
 }
 
 /// Go `tidb_slow_log_max_per_sec`'s `GetGlobal`.
-pub(super) fn get_tidb_slow_log_max_per_sec() -> Result<String, crate::vars::VarError> {
+pub(super) fn get_tidb_slow_log_max_per_sec(_vardef: &tidb_vardef::VardefSnapshot) -> Result<String, crate::vars::VarError> {
     Ok(crate::slow_log::slow_log_max_per_sec().to_string())
 }
 
@@ -778,7 +792,7 @@ pub(super) fn set_tidb_slow_log_rules(_vars: &mut SessionVars, value: &str) -> R
 }
 
 /// Go `tidb_slow_log_rules`' `GetGlobal`.
-pub(super) fn get_tidb_slow_log_rules() -> Result<String, crate::vars::VarError> {
+pub(super) fn get_tidb_slow_log_rules(_vardef: &tidb_vardef::VardefSnapshot) -> Result<String, crate::vars::VarError> {
     Ok(crate::slow_log_rules::global_slow_log_rules())
 }
 
@@ -810,6 +824,6 @@ pub(super) fn set_tidb_external_ts(vars: &mut SessionVars, value: &str) -> Resul
 }
 
 /// Go `tidb_external_ts`' `GetGlobal`: `GetExternalTimestamp`.
-pub(super) fn get_tidb_external_ts() -> Result<String, VarError> {
+pub(super) fn get_tidb_external_ts(_vardef: &tidb_vardef::VardefSnapshot) -> Result<String, VarError> {
     crate::domain_slots::get_external_timestamp().map(|ts| ts.to_string())
 }

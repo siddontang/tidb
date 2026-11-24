@@ -155,7 +155,7 @@ fn check_drop_column_in_owner(
     is_droppable_column(&info, name.original(), info.columns.len())
         .map_err(|error| cancel_ddl_job(active, error))?;
     // Go `checkDropColumnWithForeignKeyConstraintInOwner` cancels the job.
-    if tidb_vardef::ENABLE_FOREIGN_KEY.load(std::sync::atomic::Ordering::SeqCst) {
+    if tidb_vardef::snapshot::current().enable_foreign_key().load(std::sync::atomic::Ordering::SeqCst) {
         let schema = active.job.schema_name.to_string();
         crate::foreign_key_build::check_drop_column_with_foreign_key_constraint(
             catalog,

@@ -157,7 +157,7 @@ fn check_add_foreign_key_valid_in_owner(
             ),
         ));
     }
-    if !tidb_vardef::ENABLE_FOREIGN_KEY.load(std::sync::atomic::Ordering::SeqCst) {
+    if !tidb_vardef::snapshot::current().enable_foreign_key().load(std::sync::atomic::Ordering::SeqCst) {
         return Ok(());
     }
     crate::foreign_key_build::check_table_foreign_key_valid(catalog, schema, info, fk, fk_check, true)
