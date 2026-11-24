@@ -532,6 +532,191 @@ fn a_multi_keyspace_node_refuses_ddl_jobs_that_carry_placement() {
     tidb_domain_infosync::placement_manager::init_placement_manager(Some(placement));
 }
 
+/// A label rule manager that counts its calls over an in-memory one.
+#[derive(Debug, Default)]
+struct CountingLabels {
+    calls: std::sync::atomic::AtomicUsize,
+    inner: tidb_domain_infosync::label_manager::MockLabelManager,
+}
+
+impl CountingLabels {
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn count(&self) {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl tidb_domain_infosync::label_manager::LabelRuleManager for CountingLabels {
+    fn put_label_rule(&self, rule: &tidb_ddl_label::Rule) -> Result<(), String> {
+        self.count();
+        self.inner.put_label_rule(rule)
+    }
+    fn update_label_rules(&self, patch: &tidb_ddl_label::LabelRulePatch) -> Result<(), String> {
+        self.count();
+        self.inner.update_label_rules(patch)
+    }
+    fn get_all_label_rules(&self, codec: &dyn tidb_ddl_label::LabelCodec) -> Result<Vec<tidb_ddl_label::Rule>, String> {
+        self.count();
+        self.inner.get_all_label_rules(codec)
+    }
+    fn get_label_rules(
+        &self,
+        rule_ids: &[String],
+    ) -> Result<std::collections::BTreeMap<String, tidb_ddl_label::Rule>, String> {
+        self.count();
+        self.inner.get_label_rules(rule_ids)
+    }
+}
+
+/// A TiFlash replica manager that counts its PD calls over another one.
+struct CountingTiFlash {
+    calls: std::sync::atomic::AtomicUsize,
+    inner: std::sync::Arc<dyn tidb_domain_infosync::tiflash_manager::TiFlashReplicaManager>,
+}
+
+impl CountingTiFlash {
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn count(&self) {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl tidb_domain_infosync::tiflash_manager::TiFlashReplicaManager for CountingTiFlash {
+    fn set_tiflash_group_config(&self) -> Result<(), String> {
+        self.count();
+        self.inner.set_tiflash_group_config()
+    }
+    fn set_placement_rule(&self, rule: &tikv_client::pd_http::Rule) -> Result<(), String> {
+        self.count();
+        self.inner.set_placement_rule(rule)
+    }
+    fn set_placement_rule_batch(&self, rules: &[tikv_client::pd_http::Rule]) -> Result<(), String> {
+        self.count();
+        self.inner.set_placement_rule_batch(rules)
+    }
+    fn get_placement_rule(&self, table_id: i64) -> Result<tikv_client::pd_http::Rule, String> {
+        self.count();
+        self.inner.get_placement_rule(table_id)
+    }
+    fn post_accelerate_schedule_batch(&self, table_ids: &[i64]) -> Result<(), String> {
+        self.count();
+        self.inner.post_accelerate_schedule_batch(table_ids)
+    }
+    fn update_tiflash_progress_cache(&self, table_id: i64, progress: f64) {
+        self.inner.update_tiflash_progress_cache(table_id, progress);
+    }
+    fn get_tiflash_progress_from_cache(&self, table_id: i64) -> Option<f64> {
+        self.inner.get_tiflash_progress_from_cache(table_id)
+    }
+    fn delete_tiflash_progress_from_cache(&self, table_id: i64) {
+        self.inner.delete_tiflash_progress_from_cache(table_id);
+    }
+    fn clean_tiflash_progress_cache(&self) {
+        self.inner.clean_tiflash_progress_cache();
+    }
+    fn get_stores_stat(&self) -> Result<tikv_client::pd_http::StoresInfo, String> {
+        self.count();
+        self.inner.get_stores_stat()
+    }
+    fn sync_tiflash_table_schema(&self, table_id: i64, stores: &[tikv_client::pd_http::StoreInfo]) -> Result<(), String> {
+        self.count();
+        self.inner.sync_tiflash_table_schema(table_id, stores)
+    }
+    fn get_region_count_from_pd(&self, table_id: i64) -> Result<i64, String> {
+        self.count();
+        self.inner.get_region_count_from_pd(table_id)
+    }
+    fn calculate_tiflash_progress(
+        &self,
+        table_id: i64,
+        replica_count: u64,
+        tiflash_stores: &[tikv_client::pd_http::StoreInfo],
+    ) -> Result<(f64, f64), String> {
+        self.count();
+        self.inner.calculate_tiflash_progress(table_id, replica_count, tiflash_stores)
+    }
+}
+
+/// Label rules and inherited TiFlash replicas on a multi-keyspace node
+/// (design §10 phase 2, until 3b). A DDL step builds label rule IDs with
+/// the keyspace-less codec (`schema/<db>/<table>`), so two tenants with the
+/// same names would share rules: label operations are suppressed, and the
+/// counting label manager sees no call while TRUNCATE, RENAME and partition
+/// DDL of same-named tables run in two keyspaces. A table whose TiFlash
+/// replica was set before keeps it in its TableInfo, and a partition change
+/// or TRUNCATE would configure its new IDs in PD inside the step: refused
+/// with 1235 before any TiFlash manager call. A single-keyspace node makes
+/// both kinds of calls as before.
+#[test]
+fn a_multi_keyspace_node_writes_no_label_rules_or_inherited_tiflash_rules() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
+    let tenant_a = MockStoreDomain::create_with_mock_tiflash(1).unwrap();
+    let tenant_b = MockStoreDomain::create().unwrap();
+    let labels = std::sync::Arc::new(CountingLabels::default());
+    let previous_labels = tidb_domain_infosync::label_manager::label_rule_manager();
+    tidb_domain_infosync::label_manager::init_label_rule_manager(Some(labels.clone()));
+    let tiflash = std::sync::Arc::new(CountingTiFlash {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        inner: tidb_domain_infosync::tiflash_manager::tiflash_replica_manager(),
+    });
+    tidb_domain_infosync::tiflash_manager::init_tiflash_replica_manager(Some(tiflash.clone()));
+
+    // Single-keyspace: the label rules and the TiFlash replica reach PD.
+    let mut a = tenant_a.new_session().unwrap();
+    for sql in [
+        "use test",
+        "create table lt (a int) partition by range (a) (partition p0 values less than (10), partition p1 values less than (20))",
+        "alter table lt partition p0 attributes = 'merge_option=deny'",
+        "truncate table lt",
+        "create table ft (a int) partition by range (a) (partition p0 values less than (10))",
+        "alter table ft set tiflash replica 1",
+    ] {
+        a.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    assert!(labels.calls() > 0);
+    assert!(tiflash.calls() > 0);
+    let (label_calls, tiflash_calls) = (labels.calls(), tiflash.calls());
+
+    tidb_keyspace::set_multi_keyspace_mode(true);
+    // The same names in both keyspaces: no label call from either.
+    let mut b = tenant_b.new_session().unwrap();
+    b.run("use test").unwrap();
+    b.run("create table lt (a int) partition by range (a) (partition p0 values less than (10), partition p1 values less than (20))")
+        .unwrap();
+    for session in [&mut a, &mut b] {
+        for sql in [
+            "truncate table lt",
+            "alter table lt truncate partition p0",
+            "alter table lt add partition (partition p2 values less than (30))",
+            "rename table lt to lt2",
+            "rename table lt2 to lt",
+        ] {
+            assert_eq!(refusal(session, sql), None, "{sql}");
+        }
+    }
+    assert_eq!(labels.calls(), label_calls, "no label call in multi-keyspace mode");
+    // The inherited TiFlash replica: refused before the manager is called.
+    for sql in ["alter table ft add partition (partition p1 values less than (20))", "truncate table ft"] {
+        let (code, message) = refusal(&mut a, sql).unwrap_or_else(|| panic!("{sql} ran"));
+        assert_eq!(code, 1235, "{sql}: {message}");
+        assert!(message.ends_with("TIFLASH REPLICA on a multi-keyspace node'"), "{sql}: {message}");
+    }
+    assert_eq!(tiflash.calls(), tiflash_calls, "no TiFlash manager call in multi-keyspace mode");
+    assert_eq!(row_text(a.run("select count(*) from mysql.tidb_ddl_job")), [["0"]]);
+
+    tidb_keyspace::set_multi_keyspace_mode(false);
+    tidb_domain_infosync::label_manager::init_label_rule_manager(Some(previous_labels));
+    tidb_domain_infosync::tiflash_manager::init_tiflash_replica_manager(Some(tiflash.inner.clone()));
+}
+
 /// A tenant of a multi-keyspace node sets its keyspace's GLOBAL variables
 /// but not the process's (design §6.3): a variable whose value is the
 /// process's memory, log, PD client or watchdog, or one Go scopes to the

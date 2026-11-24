@@ -9926,6 +9926,7 @@ dependencies = [
  "tidb-ddl-build",
  "tidb-ddl-ingest",
  "tidb-ddl-jobsubmit",
+ "tidb-ddl-label",
  "tidb-ddl-notifier",
  "tidb-ddl-resourcegroup",
  "tidb-ddl-serverstate",

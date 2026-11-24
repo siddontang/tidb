@@ -229,6 +229,7 @@ tidb-resolve = { path = "../tidb-resolve" }
 
 [dev-dependencies]
 tidb-planner-init = { path = "../tidb-planner-init" }
+tidb-ddl-label = { path = "../tidb-ddl-label" }
 tidb-go-rand = { path = "../tidb-go-rand" }
 tidb-ingestor-globalsort = { path = "../tidb-ingestor-globalsort" }
 tidb-placement = { path = "../tidb-placement" }

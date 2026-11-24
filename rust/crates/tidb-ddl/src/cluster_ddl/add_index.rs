@@ -1466,8 +1466,10 @@ pub(super) fn on_create_columnar_index(
             }
             // Send sync schema notification to TiFlash.
             if active.job.snapshot_version == 0 {
-                tidb_domain_infosync::tiflash_manager::sync_tiflash_table_schema(info.id)
-                    .map_err(DdlPlanError::Encode)?;
+                if super::step_pd_write("COLUMNAR INDEX")? {
+                    tidb_domain_infosync::tiflash_manager::sync_tiflash_table_schema(info.id)
+                        .map_err(DdlPlanError::Encode)?;
+                }
                 // Go `getValidCurrentVersion`; the step's start timestamp
                 // is a version the store has reached.
                 active.job.snapshot_version = start_ts;

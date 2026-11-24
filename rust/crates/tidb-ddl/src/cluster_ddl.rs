@@ -3253,19 +3253,33 @@ fn plan_persisted_ddl_job_with<S: MetaSnapshot>(
             // Whether the delivered job can still be cancelled cleanly.
             let delivered = (multi_keyspace && active.job.is_running() && active.job.is_rollbackable())
                 .then(|| active.job.clone());
+            // The action's own PD writes (TiFlash rules) refuse a step that
+            // can be cancelled and are skipped by one that cannot.
+            let pd_writes = match (multi_keyspace, delivered.is_some()) {
+                (false, _) => StepPdWrites::Allow,
+                (true, true) => StepPdWrites::Refuse,
+                (true, false) => StepPdWrites::Skip,
+            };
+            let previous = STEP_PD_WRITES.with(|cell| cell.replace(pd_writes));
             let planned = plan_action(snapshot, &catalog, &mut active);
-            let feature = planned.as_ref().ok().and_then(|step| pd_backed_write_feature(&step.write));
+            STEP_PD_WRITES.with(|cell| cell.set(previous));
+            let feature = match &planned {
+                Ok(step) => pd_backed_write_feature(&step.write),
+                Err(error) if multi_keyspace && is_multi_keyspace_refusal(error) => Some("TIFLASH REPLICA"),
+                Err(_) => None,
+            };
             match (feature, delivered, planned) {
-                (Some(feature), Some(delivered), _) => {
+                (Some(feature), Some(delivered), planned) => {
                     // Go's `job.State = JobStateCancelled; return err` before
                     // the action changes anything: the job as delivered,
                     // rolled back (cancelled) by its next step.
                     active.job = delivered;
                     active.job.state = JobState::CANCELLING;
                     refused_pd_write.set(true);
-                    Err(DdlPlanError::Source(tidb_plannererrors::ERR_NOT_SUPPORTED_YET.gen_with_stack_by_args(&[
-                        format!("{feature} on a multi-keyspace node").into(),
-                    ])))
+                    Err(match planned {
+                        Err(refusal) => refusal,
+                        Ok(_) => multi_keyspace_refusal(feature),
+                    })
                 }
                 (Some(feature), None, Ok(mut step)) if multi_keyspace => {
                     // Past the point a job can be cancelled (a job queued
@@ -4618,9 +4632,85 @@ fn pd_step_error(context: Option<&str>, error: String) -> DdlPlanError {
     ))
 }
 
+/// What a job step on a multi-keyspace node does with a PD write its action
+/// makes directly (TiFlash rules, TiFlash schema sync): set around the
+/// action by [`plan_persisted_ddl_job_step`] (design §10 phase 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StepPdWrites {
+    /// A single-keyspace node: the write is made.
+    Allow,
+    /// The step can still be cancelled: the write refuses the step.
+    Refuse,
+    /// The step is past its cancel point: the write is skipped.
+    Skip,
+}
+
+thread_local! {
+    static STEP_PD_WRITES: std::cell::Cell<StepPdWrites> = const { std::cell::Cell::new(StepPdWrites::Allow) };
+}
+
+/// The 1235 a multi-keyspace node answers for `feature`.
+fn multi_keyspace_refusal(feature: &str) -> DdlPlanError {
+    DdlPlanError::Source(tidb_plannererrors::ERR_NOT_SUPPORTED_YET.gen_with_stack_by_args(&[
+        format!("{feature} on a multi-keyspace node").into(),
+    ]))
+}
+
+/// Whether `error` is a step's [`multi_keyspace_refusal`].
+fn is_multi_keyspace_refusal(error: &DdlPlanError) -> bool {
+    error.equal(&tidb_plannererrors::ERR_NOT_SUPPORTED_YET) && error.to_string().ends_with("on a multi-keyspace node'")
+}
+
+/// Gate for a PD write a job step's action makes itself: `Ok(true)` to
+/// make it, `Ok(false)` to skip it, or the step's refusal.
+pub(crate) fn step_pd_write(feature: &str) -> Result<bool, DdlPlanError> {
+    match STEP_PD_WRITES.with(std::cell::Cell::get) {
+        StepPdWrites::Allow => Ok(true),
+        StepPdWrites::Skip => Ok(false),
+        StepPdWrites::Refuse => Err(multi_keyspace_refusal(feature)),
+    }
+}
+
+/// The label rule manager a job step reads and writes. On a multi-keyspace
+/// node label operations are suppressed (phase 3b): the step builds its
+/// rule IDs with the keyspace-less codec, so two tenants with the same
+/// database and table names would share rules. The suppressed manager
+/// holds no rules and takes no writes.
+pub(crate) fn job_label_rule_manager() -> std::sync::Arc<dyn tidb_domain_infosync::label_manager::LabelRuleManager> {
+    if tidb_keyspace::is_multi_keyspace_mode() {
+        std::sync::Arc::new(SuppressedLabelRules)
+    } else {
+        tidb_domain_infosync::label_manager::label_rule_manager()
+    }
+}
+
+#[derive(Debug)]
+struct SuppressedLabelRules;
+
+impl tidb_domain_infosync::label_manager::LabelRuleManager for SuppressedLabelRules {
+    fn put_label_rule(&self, _rule: &tidb_ddl_label::Rule) -> Result<(), String> {
+        Ok(())
+    }
+    fn update_label_rules(&self, _patch: &tidb_ddl_label::LabelRulePatch) -> Result<(), String> {
+        Ok(())
+    }
+    fn get_all_label_rules(&self, _codec: &dyn tidb_ddl_label::LabelCodec) -> Result<Vec<tidb_ddl_label::Rule>, String> {
+        Ok(Vec::new())
+    }
+    fn get_label_rules(
+        &self,
+        _rule_ids: &[String],
+    ) -> Result<std::collections::BTreeMap<String, tidb_ddl_label::Rule>, String> {
+        Ok(std::collections::BTreeMap::new())
+    }
+}
+
 /// Go `infosync.ConfigureTiFlashPDForTable` in a job step; a PD refusal is
 /// the step's error.
 pub(crate) fn configure_tiflash_pd_for_table(id: i64, count: u64, labels: &[String]) -> Result<(), DdlPlanError> {
+    if !step_pd_write("TIFLASH REPLICA")? {
+        return Ok(());
+    }
     tidb_domain_infosync::tiflash_manager::configure_tiflash_pd_for_table(id, count, labels)
         .map_err(|error| pd_step_error(None, error))
 }
@@ -4633,6 +4723,9 @@ pub(crate) fn configure_tiflash_pd_for_partitions(
     labels: &[String],
     table_id: i64,
 ) -> Result<(), DdlPlanError> {
+    if !step_pd_write("TIFLASH REPLICA")? {
+        return Ok(());
+    }
     let ids: Vec<i64> = definitions.iter().map(|definition| definition.id).collect();
     tidb_domain_infosync::tiflash_manager::configure_tiflash_pd_for_partitions(accel, &ids, count, labels, table_id)
         .map_err(|error| pd_step_error(None, error))
@@ -5062,10 +5155,9 @@ pub(super) fn record_ddl_action_error(job: &mut Job, error: &DdlPlanError) -> bo
 }
 
 /// The PD write a job step's resolved metadata would make, if any, that a
-/// multi-keyspace node refuses. Label rules are not among them: their IDs
-/// carry the job's keyspace on a next-generation kernel (`keyspace/<id>/…`),
-/// so a step only rewrites its own keyspace's rules (a TRUNCATE moves them
-/// to the new table ID). Placement group IDs (`TiDB_DDL_<id>`) do not.
+/// multi-keyspace node refuses. Label rules are not among them: on such a
+/// node the step's label manager is [`job_label_rule_manager`], which
+/// suppresses them, so a step carries no label write to refuse.
 fn pd_backed_write_feature(write: &DdlWrite) -> Option<&'static str> {
     if !write.placement_bundles.is_empty() {
         Some("PLACEMENT")
@@ -5357,9 +5449,7 @@ pub(crate) struct LabelRuleSteps {
 impl LabelRuleSteps {
     fn new() -> Self {
         Self {
-            staged: tidb_domain_infosync::label_manager::StagedLabelRules::new(
-                tidb_domain_infosync::label_manager::label_rule_manager(),
-            ),
+            staged: tidb_domain_infosync::label_manager::StagedLabelRules::new(job_label_rule_manager()),
             steps: Vec::new(),
         }
     }

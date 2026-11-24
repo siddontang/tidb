@@ -106,7 +106,7 @@ fn deliver_label_rules(write: &DdlWrite) -> Result<Option<LabelDeliveryReceipt>,
     if write.label_rules.is_empty() {
         return Ok(None);
     }
-    let manager = tidb_domain_infosync::label_manager::label_rule_manager();
+    let manager = crate::cluster_ddl::job_label_rule_manager();
     let mut rule_ids = write
         .label_rules
         .iter()
