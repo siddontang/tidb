@@ -1192,6 +1192,26 @@ fn check_auth_plugin(
     user: &mut String,
     peer: &PeerAddress,
 ) -> Result<AuthPluginDecision, AuthPluginRefusal> {
+    // Go resolves variants in Starter deployments. A multi-keyspace node
+    // keys every tenant's accounts by its keyspace prefix the same way
+    // (design §4.1), so a plain name routed to a keyspace logs in as that
+    // keyspace's prefixed account there too.
+    let variants = (tidb_config_deploymode::is_starter() || tidb_keyspace::is_multi_keyspace_mode())
+        .then(|| keyspace.username_policy());
+    check_auth_plugin_resolving(server_plugin, client_plugin, plugin_auth, variants.as_ref(), users, user, peer)
+}
+
+/// [`check_auth_plugin`] resolving login names through `variants`, the
+/// routed keyspace's username policy, when the node resolves them at all.
+fn check_auth_plugin_resolving(
+    server_plugin: &str,
+    client_plugin: &mut String,
+    plugin_auth: bool,
+    variants: Option<&tidb_keyspace::UsernamePolicy>,
+    users: &ConfiguredUserStore,
+    user: &mut String,
+    peer: &PeerAddress,
+) -> Result<AuthPluginDecision, AuthPluginRefusal> {
     use tidb_mysql::consts::{
         AuthMySQLClearPassword, AuthNativePassword, AuthSocket, AuthTiDBAuthToken,
         AuthTiDBSessionToken,
@@ -1203,9 +1223,9 @@ fn check_auth_plugin(
     // Find the identity of the user based on username and peer host.
     let host = peer.host();
     let mut identity = None;
-    if tidb_config_deploymode::is_starter() {
+    if let Some(policy) = variants {
         identity = match_identity_with_variants(
-            &keyspace.username_policy(),
+            policy,
             users,
             user,
             &host,
@@ -4525,6 +4545,57 @@ mod check_auth_plugin_tests {
 
         tidb_config_deploymode::set(original_mode).unwrap();
         restore_config();
+    }
+
+    /// On a multi-keyspace node outside Starter, a plain name routed to a
+    /// keyspace logs in as that keyspace's prefixed account; an explicit
+    /// prefix matches only its own account. A single-keyspace node outside
+    /// Starter keeps its one exact lookup. (The node's mode is the
+    /// `variants` argument, so the test leaves the process-wide mode alone.)
+    #[test]
+    fn multi_keyspace_login_resolves_plain_names_to_the_routed_keyspace() {
+        use tidb_privilege::loaded::LoadedUser;
+        let users = ConfiguredUserStore::from_accounts(tidb_privilege::load::registry_from_user_rows([
+            LoadedUser::new("keyspace1.app", "%", "mysql_native_password", ""),
+        ]));
+        // The policy a multi-keyspace node gives the routed keyspace.
+        let policy = tidb_keyspace::UsernamePolicy::Prefix { user_prefix: "keyspace1".to_owned() };
+        let run = |user: &str, multi_keyspace: bool| {
+            let mut user = user.to_owned();
+            let mut client_plugin = "mysql_native_password".to_owned();
+            let decision = super::check_auth_plugin_resolving(
+                "mysql_native_password",
+                &mut client_plugin,
+                true,
+                multi_keyspace.then_some(&policy),
+                &users,
+                &mut user,
+                &tcp(),
+            );
+            (decision, user)
+        };
+        assert!(
+            !tidb_config_deploymode::is_starter() && !tidb_keyspace::is_multi_keyspace_mode(),
+            "a single-keyspace node outside Starter"
+        );
+
+        // Single keyspace outside Starter: the exact name only.
+        let (decision, _) = run("app", false);
+        assert!(matches!(decision, Err(AuthPluginRefusal::AccessDenied)));
+
+        let (decision, user) = run("app", true);
+        assert!(matches!(decision, Ok(AuthPluginDecision::Keep)));
+        assert_eq!(user, "keyspace1.app");
+
+        let (decision, user) = run("keyspace1.app", true);
+        assert!(matches!(decision, Ok(AuthPluginDecision::Keep)));
+        assert_eq!(user, "keyspace1.app");
+
+        let (decision, _) = run("keyspace2.app", true);
+        assert!(matches!(decision, Err(AuthPluginRefusal::UserPrefixMismatch)));
+
+        let (decision, _) = run("other", true);
+        assert!(matches!(decision, Err(AuthPluginRefusal::AccessDenied)));
     }
 
     /// Go `TestAuthPlugin2` (`server/conn_test.go:2040`): an account with no
