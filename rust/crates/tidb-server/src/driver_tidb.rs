@@ -62,6 +62,10 @@ impl QuerySessionFactory for Domain {
     fn expensive_query_handle(&self) -> Option<Arc<tidb_expensivequery::Handle>> {
         Some(Domain::expensive_query_handle(self))
     }
+
+    fn keyspace_context(&self) -> Option<Arc<tidb_keyspace::KeyspaceContext>> {
+        Domain::keyspace_context(self).cloned()
+    }
 }
 
 /// Go `TiDBContext`: the connection's session, as the protocol layer drives it.

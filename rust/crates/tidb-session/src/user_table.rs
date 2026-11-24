@@ -153,6 +153,10 @@ impl tidb_executor::simple::account_tables::AccountSession for Session {
         self.privileges.as_ref()
     }
 
+    fn username_policy(&self) -> tidb_keyspace::UsernamePolicy {
+        self.keyspace_context().username_policy()
+    }
+
 
     fn in_account_statement(&self) -> bool {
         self.account_sql.is_some()

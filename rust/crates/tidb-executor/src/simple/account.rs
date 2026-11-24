@@ -677,7 +677,7 @@ pub trait AccountExec: super::account_tables::UserTableExec {
         let mut users: Vec<(&str, &str)> = Vec::with_capacity(specs.len());
         for (user, host, auth, _) in specs {
             let (user, host) = (*user, *host);
-            tidb_keyspace::get_username_policy().validate_username(user)?;
+            self.username_policy().validate_username(user)?;
             if user.len() > tidb_parser::auth::USER_NAME_MAX_LENGTH {
                 return Err(tidb_planner::preprocess::wrong_string_length_error(
                     user,
@@ -940,7 +940,7 @@ pub trait AccountExec: super::account_tables::UserTableExec {
         // Go's `userExistsWithRetryVariants` rewrites each target (and, for
         // explicit roles, each role) to the username-policy variant it finds,
         // so every later step names the stored account.
-        let policy = tidb_keyspace::get_username_policy();
+        let policy = self.username_policy();
         let accounts = if sole_current {
             set_default
                 .users
@@ -1067,7 +1067,7 @@ pub trait AccountExec: super::account_tables::UserTableExec {
         };
         // Go `userExistsWithRetryVariants` rewrites each role to the
         // username-policy variant it finds.
-        let policy = tidb_keyspace::get_username_policy();
+        let policy = self.username_policy();
         roles
             .iter()
             .map(|spec| {
@@ -1098,7 +1098,7 @@ pub trait AccountExec: super::account_tables::UserTableExec {
         };
         // Go `userExistsWithRetryVariants` rewrites each account to the
         // username-policy variant it finds.
-        let policy = tidb_keyspace::get_username_policy();
+        let policy = self.username_policy();
         users
             .iter()
             .map(|spec| {
@@ -1234,7 +1234,7 @@ pub trait AccountExec: super::account_tables::UserTableExec {
                 // Go `executeRenameUser` checks the NEW name against the
                 // username policy, then its lengths, before it looks either
                 // account up.
-                tidb_keyspace::get_username_policy().validate_username(&new.0)?;
+                self.username_policy().validate_username(&new.0)?;
                 if new.0.len() > tidb_parser::auth::USER_NAME_MAX_LENGTH {
                     return Err(tidb_planner::preprocess::wrong_string_length_error(
                         &new.0,
@@ -1569,7 +1569,7 @@ pub trait AccountExec: super::account_tables::UserTableExec {
                         tidb_exeerrors::ERR_CANT_CREATE_USER_WITH_GRANT.gen_with_stack_by_args(&[]),
                     ));
                 }
-                tidb_keyspace::get_username_policy().validate_username(&spec.user.user)?;
+                self.username_policy().validate_username(&spec.user.user)?;
                 missing.push(position);
             }
         }

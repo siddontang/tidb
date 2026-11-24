@@ -554,7 +554,9 @@ impl Session {
         // Go `StmtCtx.SQLDigest`: a statement with no normalized text tags
         // no SQL digest.
         let sql_digest = (!normalized.is_empty()).then(|| digest.as_bytes().to_vec());
-        let keyspace_name = tidb_keyspace::get_keyspace_name_bytes_by_settings();
+        // Go `keyspace.GetKeyspaceNameBytesBySettings()`, for the session's
+        // keyspace.
+        let keyspace = self.keyspace_context();
         // Go `StmtCtx.GetPlanDigest`: empty until the plan is published.
         // Held weakly: the session owns its plan cell, and the tagger lives in
         // the KV context its transactions and plan contexts share.
@@ -569,6 +571,7 @@ impl Session {
         };
         let lock_plan_digest = plan_digest.clone();
         let lock_sql_digest = sql_digest.clone();
+        let lock_keyspace = Arc::clone(&keyspace);
         self.statement_kv_context
             .publish(tidb_txnkv::StatementKvContext {
                 caller_context: Some(tikv_client::trace::current_trace_context()),
@@ -581,7 +584,7 @@ impl Session {
                 exec_details: Some(Arc::clone(exec_details)),
                 txn_start_ts: None,
                 resource_group_tagger: Some(Arc::new(move || {
-                    let mut tagger = tidb_txnkv::ResourceGroupTagBuilder::new(keyspace_name);
+                    let mut tagger = tidb_txnkv::ResourceGroupTagBuilder::new(keyspace.name_bytes());
                     tagger.set_plan_digest(&plan_digest());
                     if let Some(sql_digest) = &sql_digest {
                         tagger.set_sql_digest(sql_digest);
@@ -592,7 +595,7 @@ impl Session {
                     let Some(sql_digest) = &lock_sql_digest else {
                         return Vec::new();
                     };
-                    let mut tagger = tidb_txnkv::ResourceGroupTagBuilder::new(keyspace_name);
+                    let mut tagger = tidb_txnkv::ResourceGroupTagBuilder::new(lock_keyspace.name_bytes());
                     tagger
                         .set_plan_digest(&lock_plan_digest())
                         .set_sql_digest(sql_digest);
@@ -1323,11 +1326,15 @@ mod tests {
 impl tidb_executor::exec_stmt_observation::ExecStmtObservation for Session {
     /// Go `ExecStmt.FinishExecuteStmt`: use the session's store codec, not global identity.
     fn observed_keyspace_id(&self) -> u32 {
-        if tidb_keyspace::is_keyspace_name_empty(&tidb_keyspace::get_keyspace_name_by_settings()) {
+        if tidb_keyspace::is_keyspace_name_empty(self.keyspace_context().name()) {
             0
         } else {
             self.store_keyspace_id
         }
+    }
+
+    fn observed_keyspace_name(&self) -> String {
+        self.keyspace_context().name().to_owned()
     }
 
     fn observed_connection_id(&self) -> u64 {
@@ -1463,5 +1470,44 @@ impl tidb_executor::exec_stmt_observation::FinishExecuteStmt for Session {
 
     fn top_ru_user(&self) -> String {
         Session::top_ru_user(self)
+    }
+}
+
+#[cfg(test)]
+mod keyspace_identity_tests {
+    use prost::Message as _;
+    use tidb_executor::exec_stmt_observation::ExecStmtObservation as _;
+
+    /// A session bound to keyspace `ks_b` on a node whose configured
+    /// keyspace is `ks_a` (multi-keyspace design §6.1) reports `ks_b` in its
+    /// slow log and statement summary, and its requests' resource-group tags
+    /// carry `ks_b`.
+    #[test]
+    fn observation_and_resource_tags_name_the_session_keyspace() {
+        if !tidb_config_kerneltype::is_next_gen() {
+            // Named mock keyspaces exist only in the nextgen kernel.
+            return;
+        }
+        let restore_config = tidb_config::config_tree::config::restore_func();
+        let store = crate::domain::mock_store::MockStoreDomain::create_for_keyspace("ks_b").unwrap();
+        tidb_config::config_tree::config::update_global(|config| {
+            config.keyspace_name = "ks_a".into();
+        });
+        let mut session = store.new_session().unwrap();
+
+        assert_eq!(session.observed_keyspace_name(), "ks_b");
+        let keyspace_id = session.keyspace_context().id().expect("a named store's keyspace ID");
+        assert_eq!(session.observed_keyspace_id(), keyspace_id);
+
+        session.context_with_initialized_exec_details("select 1");
+        let tagger = session
+            .statement_kv_context_cell()
+            .get()
+            .resource_group_tagger
+            .expect("the statement's tagger");
+        let tag = tidb_proto::ResourceGroupTag::decode(tagger().encode_tag_with_key(&[]).as_slice()).unwrap();
+        assert_eq!(tag.keyspace_name.as_deref(), Some(&b"ks_b"[..]));
+
+        restore_config();
     }
 }

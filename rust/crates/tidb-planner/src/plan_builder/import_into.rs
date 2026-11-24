@@ -18,7 +18,11 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
     pub fn build_import_into(&mut self, stmt: &ImportIntoStmt) -> Result<Plan, PlanError> {
         let (path, format, local) = match &stmt.source {
             ImportSource::File { path, format } => {
-                let (path, local) = check_import_source_path(path)?;
+                let keyspace = self.session_ctx.map_or_else(
+                    tidb_config::config_tree::config::get_global_keyspace_name,
+                    |session| session.keyspace_name(),
+                );
+                let (path, local) = check_import_source_path(path, &keyspace)?;
                 (path, format.clone(), local)
             }
             ImportSource::Select { .. } => (String::new(), None, false),
@@ -200,7 +204,8 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
 /// the path must parse as a URL, SEM v1 forbids server disk, and a
 /// next-generation kernel under SEM stamps its keyspace as the S3 external
 /// ID. Answers the (possibly rewritten) path and whether it is server disk.
-pub(crate) fn check_import_source_path(path: &str) -> Result<(String, bool), PlanError> {
+/// `keyspace` is the session's (Go `config.GetGlobalConfig().KeyspaceName`).
+pub(crate) fn check_import_source_path(path: &str, keyspace: &str) -> Result<(String, bool), PlanError> {
     let mut u = tidb_go_url::parse(path).map_err(|err| {
         // Go reports `err.Error()`, which quotes the path; its credentials
         // are redacted here.
@@ -226,14 +231,11 @@ pub(crate) fn check_import_source_path(path: &str) -> Result<(String, bool), Pla
         if is_starter {
             check_starter_s3_path(&u)?;
         }
-        check_next_gen_s3_path_with_sem(&u)?;
+        check_next_gen_s3_path_with_sem(&u, keyspace)?;
         // Non-Starter deployments derive the external ID from the keyspace.
         if !is_starter {
             let mut values = u.query();
-            values.set(
-                tidb_objstore_s3like::S3_EXTERNAL_ID,
-                tidb_config::config_tree::config::get_global_keyspace_name(),
-            );
+            values.set(tidb_objstore_s3like::S3_EXTERNAL_ID, keyspace.to_owned());
             u.raw_query = values.encode();
             return Ok((u.string(), import_from_server));
         }
@@ -267,8 +269,12 @@ pub(crate) fn check_starter_s3_path(u: &tidb_go_url::URL) -> Result<(), PlanErro
 }
 
 /// Go `checkNextGenS3PathWithSem`: under SEM a tenant must bring its own key
-/// pair or role ARN, and outside Starter may not choose the external ID.
-pub(crate) fn check_next_gen_s3_path_with_sem(u: &tidb_go_url::URL) -> Result<(), PlanError> {
+/// pair or role ARN, and outside Starter may not choose the external ID,
+/// which is the session's keyspace `expected_external_id`.
+pub(crate) fn check_next_gen_s3_path_with_sem(
+    u: &tidb_go_url::URL,
+    expected_external_id: &str,
+) -> Result<(), PlanError> {
     use tidb_objstore_s3like::{S3_ACCESS_KEY, S3_EXTERNAL_ID, S3_ROLE_ARN, S3_SECRET_ACCESS_KEY};
     let not_supported = |feature: &str| {
         PlanError::from(
@@ -277,7 +283,6 @@ pub(crate) fn check_next_gen_s3_path_with_sem(u: &tidb_go_url::URL) -> Result<()
         )
     };
     let values = u.query();
-    let expected_external_id = tidb_config::config_tree::config::get_global_keyspace_name();
     let is_starter = tidb_config_deploymode::is_starter();
     let (mut has_access_key, mut has_secret_access_key, mut has_role_arn) = (false, false, false);
     for (key, vs) in &values.0 {
@@ -309,7 +314,9 @@ mod tests {
 
     fn sem_error(u: &str) -> Option<String> {
         let u = tidb_go_url::parse(u).unwrap();
-        check_next_gen_s3_path_with_sem(&u).err().map(|e| e.to_string())
+        check_next_gen_s3_path_with_sem(&u, &tidb_config::config_tree::config::get_global_keyspace_name())
+            .err()
+            .map(|e| e.to_string())
     }
 
     /// Go `TestProcessNextGenS3Path`.

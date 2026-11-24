@@ -328,6 +328,9 @@ pub fn set_task_manager(is: Option<Arc<TaskManager>>) {
 /// # Errors
 /// The needed task manager is not set.
 pub fn get_dxf_svc_task_mgr() -> Result<Arc<TaskManager>> {
+    // Process-level for now: the task managers themselves are process
+    // singletons, bound to the configured keyspace until they move into
+    // each keyspace runtime (multi-keyspace design §6.10, phase 3f).
     if tidb_config_kerneltype::is_next_gen()
         && tidb_config::config_tree::config::get_global_keyspace_name() != tidb_keyspace::SYSTEM
     {

@@ -146,12 +146,13 @@ pub fn fill_one_import_job_info(
 /// progress.
 fn handle_import_job_info(
     ctx: &Context,
+    keyspace: &str,
     mut info: JobInfo,
     zone: &tidb_datatype::SessionTimeZone,
 ) -> Result<Vec<Datum>, DriverError> {
     let mut run_info = None;
     if info.status == importer_job::JOB_STATUS_RUNNING {
-        let ri = tidb_dxf_importinto::runtime_info::get_runtime_info_for_job(ctx, info.id)
+        let ri = tidb_dxf_importinto::runtime_info::get_runtime_info_for_job(ctx, keyspace, info.id)
             .map_err(|e| import_error(&e))?;
         if ri.status == tidb_dxf::TASK_STATE_AWAITING_RESOLUTION {
             info.status = ri.status.to_string();
@@ -235,6 +236,13 @@ pub trait ImportIntoSession {
     fn set_statement_message(&mut self, message: String);
     /// Go `sctx.GetSessionVars().SQLKiller`.
     fn sql_killer(&self) -> std::sync::Arc<tidb_sqlkiller::SqlKiller>;
+
+    /// Go `keyspace.GetKeyspaceNameBySettings()`, for the keyspace the
+    /// session serves (multi-keyspace design §6.1): the plan's keyspace and
+    /// the import task keys.
+    fn import_keyspace(&self) -> String {
+        tidb_config::config_tree::config::get_global_keyspace_name()
+    }
 }
 
 /// Go `ImportIntoExec`, `ImportIntoActionExec` and the import `ShowExec`
@@ -261,7 +269,7 @@ pub trait ImportIntoExec: ImportIntoSession {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(tidb_vardef::defaults::DEF_DIST_SQL_SCAN_CONCURRENCY as usize),
             user: self.import_user(),
-            keyspace: tidb_config::config_tree::config::get_global_keyspace_name(),
+            keyspace: self.import_keyspace(),
             new_collation: tidb_datatype::new_collation_enabled(),
             max_dist_task_nodes: system(tidb_vardef::tidb_vars::TIDB_MAX_DIST_TASK_NODES),
             max_node_count_by_stores: tidb_dxf_importinto::import_store().map_or(0, |s| s.max_node_count_by_stores()),
@@ -610,8 +618,12 @@ pub trait ImportIntoExec: ImportIntoSession {
         let _ = watcher.join();
         match result {
             Err(tidb_dxf_handle::HandleError::Context(tidb_gocontext::CtxError::Canceled)) => {
-                tidb_dxf_importinto::job::cancel_and_wait_import_job(&Context::background(), job_id)
-                    .map_err(|e| import_error(&e))
+                tidb_dxf_importinto::job::cancel_and_wait_import_job(
+                    &Context::background(),
+                    &self.import_keyspace(),
+                    job_id,
+                )
+                .map_err(|e| import_error(&e))
             }
             Err(tidb_dxf_handle::HandleError::Task(e)) => Err(import_error(&e)),
             Err(e) => Err(other(e)),
@@ -632,7 +644,8 @@ pub trait ImportIntoExec: ImportIntoSession {
                 tidb_exeerrors::ERR_LOAD_DATA_INVALID_OPERATION.gen_with_stack_by_args(&["CANCEL".into()]),
             ));
         }
-        tidb_dxf_importinto::job::cancel_and_wait_import_job(&ctx, job_id).map_err(|e| import_error(&e))?;
+        tidb_dxf_importinto::job::cancel_and_wait_import_job(&ctx, &self.import_keyspace(), job_id)
+            .map_err(|e| import_error(&e))?;
         Ok(StmtOutput::Affected(0))
     }
 
@@ -648,7 +661,8 @@ pub trait ImportIntoExec: ImportIntoSession {
                 None => importer_job::get_all_viewable_jobs(&ctx, conn.as_ref(), &user, has_super),
             }
         })?;
-        infos.into_iter().map(|info| handle_import_job_info(&ctx, info, &zone)).collect()
+        let keyspace = self.import_keyspace();
+        infos.into_iter().map(|info| handle_import_job_info(&ctx, &keyspace, info, &zone)).collect()
     }
 
     /// Go `ShowExec.fetchShowImportGroups`.
@@ -667,13 +681,14 @@ pub trait ImportIntoExec: ImportIntoSession {
         }
         let mut groups: std::collections::BTreeMap<String, GroupInfo> = std::collections::BTreeMap::new();
         let mut order = Vec::new();
+        let keyspace = self.import_keyspace();
         for info in infos {
             if !groups.contains_key(&info.group_key) {
                 order.push(info.group_key.clone());
             }
             let mut update_time = None;
             if info.status == importer_job::JOB_STATUS_RUNNING {
-                let ri = tidb_dxf_importinto::runtime_info::get_runtime_info_for_job(&ctx, info.id)
+                let ri = tidb_dxf_importinto::runtime_info::get_runtime_info_for_job(&ctx, &keyspace, info.id)
                     .map_err(|e| import_error(&e))?;
                 update_time = match ri.update_time {
                     Some(t) => match to_mysql_time(t, &zone) {

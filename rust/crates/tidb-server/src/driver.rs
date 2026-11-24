@@ -463,6 +463,13 @@ pub trait QuerySessionFactory: Send + Sync + 'static {
     fn expensive_query_handle(&self) -> Option<Arc<tidb_expensivequery::Handle>> {
         None
     }
+
+    /// The keyspace the factory's sessions serve (design §6.1), whose
+    /// username policy the login applies; `None` is the process's
+    /// configured keyspace.
+    fn keyspace_context(&self) -> Option<Arc<tidb_keyspace::KeyspaceContext>> {
+        None
+    }
 }
 
 /// Go `shouldInstallConnectionAlive` (`pkg/server/conn.go`): EXECUTE, TRACE

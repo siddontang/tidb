@@ -1789,6 +1789,8 @@ fn flash_replica_summary_response(path: &str, request: &str, routes: &StatusRout
     // Go `FlashReplicaSummary`, in its field order.
     let body = format!(
         "{{\"keyspace\":{},\"keyspace_id\":{},\"tidb_columnar_storage_enabled\":\"{}\",\"columnar_store_type\":{},\"can_disable\":{},\"table_count\":{table_count},\"reloaded\":{do_reload}}}",
+        // Process-level: the status port serves the configured keyspace's
+        // domain only (multi-keyspace design §6.9).
         serde_json::Value::from(tidb_keyspace::get_keyspace_name_by_settings()),
         // The store codec's keyspace: `NulSpaceID` on a classic store.
         tidb_txnkv::driver::tikv_store::NULL_KEYSPACE_ID,

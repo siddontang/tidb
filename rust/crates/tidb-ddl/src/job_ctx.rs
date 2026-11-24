@@ -110,15 +110,16 @@ impl ReorgContext {
 
     /// Go `ReorgContext.getResourceGroupTaggerForTopSQL`: the tag the job's
     /// requests carry, its SQL digest, while Top SQL is on.
-    fn get_resource_group_tagger_for_top_sql(&self) -> Option<tidb_txnkv::StatementResourceGroupTagger> {
+    fn get_resource_group_tagger_for_top_sql(
+        &self,
+        keyspace: std::sync::Arc<tidb_keyspace::KeyspaceContext>,
+    ) -> Option<tidb_txnkv::StatementResourceGroupTagger> {
         if !tidb_topsql_state::top_sql_enabled() {
             return None;
         }
         let digest = self.cache_digest.as_ref()?.as_bytes().to_vec();
         Some(std::sync::Arc::new(move || {
-            let mut tagger = tidb_txnkv::ResourceGroupTagBuilder::new(
-                tidb_keyspace::get_keyspace_name_bytes_by_settings(),
-            );
+            let mut tagger = tidb_txnkv::ResourceGroupTagBuilder::new(keyspace.name_bytes());
             tagger.set_sql_digest(&digest);
             tagger
         }))
@@ -201,15 +202,22 @@ pub(crate) fn job_resource_group_name(job_id: i64, reorg_meta_group: Option<&str
 }
 
 /// Go `ddlCtx.getResourceGroupTaggerForTopSQL`: none for a job with no
-/// context.
+/// context. The tag names `keyspace`, the keyspace of the DDL that runs the
+/// job (Go `keyspace.GetKeyspaceNameBytesBySettings()`); `None` is the
+/// process's configured keyspace.
 pub(crate) fn get_resource_group_tagger_for_top_sql(
     job_id: i64,
+    keyspace: Option<&std::sync::Arc<tidb_keyspace::KeyspaceContext>>,
 ) -> Option<tidb_txnkv::StatementResourceGroupTagger> {
+    let keyspace = keyspace.map_or_else(
+        || std::sync::Arc::new(tidb_keyspace::KeyspaceContext::unbound()),
+        std::sync::Arc::clone,
+    );
     JOB_CTX_MAP
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(&job_id)
-        .and_then(ReorgContext::get_resource_group_tagger_for_top_sql)
+        .and_then(|ctx| ctx.get_resource_group_tagger_for_top_sql(keyspace))
 }
 
 /// Go `removeJobCtx`: the job is done with its context.
@@ -274,15 +282,15 @@ mod tests {
             assert_eq!(labelled_digest(), None);
 
             tidb_topsql_state::enable_top_sql();
-            assert!(get_resource_group_tagger_for_top_sql(job_id).is_none(), "no digest yet");
+            assert!(get_resource_group_tagger_for_top_sql(job_id, None).is_none(), "no digest yet");
             attach_top_profiling_info(job_id, "ALTER TABLE t ADD INDEX i (a)");
             let (_, add_index) = tidb_parser::normalize_digest("ALTER TABLE t ADD INDEX i (a)");
             assert_eq!(labelled_digest().as_deref(), Some(add_index.as_str()));
-            assert!(get_resource_group_tagger_for_top_sql(job_id).is_some());
+            assert!(get_resource_group_tagger_for_top_sql(job_id, None).is_some());
             // Go `getResourceGroupTaggerForTopSQL`: no tagger while Top SQL
             // is off, though the digest is cached.
             tidb_topsql_state::disable_top_sql();
-            assert!(get_resource_group_tagger_for_top_sql(job_id).is_none());
+            assert!(get_resource_group_tagger_for_top_sql(job_id, None).is_none());
             tidb_topsql_state::enable_top_sql();
 
             // Another thread of the same job reuses the cached digest.

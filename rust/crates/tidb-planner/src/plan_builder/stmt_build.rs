@@ -44,6 +44,13 @@ pub trait SessionPlanContext {
     /// Go `SessionVars.SnapshotTS`.
     fn snapshot_ts(&self) -> u64 { 0 }
 
+    /// Go `config.GetGlobalConfig().KeyspaceName` for the keyspace the
+    /// session acts in, which on a multi-keyspace node is not the
+    /// process's.
+    fn keyspace_name(&self) -> String {
+        tidb_config::config_tree::config::get_global_keyspace_name()
+    }
+
     /// Go `gcutil.ValidateSnapshotWithGCSafePoint(ts, GetGCSafePoint(sctx))`
     /// and `staleread.GetSessionSnapshotInfoSchema(sctx, ts)`: the schema an
     /// AS OF refresh's MIN / MAX lookup plans over.

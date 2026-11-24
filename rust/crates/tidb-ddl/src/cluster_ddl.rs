@@ -2530,6 +2530,10 @@ pub struct DdlJobSchemaState {
     /// `prepareTxn` tags with the job's SQL (`kv.ResourceGroupTagger`).
     /// `None` for a run without a transaction of its own.
     pub step_kv_context: Option<tidb_txnkv::StatementKvContextCell>,
+    /// The keyspace of the store the step runs on, whose name the step's
+    /// resource-group tags carry (design §6.1). `None` for a run without a
+    /// store of its own, which tags the process's configured keyspace.
+    pub keyspace: Option<std::sync::Arc<tidb_keyspace::KeyspaceContext>>,
     /// Go `jobContext.infoCache`: the schema a step reads beside its job's
     /// own schemas, which it reads from meta (`jobCtx.metaMut`). `None` reads
     /// the whole schema from the snapshot.
@@ -2547,6 +2551,7 @@ impl DdlJobSchemaState {
             reorg: Vec::new(),
             worker,
             step_kv_context: None,
+            keyspace: None,
             info_cache: None,
         }
     }
@@ -3149,7 +3154,10 @@ fn plan_persisted_ddl_job_with<S: MetaSnapshot>(
         // transaction's `kv.RequestSourceType` and `kv.ResourceGroupTagger`.
         let source_type = crate::job_ctx::set_ddl_source_for_diagnosis(active.job.id, active.job.type_);
         step_kv_context.publish(tidb_txnkv::StatementKvContext {
-            resource_group_tagger: crate::job_ctx::get_resource_group_tagger_for_top_sql(active.job.id),
+            resource_group_tagger: crate::job_ctx::get_resource_group_tagger_for_top_sql(
+                active.job.id,
+                schema_state.keyspace.as_ref(),
+            ),
             request_source_type: Some(source_type),
             resource_group_name: Some(crate::job_ctx::job_resource_group_name(
                 active.job.id,

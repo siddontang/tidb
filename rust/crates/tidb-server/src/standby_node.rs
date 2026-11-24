@@ -71,14 +71,11 @@ pub(crate) fn get_normal_closed_conn(keyspace_name: &str, conn_id: &str) -> Stri
 }
 
 /// Go `Server.kill`: a killed connection's `normalCloseMsg` is recorded
-/// under its gateway connection id when the server has a standby controller.
-pub(crate) fn record_killed_conn_normal_close(gateway_conn_id: &str, normal_close_msg: &str) {
+/// under its keyspace (`keyspace_name`, the one it was routed to) and
+/// gateway connection id when the server has a standby controller.
+pub(crate) fn record_killed_conn_normal_close(keyspace_name: &str, gateway_conn_id: &str, normal_close_msg: &str) {
     if !normal_close_msg.is_empty() && server_standby_controller().is_some() {
-        set_normal_closed_conn(
-            &tidb_keyspace::get_keyspace_name_by_settings(),
-            gateway_conn_id,
-            normal_close_msg,
-        );
+        set_normal_closed_conn(keyspace_name, gateway_conn_id, normal_close_msg);
     }
 }
 
@@ -740,7 +737,11 @@ mod tests {
         // The connection's kill handle as `serve_connection_inner` binds it.
         let new_conn = |conn_id: u64, gw_conn_id: &'static str| {
             let close = ConnectionClose::with_wake(move |normal_close_msg| {
-                record_killed_conn_normal_close(gw_conn_id, normal_close_msg);
+                record_killed_conn_normal_close(
+                    &tidb_keyspace::get_keyspace_name_by_settings(),
+                    gw_conn_id,
+                    normal_close_msg,
+                );
             });
             let guard = registry.register(
                 conn_id,

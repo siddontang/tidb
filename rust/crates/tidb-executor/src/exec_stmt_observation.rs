@@ -157,6 +157,10 @@ impl StmtExecLazyInfo for LazyStatement {
 pub trait ExecStmtObservation: crate::sessionctx::SessionContext {
     /// Go `ExecStmt.FinishExecuteStmt`: the codec ID when keyspace settings are nonempty.
     fn observed_keyspace_id(&self) -> u32;
+    /// Go `keyspace.GetKeyspaceNameBySettings()` for the keyspace the
+    /// statement runs in, which a multi-keyspace node does not share between
+    /// its tenants.
+    fn observed_keyspace_name(&self) -> String;
     /// The connection the statement runs on.
     fn observed_connection_id(&self) -> u64;
     /// Go `StmtHints.WriteSlowLog`: the `write_slow_log` hint.
@@ -425,7 +429,7 @@ pub trait ExecStmtObservation: crate::sessionctx::SessionContext {
             .as_deref()
             .and_then(|identity| identity.split_once('@'))
             .map(|(user, host)| (user.to_owned(), host.to_owned()));
-        let keyspace_name = tidb_keyspace::get_keyspace_name_by_settings();
+        let keyspace_name = self.observed_keyspace_name();
         let items = tidb_variable::slow_log::SlowQueryLogItems {
             txn_ts,
             keyspace_name: if tidb_keyspace::is_keyspace_name_empty(&keyspace_name) {
@@ -788,9 +792,7 @@ pub trait ExecStmtObservation: crate::sessionctx::SessionContext {
                 &observation.exec_details,
             )),
             prepared: observation.prepared,
-            keyspace_name: tidb_config::config_tree::config::get_global_config()
-                .keyspace_name
-                .clone(),
+            keyspace_name: self.observed_keyspace_name(),
             keyspace_id: self.observed_keyspace_id(),
             resource_group_name: self.observed_resource_group(),
             ru_detail: Some(Arc::clone(&observation.ru_details)),

@@ -1129,10 +1129,9 @@ fn check_user_variant_mismatch(
             "username variants mismatch",
             &[
                 tidb_log::Field::new("user", tidb_log::Value::Str(user.to_owned())),
-                tidb_log::Field::new(
-                    "assigned-keyspace",
-                    tidb_log::Value::Str(tidb_keyspace::get_keyspace_name_by_settings()),
-                ),
+                // Go `keyspace.GetKeyspaceNameBySettings()`: the keyspace
+                // whose prefix the policy requires.
+                tidb_log::Field::new("assigned-keyspace", tidb_log::Value::Str(policy_prefix(policy))),
             ],
         );
         return Err(AuthPluginRefusal::UserPrefixMismatch);
@@ -1140,12 +1139,20 @@ fn check_user_variant_mismatch(
     Ok(())
 }
 
+/// The keyspace prefix `policy` requires; empty for the default policy.
+fn policy_prefix(policy: &tidb_keyspace::UsernamePolicy) -> String {
+    match policy {
+        tidb_keyspace::UsernamePolicy::Prefix { user_prefix } => user_prefix.clone(),
+        tidb_keyspace::UsernamePolicy::Default => String::new(),
+    }
+}
+
 /// Go `clientConn.matchIdentityWithVariants` (`server/conn.go:910`): the
 /// account plugin of the first policy variant of `user` that matches an
 /// account, rewriting `user` to that variant as Go sets `cc.user`.
 /// `Ok(None)` is Go's `ErrIdentityNotFound`, which `checkAuthPlugin` answers
-/// with the exact-name lookup. `policy` is Go's `keyspace.GetUsernamePolicy()`,
-/// passed in by the caller.
+/// with the exact-name lookup. `policy` is Go's `keyspace.GetUsernamePolicy()`
+/// for the connection's keyspace, passed in by the caller.
 fn match_identity_with_variants(
     policy: &tidb_keyspace::UsernamePolicy,
     users: &ConfiguredUserStore,
@@ -1174,11 +1181,13 @@ fn match_identity_with_variants(
 /// Go `clientConn.checkAuthPlugin` (`server/conn.go:939`): `server_plugin` is
 /// `cc.authPlugin`, `client_plugin` is `resp.AuthPlugin`, which a switch
 /// rewrites, and `user` is `cc.user`, which a Starter username variant
-/// rewrites.
+/// rewrites. `keyspace` is the keyspace the connection was routed to, whose
+/// username policy resolves the variants.
 fn check_auth_plugin(
     server_plugin: &str,
     client_plugin: &mut String,
     plugin_auth: bool,
+    keyspace: &tidb_keyspace::KeyspaceContext,
     users: &ConfiguredUserStore,
     user: &mut String,
     peer: &PeerAddress,
@@ -1196,7 +1205,7 @@ fn check_auth_plugin(
     let mut identity = None;
     if tidb_config_deploymode::is_starter() {
         identity = match_identity_with_variants(
-            &tidb_keyspace::get_username_policy(),
+            &keyspace.username_policy(),
             users,
             user,
             &host,
@@ -1603,10 +1612,16 @@ fn serve_connection_inner<F: QuerySessionFactory>(
     let mut client_plugin = String::from_utf8_lossy(response.auth_plugin.as_bytes()).into_owned();
     let mut auth_response = response.auth.clone();
     let mut response_sequence = reply_sequence;
+    // The routed keyspace's identity: the login resolves names under its
+    // username policy, not the process's configured keyspace's.
+    let keyspace = factory
+        .keyspace_context()
+        .unwrap_or_else(|| Arc::new(tidb_keyspace::KeyspaceContext::unbound()));
     let decision = check_auth_plugin(
         &server_plugin,
         &mut client_plugin,
         plugin_auth,
+        &keyspace,
         users,
         &mut response_user,
         &peer_addr,
@@ -1909,9 +1924,10 @@ fn serve_connection_inner<F: QuerySessionFactory>(
         .find(|(key, _)| key.to_string_lossy() == crate::standby_node::TIDB_GATEWAY_ATTRS_CONN_KEY)
         .map(|(_, value)| value.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let close_keyspace = keyspace.name().to_owned();
     let close = ConnectionClose::with_wake(move |normal_close_msg| {
         let _ = stream_for_close.shutdown(std::net::Shutdown::Both);
-        crate::standby_node::record_killed_conn_normal_close(&gateway_conn_id, normal_close_msg);
+        crate::standby_node::record_killed_conn_normal_close(&close_keyspace, &gateway_conn_id, normal_close_msg);
     });
     // With mysql --compression-algorithms=zlib,zstd both flags are set, the
     // result is Zlib.
@@ -2107,6 +2123,7 @@ fn serve_connection_inner<F: QuerySessionFactory>(
             collation: handshake_collation,
             user: response_user.clone(),
         },
+        keyspace_name: keyspace.name().to_owned(),
     })
 }
 
@@ -2191,6 +2208,9 @@ struct CommandContext<'a, S: QuerySession> {
     cancellation: ConnectionCancellation,
     stream_for_watch: ClientSocket,
     conn_info: ConnInfo,
+    /// The keyspace the connection was routed to (Go
+    /// `keyspace.GetKeyspaceNameBySettings()` for its session).
+    keyspace_name: String,
 }
 
 /// The handshake facts Go's `clientConn.String()` prints.
@@ -2482,6 +2502,7 @@ fn run_connection_commands<S: QuerySession>(
         conn_info,
         events,
         reset_session,
+        keyspace_name,
     } = context;
     let protocol_41 = framing.protocol_41;
     let connection_alive = Arc::new(ConnectionAliveProbe {
@@ -2572,7 +2593,7 @@ fn run_connection_commands<S: QuerySession>(
                     .map(|(_, value)| value.clone())
                     .unwrap_or_default();
                 crate::standby_node::set_normal_closed_conn(
-                    &tidb_keyspace::get_keyspace_name_by_settings(),
+                    &keyspace_name,
                     &gateway_conn_id,
                     "read packet timeout",
                 );
@@ -4352,6 +4373,7 @@ mod check_auth_plugin_tests {
             server_plugin,
             &mut client_plugin,
             plugin_auth,
+            &tidb_keyspace::KeyspaceContext::unbound(),
             users,
             &mut user.to_owned(),
             &peer,
@@ -4433,6 +4455,7 @@ mod check_auth_plugin_tests {
                 "mysql_native_password",
                 &mut client_plugin,
                 true,
+                &tidb_keyspace::KeyspaceContext::unbound(),
                 &users,
                 &mut user,
                 &tcp(),
@@ -4454,6 +4477,51 @@ mod check_auth_plugin_tests {
         let (decision, user) = run("test_user", "tidb_session_token");
         assert!(matches!(decision, Ok(AuthPluginDecision::Keep)));
         assert_eq!(user, "test_user");
+
+        tidb_config_deploymode::set(original_mode).unwrap();
+        restore_config();
+    }
+
+    /// A connection routed to keyspace `ks_b` on a node configured for
+    /// `ks_a` (design §6.1) resolves login names under `ks_b`'s policy: an
+    /// unprefixed name becomes its `ks_b.` account, and the configured
+    /// keyspace's prefix is another keyspace's.
+    #[test]
+    fn login_variants_use_the_routed_keyspace_prefix() {
+        if !tidb_config_kerneltype::is_next_gen() {
+            // The starter deploy mode exists only in the nextgen kernel.
+            return;
+        }
+        let restore_config = tidb_config::config_tree::config::restore_func();
+        let original_mode = tidb_config_deploymode::get();
+        tidb_config::config_tree::config::update_global(|config| {
+            config.keyspace_name = "ks_a".into();
+        });
+        tidb_config_deploymode::set(tidb_config_deploymode::Mode::Starter).unwrap();
+
+        use tidb_privilege::loaded::LoadedUser;
+        let users = ConfiguredUserStore::from_accounts(tidb_privilege::load::registry_from_user_rows([
+            LoadedUser::new("ks_a.app", "%", "mysql_native_password", ""),
+            LoadedUser::new("ks_b.app", "%", "mysql_native_password", ""),
+        ]));
+        let routed = tidb_keyspace::KeyspaceContext::new("ks_b", Some(2));
+        let run = |user: &str| {
+            let mut user = user.to_owned();
+            let mut client_plugin = "mysql_native_password".to_owned();
+            let decision =
+                check_auth_plugin("mysql_native_password", &mut client_plugin, true, &routed, &users, &mut user, &tcp());
+            (decision, user)
+        };
+        let (decision, user) = run("app");
+        assert!(matches!(decision, Ok(AuthPluginDecision::Keep)));
+        assert_eq!(user, "ks_b.app");
+
+        let (decision, user) = run("ks_b.app");
+        assert!(matches!(decision, Ok(AuthPluginDecision::Keep)));
+        assert_eq!(user, "ks_b.app");
+
+        let (decision, _) = run("ks_a.app");
+        assert!(matches!(decision, Err(AuthPluginRefusal::UserPrefixMismatch)));
 
         tidb_config_deploymode::set(original_mode).unwrap();
         restore_config();

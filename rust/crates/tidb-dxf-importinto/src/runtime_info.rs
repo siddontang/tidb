@@ -110,10 +110,10 @@ pub fn format_second_as_time(sec: i64) -> String {
 ///
 /// # Errors
 /// The task of the job cannot be read.
-pub fn get_runtime_info_for_job(ctx: &Context, job_id: i64) -> Result<RuntimeInfo, Error> {
+pub fn get_runtime_info_for_job(ctx: &Context, keyspace: &str, job_id: i64) -> Result<RuntimeInfo, Error> {
     let ctx = tidb_dxf_storage::with_internal_source_type(ctx, tidb_txnkv::INTERNAL_DIST_TASK);
     let mgr = tidb_dxf_storage::get_dxf_svc_task_mgr().map_err(|e| Arc::new(e) as Error)?;
-    let task = mgr.get_task_by_key_with_history(&ctx, &crate::job::task_key(job_id)).map_err(|e| Arc::new(e) as Error)?;
+    let task = mgr.get_task_by_key_with_history(&ctx, &crate::job::task_key_in_keyspace(keyspace, job_id)).map_err(|e| Arc::new(e) as Error)?;
     let meta = TaskMeta::from_json(&task.meta)?;
     let mut ri = RuntimeInfo { status: task.base.state.clone(), step: task.base.step, ..RuntimeInfo::default() };
     if let Some(e) = &task.error {

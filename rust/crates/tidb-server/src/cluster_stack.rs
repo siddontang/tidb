@@ -745,6 +745,15 @@ fn bootstrap(
 /// session factory with its services. [`run_in_bootstrap_session`] builds
 /// one to bootstrap or upgrade the store and closes it; the serving domain is
 /// the second, started in normal mode.
+/// The identity of the keyspace `config` names, over its opened store.
+fn runtime_keyspace_context(
+    config: &NodeConfig,
+    store: &dyn tidb_keyspace::KeyspaceCodec,
+) -> tidb_keyspace::KeyspaceContext {
+    let id = (!store.is_api_v1()).then(|| store.keyspace_id());
+    tidb_keyspace::KeyspaceContext::new(config.global_config.keyspace_name.clone(), id)
+}
+
 fn new_cluster_domain(
     process: &NodeProcess<'_>,
     start_mode: tidb_ddl::StartMode,
@@ -1142,6 +1151,9 @@ fn new_cluster_domain(
         None => factory,
     };
     factory.install_store_keyspace(authority.tikv_store().get_keyspace().to_owned());
+    // The keyspace this runtime serves (design §6.1): its configured name,
+    // which is the process's on a single-keyspace node.
+    factory.install_keyspace_context(runtime_keyspace_context(config, authority.tikv_store()));
     if let Some(client) = &unprefixed_etcd {
         factory.install_unprefixed_etcd_client(Arc::clone(client));
     }

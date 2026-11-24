@@ -1671,9 +1671,16 @@ impl tidb_topsql_collector::ProcessCpuTimeUpdater for ProcessCpuTimeUpdater {
 /// Go `main`'s `topsql.SetupTopProfiling(keyspace.GetKeyspaceNameBytesBySettings(), svr, dom)`,
 /// before `svr.Run`. The domain binds itself as the RU-version provider when
 /// its resource-groups controller starts, so none is passed here.
+///
+/// The reporter is process-wide and binds one keyspace (design §6.8): the
+/// configured keyspace's runtime identity.
 pub(crate) fn setup_top_profiling(factory: &Arc<Domain>) {
+    let keyspace = factory
+        .keyspace_context()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(tidb_keyspace::KeyspaceContext::from_settings()));
     tidb_topsql::setup_top_profiling(
-        tidb_keyspace::get_keyspace_name_bytes_by_settings().map(<[u8]>::to_vec).unwrap_or_default(),
+        keyspace.name_bytes().map(<[u8]>::to_vec).unwrap_or_default(),
         Arc::new(ProcessCpuTimeUpdater(factory.processes())),
         None,
     );

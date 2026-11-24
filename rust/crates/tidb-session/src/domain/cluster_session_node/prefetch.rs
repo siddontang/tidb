@@ -84,7 +84,8 @@ impl ClusterServerSession<'_> {
         }
         let transaction = self.node.txn.explicit().expect("checked above");
         let mut snapshot = transaction.snapshot().map_err(SqlQueryError::unknown)?;
-        set_resource_group_tagger_for_multi_stmt_prefetch(snapshot.as_mut(), sqls);
+        let keyspace = self.session.keyspace_context();
+        set_resource_group_tagger_for_multi_stmt_prefetch(snapshot.as_mut(), sqls, keyspace);
         let to_keys = |keys: &[Vec<u8>]| keys.iter().cloned().map(tidb_txnkv::Key::from_bytes).collect::<Vec<_>>();
         let idx_vals = snapshot
             .batch_get(&to_keys(&idx_keys))
@@ -125,7 +126,12 @@ impl ClusterServerSession<'_> {
 
 /// Go `setResourceGroupTaggerForMultiStmtPrefetch`: with Top SQL on, the
 /// prefetch's reads carry the whole query's SQL digest.
-fn set_resource_group_tagger_for_multi_stmt_prefetch(snapshot: &mut dyn ClusterSnapshot, sqls: &str) {
+/// `keyspace` is the session's (Go `keyspace.GetKeyspaceNameBytesBySettings()`).
+fn set_resource_group_tagger_for_multi_stmt_prefetch(
+    snapshot: &mut dyn ClusterSnapshot,
+    sqls: &str,
+    keyspace: std::sync::Arc<tidb_keyspace::KeyspaceContext>,
+) {
     if !tidb_topsql_state::top_profiling_enabled() {
         return;
     }
@@ -134,12 +140,11 @@ fn set_resource_group_tagger_for_multi_stmt_prefetch(snapshot: &mut dyn ClusterS
     if normalized.is_empty() {
         return;
     }
-    let keyspace_name = tidb_keyspace::get_keyspace_name_bytes_by_settings();
     let sql_digest = digest.as_bytes().to_vec();
     let context = tidb_txnkv::StatementKvContextCell::default();
     context.publish(tidb_txnkv::StatementKvContext {
         resource_group_tagger: Some(std::sync::Arc::new(move || {
-            let mut tagger = tidb_txnkv::ResourceGroupTagBuilder::new(keyspace_name);
+            let mut tagger = tidb_txnkv::ResourceGroupTagBuilder::new(keyspace.name_bytes());
             tagger.set_sql_digest(&sql_digest);
             tagger
         })),

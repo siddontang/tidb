@@ -24,6 +24,10 @@ impl Session {
 
 /// Go `ImportIntoExec`'s `sctx`.
 impl tidb_executor::import_into::ImportIntoSession for Session {
+    fn import_keyspace(&self) -> String {
+        self.keyspace_context().name().to_owned()
+    }
+
     fn import_identity(&self) -> Option<(String, String)> {
         Session::current_identity(self).map(|(user, host)| (user.to_owned(), host.to_owned()))
     }

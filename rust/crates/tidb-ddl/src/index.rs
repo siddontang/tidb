@@ -552,11 +552,19 @@ impl TaskKeyBuilder {
         }
         self
     }
-    /// Go `TaskKeyBuilder.Build`.
+    /// Go `TaskKeyBuilder.Build`, for the process's configured keyspace.
     pub fn build(&self, job_id: i64) -> String {
+        self.build_in_keyspace(&tidb_keyspace::get_keyspace_name_by_settings(), job_id)
+    }
+
+    /// Go `TaskKeyBuilder.Build` for a job of keyspace `keyspace`: the
+    /// keyspace of the DDL that runs it, which on a multi-keyspace node is
+    /// not the process's (`rust/docs/design/2026-11-24-multi-keyspace-server.md`,
+    /// §6.1).
+    pub fn build_in_keyspace(&self, keyspace: &str, job_id: i64) -> String {
         let mut labels = Vec::new();
         if tidb_config_kerneltype::is_next_gen() {
-            labels.push(tidb_keyspace::get_keyspace_name_by_settings());
+            labels.push(keyspace.to_owned());
         }
         labels.extend([
             "ddl".to_owned(),

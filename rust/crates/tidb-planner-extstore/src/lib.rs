@@ -50,6 +50,9 @@ pub fn set_global_ext_storage_for_test(storage: Option<ExtStorage>) {
 
 /// Go `createGlobalExtStorage`.
 fn create_global_ext_storage(ctx: &Context) -> Result<ExtStorage, String> {
+    // Process-level for now: the storage is one process singleton, namespaced
+    // by the configured keyspace until it moves into each keyspace runtime
+    // (multi-keyspace design §6.10, phase 3f).
     let keyspace_name = tidb_keyspace::get_keyspace_name_by_settings();
     let mut uri = tidb_vardef::CLOUD_STORAGE_URI.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     // When classic kernel or cloud storage URI is not set, use local directory.

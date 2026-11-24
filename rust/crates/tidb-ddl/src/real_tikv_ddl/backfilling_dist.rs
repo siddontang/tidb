@@ -2044,9 +2044,11 @@ pub(super) fn execute_dist_task<S: StoreClient>(
 ) -> Result<ReorgResult, ClusterDdlError> {
     let ctx = Context::background();
     let builder = crate::index::TaskKeyBuilder::new().set_merge_temp_index(reorg.merging);
+    // The task belongs to the keyspace of the store this DDL runs on.
+    let keyspace = opener.store().get_keyspace();
     let key = match &job.multi_schema_info {
-        Some(m) => builder.set_multi_schema(Some(&m.read())).build(job.id),
-        None => builder.build(job.id),
+        Some(m) => builder.set_multi_schema(Some(&m.read())).build_in_keyspace(keyspace, job.id),
+        None => builder.build_in_keyspace(keyspace, job.id),
     };
     let manager = tidb_dxf_storage::get_dxf_svc_task_mgr()
         .map_err(|e| ClusterDdlError::backfill(&e))?;

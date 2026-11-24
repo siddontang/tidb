@@ -53,10 +53,18 @@ pub fn should_use_async_prepare(plan: &Plan) -> bool {
         && plan.is_global_sort()
 }
 
-/// Go `TaskKey`.
+/// Go `TaskKey`, for the process's configured keyspace.
 #[must_use]
 pub fn task_key(job_id: i64) -> String {
     tidb_dxf_importinto_taskkey::for_job(job_id)
+}
+
+/// Go `TaskKey` for a job of keyspace `keyspace`: the job's session's
+/// keyspace, which on a multi-keyspace node is not the process's
+/// (`rust/docs/design/2026-11-24-multi-keyspace-server.md`, §6.1).
+#[must_use]
+pub fn task_key_in_keyspace(keyspace: &str, job_id: i64) -> String {
+    tidb_dxf_importinto_taskkey::for_job_in_keyspace(keyspace, job_id)
 }
 
 /// Go `doSubmitTask`: the job row, the table's import mode and the task,
@@ -90,8 +98,9 @@ fn do_submit_task(
     let mut job_id = 0;
     let mut task_id = 0;
     let mut failure: Option<Error> = None;
-    // Go `kv.IsUserKS(se.GetStore())`.
-    let keyspace = tidb_keyspace::get_keyspace_name_by_settings();
+    // Go `kv.IsUserKS(se.GetStore())`: the keyspace of the session that
+    // planned the import.
+    let keyspace = plan.keyspace.clone();
     let running_on_user_ks = tidb_txnkv::is_user_keyspace(kernel_type(), &keyspace);
     let in_job_txn = !tidb_config_kerneltype::is_next_gen() || tidb_txnkv::is_system_keyspace(kernel_type(), &keyspace);
     let submit = |se: &dyn tidb_dxf_storage::SessionContext, job_id: i64, logical: &mut LogicalPlan, manager: &tidb_dxf_storage::TaskManager| {
@@ -99,7 +108,7 @@ fn do_submit_task(
         let plan_ctx = tidb_dxf_planner::PlanCtx {
             ctx: ctx.clone(),
             session_ctx: Some(se),
-            task_key: task_key(job_id),
+            task_key: task_key_in_keyspace(&keyspace, job_id),
             task_type: tidb_dxf::IMPORT_INTO,
             thread_cnt: thread_cnt as isize,
             max_node_cnt: max_node_cnt as isize,
@@ -205,10 +214,10 @@ pub(crate) fn kernel_type() -> tidb_txnkv::KernelType {
 ///
 /// # Errors
 /// The task could not be cancelled, or the job changed meanwhile.
-pub fn cancel_and_wait_import_job(ctx: &Context, job_id: i64) -> Result<(), Error> {
+pub fn cancel_and_wait_import_job(ctx: &Context, keyspace: &str, job_id: i64) -> Result<(), Error> {
     let ctx = tidb_dxf_storage::with_internal_source_type(ctx, tidb_txnkv::INTERNAL_DIST_TASK);
     let manager = tidb_dxf_storage::get_dxf_svc_task_mgr().map_err(|e| Arc::new(e) as Error)?;
-    let key = task_key(job_id);
+    let key = task_key_in_keyspace(keyspace, job_id);
     match manager.get_task_base_by_key_with_history(&ctx, &key) {
         Ok(_) => {
             manager

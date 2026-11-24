@@ -462,6 +462,11 @@ impl Session {
 impl NodeConn {
     /// Go `session.GetStore().GetCodec().GetKeyspaceID`.
     pub(crate) fn keyspace_id(&self) -> u32 { self.transactions.keyspace_id() }
+    /// The keyspace identity of the domain this connection runs on, when its
+    /// runtime bound one (design §6.1).
+    pub(crate) fn keyspace_context(&self) -> Option<Arc<tidb_keyspace::KeyspaceContext>> {
+        self.domain.as_ref().and_then(|domain| domain.keyspace_context().cloned())
+    }
     /// Go `session.GetLatestInfoSchema`.
     pub(crate) fn latest_info_schema(&self) -> Arc<SessionExtendedInfoSchema> {self.catalog.get_latest()}
     /// Go `domain.GetDomain(sctx)`.

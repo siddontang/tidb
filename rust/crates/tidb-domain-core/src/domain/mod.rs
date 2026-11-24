@@ -638,6 +638,9 @@ pub type BindingHandleSlot =
 pub struct Domain {
     /// Go `Domain.store.GetKeyspace`: installed from the opened store.
     store_keyspace: std::sync::OnceLock<String>,
+    /// The keyspace this domain's runtime serves (design §6.1), when the
+    /// runtime bound one; see [`Self::keyspace_context`].
+    keyspace: std::sync::OnceLock<Arc<tidb_keyspace::KeyspaceContext>>,
     cross_ks_runtimes: std::sync::OnceLock<cross_ks::CrossKsRuntimes>,
     /// Go `Domain.unprefixedEtcdCli`: cluster-wide metadata client.
     unprefixed_etcd_client: std::sync::OnceLock<Arc<tidb_pd_client::EtcdClient>>,
@@ -1100,6 +1103,7 @@ impl Domain {
         ));
         Self {
             store_keyspace: std::sync::OnceLock::new(),
+            keyspace: std::sync::OnceLock::new(),
             cross_ks_runtimes: std::sync::OnceLock::new(),
             unprefixed_etcd_client: std::sync::OnceLock::new(),
             sys_session_opener,
@@ -1838,6 +1842,22 @@ impl Domain {
     /// Go `Domain.Store().GetKeyspace`; embedded API-V1 stores have no name.
     pub fn store_keyspace(&self) -> &str {
         self.store_keyspace.get().map_or("", String::as_str)
+    }
+
+    /// Binds the keyspace identity this domain's runtime serves, once,
+    /// before its sessions open.
+    pub fn install_keyspace_context(&self, keyspace: tidb_keyspace::KeyspaceContext) {
+        self.keyspace.set(Arc::new(keyspace)).expect("keyspace identity installed once");
+    }
+
+    /// The keyspace this domain's sessions and background work act for:
+    /// their slow-log and statement-summary keyspace, resource-group tags,
+    /// username policy and IMPORT INTO keys. `None` for a domain whose
+    /// runtime bound none (a test stack that names no keyspace); its readers
+    /// fall back to the process's configured keyspace
+    /// ([`tidb_keyspace::KeyspaceContext::unbound`]).
+    pub fn keyspace_context(&self) -> Option<&Arc<tidb_keyspace::KeyspaceContext>> {
+        self.keyspace.get()
     }
 
     /// Go `Domain.Init`: retains a handle without a keyspace namespace.

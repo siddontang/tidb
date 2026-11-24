@@ -1033,3 +1033,64 @@ fn starter_username_policy_in_simple_exec() {
     tidb_config_deploymode::set(original_mode).unwrap();
     restore_config();
 }
+
+/// A session bound to keyspace `ks_b` on a node whose configured keyspace is
+/// `ks_a` (`rust/docs/design/2026-11-24-multi-keyspace-server.md`, §6.1)
+/// validates new account names against `ks_b`'s prefix, with Go's Starter
+/// `ErrUserNameNeedPrefix`, and resolves unprefixed targets to `ks_b.`
+/// accounts.
+#[test]
+fn account_statements_use_the_session_keyspace_prefix() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // The starter deploy mode exists only in the nextgen kernel.
+        return;
+    }
+    let restore_config = tidb_config::config_tree::config::restore_func();
+    let original_mode = tidb_config_deploymode::get();
+    let store = crate::domain::mock_store::MockStoreDomain::create_for_keyspace("ks_b").unwrap();
+    tidb_config::config_tree::config::update_global(|config| {
+        config.keyspace_name = "ks_a".into();
+    });
+    tidb_config_deploymode::set(tidb_config_deploymode::Mode::Starter).unwrap();
+
+    let mut tk = store.new_session().unwrap();
+    assert_eq!(tk.keyspace_context().name(), "ks_b");
+    // Go `exeerrors.ErrUserNameNeedPrefix`: `mysql.ErrUsername` (1468).
+    let error = |session: &mut Session, sql: &str| {
+        let error = session.run(sql).expect_err(sql).to_mysql_error();
+        assert_eq!(error.code, 1468, "{sql}: {}", error.message);
+        error.message
+    };
+    let run = |session: &mut Session, sql: &str| {
+        session
+            .run(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    };
+
+    assert_eq!(
+        error(&mut tk, "create user `ks_a.x`@`%`"),
+        "User name must start with `ks_b.` (use `ks_b.ks_a.x` instead)"
+    );
+    assert_eq!(
+        error(&mut tk, "create user x@`%`"),
+        "User name must start with `ks_b.` (use `ks_b.x` instead)"
+    );
+    run(&mut tk, "create user `ks_b.x`@`%`");
+    assert_eq!(
+        row_text(tk.run("select User from mysql.user where User like 'ks_%'")),
+        [["ks_b.x"]]
+    );
+    assert_eq!(
+        error(&mut tk, "rename user `ks_b.x`@`%` to `ks_a.y`@`%`"),
+        "User name must start with `ks_b.` (use `ks_b.ks_a.y` instead)"
+    );
+    // An unprefixed target resolves to the session keyspace's account.
+    run(&mut tk, "alter user x@`%` identified by 'pwd'");
+    assert_eq!(
+        row_text(tk.run("select authentication_string from mysql.user where User='ks_b.x'")),
+        [[tidb_privilege::encode_password("pwd")]]
+    );
+
+    tidb_config_deploymode::set(original_mode).unwrap();
+    restore_config();
+}

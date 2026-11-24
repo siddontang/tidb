@@ -602,6 +602,8 @@ pub fn standby_probe(path: &str) -> Option<Response> {
 /// `keyspace` is not this node's.
 fn keyspace_validate(request: &Request<'_>) -> Option<Response> {
     let remote = request.query_get("keyspace");
+    // Process-level: a standby node is activated for exactly one keyspace,
+    // its configured one.
     let local = tidb_config::config_tree::config::get_global_keyspace_name();
     (remote != local).then(|| Response {
         status: 412,
@@ -731,6 +733,8 @@ fn load_tidb_normal_restart_info_and_remove() {
 
 /// Go `SaveTidbNormalRestartInfo`: saves tidb normal restart info to file.
 pub fn save_tidb_normal_restart_info(msg: &str) {
+    // Process-level: the restart record belongs to the process, which a
+    // standby controller activates for its configured keyspace.
     let keyspace_name = tidb_keyspace::get_keyspace_name_by_settings();
     if keyspace_name.is_empty() {
         return;

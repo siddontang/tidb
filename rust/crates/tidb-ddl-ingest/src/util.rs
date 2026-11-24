@@ -38,6 +38,8 @@ fn gen_key_exists_err(
     index: &tidb_model::IndexInfo,
     table: &tidb_model::TableInfo,
 ) -> Error {
+    // Process-level: whether keys carry a keyspace prefix. A multi-keyspace
+    // node serves named keyspaces only, so every tenant answers the same.
     if key.len() > 4
         && key[0] == b'x'
         && !tidb_config::config_tree::config::get_global_keyspace_name().is_empty()

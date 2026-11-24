@@ -1615,6 +1615,10 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
     let mut buffer = MutationBuffer::new();
     let mut schema_state = phase.schema_state.clone();
     schema_state.step_kv_context = Some(step_kv_context);
+    schema_state.keyspace = Some(std::sync::Arc::new(tidb_keyspace::KeyspaceContext::new(
+        opener.store().get_keyspace(),
+        None,
+    )));
     // Go `w.sess` for this step, kept until the step commits: the MDL row
     // below runs on it too.
     let mut step_sql: crate::job_txn::StepSqlSlot = Default::default();

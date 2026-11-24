@@ -59,6 +59,9 @@ pub trait AccountSession: crate::stmt_ctx_build::ResetContextOfStmt {
     fn lock_catalog(&self) -> Result<std::sync::MutexGuard<'_, crate::SessionExtendedInfoSchema>, DriverError>;
     /// The `RESOURCE_GROUP` user attribute after Go's resource-group checks.
     fn user_resource_group_attribute(&self, name: &str, is_role: bool) -> Result<String, DriverError>;
+    /// Go `keyspace.GetUsernamePolicy()` for the keyspace the session acts
+    /// for, which a multi-keyspace node does not share between its tenants.
+    fn username_policy(&self) -> tidb_keyspace::UsernamePolicy;
     /// Go `domain.GetDomain(e.Ctx()).NotifyUpdatePrivilege(users)` at the
     /// end of an account executor: the users whose privilege rows it
     /// changed, reloaded once its writes commit.
@@ -268,7 +271,7 @@ pub trait UserTableExec: AccountSession {
         name: &mut String,
         host: &str,
     ) -> Result<bool, DriverError> {
-        let policy = tidb_keyspace::get_username_policy();
+        let policy = self.username_policy();
         retry_username_variants(&policy, name, |user| self.user_exists(user, host))
     }
 

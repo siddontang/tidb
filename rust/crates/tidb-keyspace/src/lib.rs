@@ -25,7 +25,15 @@
 //! with the keyspace name; its observable contract is the field itself, which
 //! [`keyspace_name_log_field`] supplies for this workspace's logger
 //! composition.
+//!
+//! One process may serve several keyspaces
+//! (`rust/docs/design/2026-11-24-multi-keyspace-server.md`, §6.1), so the
+//! identity a statement or a job acts under is a [`KeyspaceContext`] owned by
+//! its keyspace's runtime. The `*_by_settings` readers stay for what is
+//! process-level by nature and are the runtime identity of a single-keyspace
+//! node.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use tidb_config::config_tree::config::get_global_keyspace_name;
@@ -170,14 +178,102 @@ pub enum UsernamePolicy {
 }
 
 /// Go `GetUsernamePolicy`: the prefix policy in Starter deployments, the
-/// permissive default otherwise.
+/// permissive default otherwise. This is the process's configured keyspace's
+/// policy; a statement or a login uses its keyspace's
+/// [`KeyspaceContext::username_policy`].
 pub fn get_username_policy() -> UsernamePolicy {
-    if deploymode::is_starter() {
+    username_policy_for(get_keyspace_name_by_settings())
+}
+
+/// Go `GetUsernamePolicy` for the keyspace `keyspace_name`. A node serving
+/// several keyspaces (design §6.1) applies the prefix policy too: each
+/// tenant's accounts carry its keyspace's prefix, as in Starter.
+fn username_policy_for(keyspace_name: String) -> UsernamePolicy {
+    if deploymode::is_starter() || is_multi_keyspace_mode() {
         UsernamePolicy::Prefix {
-            user_prefix: get_keyspace_name_by_settings(),
+            user_prefix: keyspace_name,
         }
     } else {
         UsernamePolicy::Default
+    }
+}
+
+/// Whether this process serves more than one keyspace.
+static MULTI_KEYSPACE_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Marks the process as serving more than one keyspace (design §5.3),
+/// before its first keyspace runtime opens.
+pub fn set_multi_keyspace_mode(enabled: bool) {
+    MULTI_KEYSPACE_MODE.store(enabled, Ordering::Release);
+}
+
+/// Whether this process serves more than one keyspace, so the process's
+/// configured keyspace is not every statement's keyspace.
+pub fn is_multi_keyspace_mode() -> bool {
+    MULTI_KEYSPACE_MODE.load(Ordering::Acquire)
+}
+
+/// The keyspace one runtime serves (design §5.2, §6.1): its name, its codec
+/// ID, the name bytes its requests' resource-group tags carry, and the
+/// username policy its account statements and logins apply. A session reads
+/// it from its domain, a background job from the runtime that runs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyspaceContext {
+    name: String,
+    id: Option<u32>,
+    /// Go `GetKeyspaceNameBytesBySettings` for this keyspace.
+    name_bytes: Option<Vec<u8>>,
+}
+
+impl KeyspaceContext {
+    /// The identity of keyspace `name`, whose store codec has keyspace ID
+    /// `id` (`None` for an API-v1 store).
+    pub fn new(name: impl Into<String>, id: Option<u32>) -> Self {
+        let name = name.into();
+        // Go's once-guard stores nothing on a classic kernel.
+        let name_bytes = kerneltype::is_next_gen().then(|| name.clone().into_bytes());
+        Self { name, id, name_bytes }
+    }
+
+    /// The process's configured keyspace (Go `GetKeyspaceNameBySettings`):
+    /// the identity of a single-keyspace node.
+    pub fn from_settings() -> Self {
+        Self::new(get_keyspace_name_by_settings(), None)
+    }
+
+    /// What a tenant-level path reads when its session or job carries no
+    /// runtime identity (a session with no domain, a test stack that names
+    /// no keyspace): the process's configured keyspace, which is the only
+    /// keyspace of a single-keyspace node. On a node serving several
+    /// keyspaces every runtime binds its own identity, so reaching this
+    /// there is a bug.
+    pub fn unbound() -> Self {
+        debug_assert!(
+            !is_multi_keyspace_mode(),
+            "a tenant-level path read the process keyspace on a multi-keyspace node"
+        );
+        Self::from_settings()
+    }
+
+    /// Go `GetKeyspaceNameBySettings` for this keyspace.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Go `GetCodec().GetKeyspaceID()`, when the runtime's store has one.
+    pub fn id(&self) -> Option<u32> {
+        self.id
+    }
+
+    /// Go `GetKeyspaceNameBytesBySettings` for this keyspace: `None` on a
+    /// classic kernel.
+    pub fn name_bytes(&self) -> Option<&[u8]> {
+        self.name_bytes.as_deref()
+    }
+
+    /// Go `GetUsernamePolicy` for this keyspace.
+    pub fn username_policy(&self) -> UsernamePolicy {
+        username_policy_for(self.name.clone())
     }
 }
 

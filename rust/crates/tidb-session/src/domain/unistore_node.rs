@@ -831,6 +831,18 @@ pub fn unistore_cluster_session_stack_from_for_keyspace(
         None => factory,
     };
     factory.install_store_keyspace(opener.store().get_keyspace().to_owned());
+    // The keyspace this runtime serves (design §6.1). A test stack whose node
+    // config names none follows the process's configured keyspace, as Go's
+    // testkit does (`testenv.UpdateConfigForNextgen`).
+    if !config.global_config.keyspace_name.is_empty() {
+        let store = opener.store();
+        let id = (!tidb_keyspace::KeyspaceCodec::is_api_v1(store))
+            .then(|| tidb_keyspace::KeyspaceCodec::keyspace_id(store));
+        factory.install_keyspace_context(tidb_keyspace::KeyspaceContext::new(
+            config.global_config.keyspace_name.clone(),
+            id,
+        ));
+    }
     let factory = factory.shared();
     // Go `initResourceGroupsController`'s runaway manager over unistore's
     // mock PD client; `Domain.Start` runs its loops.
