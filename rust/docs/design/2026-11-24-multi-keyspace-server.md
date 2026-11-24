@@ -705,10 +705,16 @@ pressure, most idle first; `preload` tenants are never frozen.
   Record the peak memory while writing the snapshot (it must not need a second
   copy of the state), the tenant-tracked bytes left after each freeze, process
   RSS, and B's query latency. RSS alone can stay flat when the allocator
-  reuses pages, so the tracked bytes are the pass criterion.
+  reuses pages. Both outcomes are required in every cycle: A's tracker root
+  reaches zero, **and** B allocates the released budget and completes its
+  queries under the same process limit. The second catches memory the tracker
+  missed.
 - **Thaw matches a fresh node.** While A is frozen, revoke a grant, drop a
   user and run DDL on A from another node. After thaw, the first login and the
-  first query must behave exactly as on a freshly started node.
+  first query must behave exactly as on a freshly started node. The test
+  also asserts that thaw **replayed** the schema diffs from the snapshot's
+  version N (a metric or log counter), since a cold open would return the same
+  query result.
 - **Wrong or broken snapshots fall back.** Another tenant's snapshot, one from
   before a restore, a corrupt one and an interrupted upload each give a cold
   open with correct results.
