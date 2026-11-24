@@ -1,6 +1,6 @@
 # Multi-keyspace tidb-server: one process, many tenants
 
-- Status: **Draft for review, revision 6**: session migration through the Rust TiProxy (§5.6, §5.7); addresses the reviews of `42b666f`, `7cbdef8ad3` and `08d9476bfc`. No code has been written yet.
+- Status: **Draft for review, revision 8**: tenant hibernation (§5.8), revised after review; session migration through the Rust TiProxy (§5.6, §5.7); addresses the reviews of `42b666f`, `7cbdef8ad3` and `08d9476bfc`. Implementation in progress on `multi-keyspace`; §5.9 records the per-tenant data model of the code.
 - Scope: the Rust SQL node (`rust/crates/tidb-server`), Next Generation kernel (`--features nextgen`) only.
 - Branch base: `hparser-integration` @ `73a0893eff`.
 
@@ -606,7 +606,126 @@ shared deployment behind TiProxy. **Decision (siddontang, 2026-11-24):** they li
 branch of a `siddontang/tiproxy` fork, based on `pingcap/tiproxy` `rust`. They
 do not block TiDB Phases 1–3g.
 
-### 5.8 Per-tenant data model
+### 5.8 Tenant hibernation (freeze and thaw)
+
+**Decision (siddontang, 2026-11-24):** add hibernation as Phase 4b, after
+Phase 4.
+
+Everything a tenant uses inside the process should belong to that tenant and
+be accountable to it. Then a cold tenant can be **frozen**: its warm state is
+written out, and its memory goes back to the process. A frozen tenant is
+**thawed** on its next connection, without the slow rebuild a fresh open does
+today. This is scale-to-zero per tenant inside a shared process. Starter does
+it today with one process per tenant and a standby pool.
+
+**What a tenant owns.** After Phase 3, all per-tenant state lives in its
+`KeyspaceRuntime` (§5.2). It falls into three kinds:
+
+| Kind | Examples | On freeze |
+| --- | --- | --- |
+| Rebuildable caches | infoschema, stats, plan cache, privileges, bindings, global sysvars, region and TSO caches | Snapshot the expensive ones; drop the rest |
+| Connections to the cluster | PD client, TiKV channels, etcd client, owner campaigns, background loops | Close, resigning owner roles first (§5.3) |
+| Live sessions | client connections, transactions, prepared statements | Migrate through TiProxy (§5.6), or wait for them to end |
+
+Storage (CSE) is the source of truth, so nothing in the first two rows needs a
+snapshot for correctness. The snapshot only makes thaw fast.
+
+**Memory isolation.**
+- Each runtime gets its own memory-tracker root under the process
+  `MemArbitrator`, with a per-tenant quota. Quota pressure on one tenant then
+  cancels or spills that tenant's statements, not another tenant's.
+- **v1 frees memory by ownership, not by arena.** Freeze joins the tenant's
+  background tasks and drops the runtime normally. The tracker root must reach
+  zero tracked bytes; anything left is a leak the tests report.
+- **Per-tenant jemalloc arenas are not in v1.** On the shared Tokio runtime,
+  tenant A's task can suspend and tenant B's run on the same worker thread, so
+  a thread-level arena would put B's allocations in A's arena. jemalloc also
+  needs every participating thread cache flushed before
+  [`arena.<i>.destroy`](https://jemalloc.net/jemalloc.3.html#arena.i.destroy).
+  Arenas stay a later option, only if a test can show that no worker thread,
+  thread cache or surviving reference can still touch the arena.
+
+**One eviction decision.** The registry has a single idle path, replacing
+§5.3's separate idle close and freeze timers. When a Ready runtime has had no
+pins for `idle-timeout`, or the process is under memory pressure, the registry
+decides once: **freeze** when hibernation is enabled and a snapshot is
+allowed, otherwise **close** as in §5.3.
+
+**Freeze:**
+1. Move the runtime to Draining. New connections wait for thaw.
+2. Migrate or wait out live sessions (§5.6). Skip the freeze while the tenant
+   owns unfinished DDL, DXF or TTL work and this node may be its last serving
+   node (§5.3).
+3. **Bounded drain.** If sessions cannot be migrated or a job keeps its pin
+   past `freeze-drain-timeout` (default 30s), cancel the freeze: return to
+   Ready and wake the waiting connections. A pressure-triggered freeze then
+   tries the next tenant.
+4. Write the snapshot (below) to a temporary object, then publish it
+   atomically by rename (local disk) or by writing the manifest last (object
+   storage). A tenant that hits a snapshot I/O error after a successful drain
+   is closed normally; its next open is a cold open.
+5. Retire and release the runtime (§5.2) and check that its tracker root is
+   at zero.
+
+**What the snapshot holds, and what it does not.** v1 snapshots only the
+schema cache (the infoschema at schema version N) and the stats already
+loaded. Accounts, grants, global sysvars and bindings are **not** taken from
+the snapshot: a user or grant can be dropped while the tenant is frozen, and a
+read timestamp alone cannot tell thaw which rows disappeared. They are always
+loaded from the live keyspace on thaw, before the runtime becomes Ready. The
+full privilege reload already does this
+(`rust/crates/tidb-privilege/src/handle.rs:118`).
+
+**Manifest binding.** The snapshot's manifest records the PD cluster ID, the
+immutable keyspace ID, the keyspace's storage generation (a value that changes
+when the keyspace is restored, for example from BR), the binary version, the
+schema version N and a checksum. A valid checksum alone would also accept
+another tenant's perfectly valid image. Thaw checks every field against the
+live store before seeding any cache. Any mismatch, a missing manifest or an
+interrupted upload gives a normal cold open.
+
+**Thaw**, on the first connection or an explicit preload:
+1. Verify the manifest (above).
+2. Load accounts, grants, global sysvars and bindings from the keyspace.
+3. Seed the schema cache from the snapshot only if every schema diff from N to
+   the current version is still available; apply them through the normal
+   schema-sync path. Otherwise reload the schema in full. Seed stats, then
+   refresh those changed after the snapshot as the stats loop normally does.
+4. Mark the runtime Ready and wake waiting connections.
+
+Correctness never depends on the snapshot: every failure path is a cold open.
+
+**Policy.** Tenants move between hot (open), warm (frozen to local disk) and
+cold (frozen to object storage). Eviction is by idle time and by memory
+pressure, most idle first; `preload` tenants are never frozen.
+
+**Tests.**
+- **Can tenant B use A's memory?** Under a fixed process memory limit: warm
+  tenant A, freeze it, then have tenant B allocate the released budget and
+  keep serving queries. Repeat with A and B alternating over many cycles.
+  Record the peak memory while writing the snapshot (it must not need a second
+  copy of the state), the tenant-tracked bytes left after each freeze, process
+  RSS, and B's query latency. RSS alone can stay flat when the allocator
+  reuses pages. Both outcomes are required in every cycle: A's tracker root
+  reaches zero, **and** B allocates the released budget and completes its
+  queries under the same process limit. The second catches memory the tracker
+  missed.
+- **Thaw matches a fresh node.** While A is frozen, revoke a grant, drop a
+  user and run DDL on A from another node. After thaw, the first login and the
+  first query must behave exactly as on a freshly started node. The test
+  also asserts that thaw **replayed** the schema diffs from the snapshot's
+  version N (a metric or log counter), since a cold open would return the same
+  query result.
+- **Wrong or broken snapshots fall back.** Another tenant's snapshot, one from
+  before a restore, a corrupt one and an interrupted upload each give a cold
+  open with correct results.
+- **Bounded drain.** A pressure-triggered freeze with an unmigratable session
+  is cancelled after `freeze-drain-timeout` and the tenant keeps serving.
+- First-query latency after thaw versus a cold open, for 10, 100 and 1000
+  tables.
+- A session migrated away during freeze keeps working (§9 harness).
+
+### 5.9 Per-tenant data model
 
 This section lists what each tenant's state is, where it lives, who changes
 it, and whether it is isolated today. It was checked against the code at
@@ -644,12 +763,12 @@ operator listener exists, Op means node config.
 | AutoID service (`AUTO_ID_CACHE=1`) | P | — | Shared: only the configured runtime serves it, bound to one keyspace. Refused in multi-keyspace mode. | `keyspace_registry.rs`; `tidb-autoid-service/src/lib.rs:354` | 3f |
 | Sequences | TS + RT | SQL | Isolated. | — | — |
 | Resource groups | PD (per keyspace) | SQL | Shared: the resource-manager client static belongs to the last-opened runtime. Resource-group DDL is refused in multi-keyspace mode. `DEFAULT_RESOURCE_GROUP` is a process static. | `cluster_stack.rs:126`; `tidb-domain-infosync/src/resource_manager_client.rs:147`; `tidb-meta/src/transaction.rs:59` | 3b, 3d |
-| Placement, label rules, TiFlash replicas, PD HTTP | PD | SQL | Shared: the last-opened runtime's clients win. Refused in multi-keyspace mode. Placement group IDs (`TiDB_DDL_<id>`) carry no keyspace, so table IDs collide in PD. | `cluster_stack.rs:1043`; `tidb-ddl-label/src/lib.rs:289`; `tidb-placement/src/bundle.rs:49` | 3b, including the group ID namespace |
+| Placement, label rules, TiFlash replicas, PD HTTP | PD | SQL | Shared: the last-opened runtime's clients win. Refused in multi-keyspace mode: the statements that ask for it, and any DDL job step whose resolved metadata would put placement bundles (a TRUNCATE or partition change of a table created with placement before); a step past its cancel point finishes without the PD write. The TiFlash poller and GC's rule cleanup are off. Label rule IDs carry the keyspace, so label steps of other DDL still run. Placement group IDs (`TiDB_DDL_<id>`) carry no keyspace, so table IDs collide in PD. | `cluster_stack.rs:1043`; `tidb-ddl-label/src/lib.rs:289`; `tidb-placement/src/bundle.rs:49` | 3b, including the group ID namespace |
 | DXF tables and task managers | SYSTEM storage (nextgen) | — | User runtimes skip the DXF loop, but `TASK_MANAGER_INSTANCE` and `DXF_SVC_TASK_MGR` belong to the last-opened runtime. | `tidb-domain-core/src/domain/dist_task.rs:145`; `tidb-dxf-storage/src/lib.rs:300,304` | 3f (§6.10) |
 | TTL jobs and timers | TS + RT | SQL | Isolated: job manager per domain; delete rate per keyspace. | `tidb-ttl-ttlworker/src/del.rs:118` | — |
 | MV service, workload repository, runaway, RU writer, telemetry | RT | — | Isolated per domain. | `keyspace_runtime.rs` | — |
 | IMPORT INTO, BR, PLAN REPLAYER, external storage | P | — | Shared; refused in multi-keyspace mode. Each runtime open overwrites the import store, BRIE node and cluster ID. | `keyspace_runtime.rs:100`; `tidb-executor/src/builder.rs`; `tidb-executor/src/admin.rs` | 3f |
-| INFORMATION_SCHEMA, PERFORMANCE_SCHEMA, SYS | RT | — | Isolated (only table definitions are static). | `tidb-infoschema/src/lib.rs:2266` | — |
+| INFORMATION_SCHEMA, PERFORMANCE_SCHEMA, SYS | RT + P | — | Table definitions and catalog rows are per runtime. Diagnostic rows still come from process-wide providers: the processlist's connection IDs (§6.6) and the statement summary, `slow_query`, deadlock, transaction-summary and `CLUSTER_*` tables (§6.8). | `tidb-infoschema/src/lib.rs:2266` | 3e, Phase 2 (§6.6) |
 | METRICS_SCHEMA | P | — | Shared: `PROMETHEUS_STATE` belongs to the last-opened runtime, and metrics carry no keyspace label. | `tidb-domain-infosync/src/prometheus_addr.rs:86` | 3b, 3e |
 | Instance plan cache, stats, binding and schema caches | RT | Cfg (limits) | Isolated, but each runtime gets the full process quota, so memory grows with the number of tenants. | `tidb-session/src/domain/cluster_session_node/node_services.rs:37` | Phase 5 |
 | Statement summary v1 and v2 | P | — | Shared. | `tidb-stmtsummary/src/statement_summary.rs:46`; `v2/stmtsummary.rs:138` | 3e |
@@ -658,7 +777,7 @@ operator listener exists, Op means node config.
 | Top SQL | P | — | Shared: the reporter binds one keyspace. | `tidb-topsql/src/lib.rs:45` | 3e |
 | `SHOW STATUS` providers | P | — | Shared: one process list (`STATISTICS_LIST`); each domain and GC worker registers into it, and a later provider wins on name. | `tidb-variable/src/statusvar.rs:50`; `tidb-gcworker/src/gc_worker.rs:314` | 3e (§6.8) |
 | Processlist, `KILL`, connection IDs | RT + P | — | Processlist per domain. Connection IDs come from the configured runtime's allocator, while each runtime leases its own server ID. | `tidb-server/src/sql_node.rs:747`; `cluster_stack.rs:851` | Phase 2 (§6.6) |
-| Expensive-query watchdog | RT | — | Isolated: each runtime runs its own over its own processes and settings. | `keyspace_registry.rs` (`start_expensive_query_watchdog`) | — |
+| Expensive-query watchdog | RT + P | — | Each runtime runs its own over its own processes and settings, but it recognizes auto-analyze sessions through the process-wide `GLOBAL_AUTO_ANALYZE_PROCESS_LIST`, keyed by connection IDs that can collide across runtimes (§6.6), so a tenant's session can be taken for another tenant's auto-analyze. | `keyspace_registry.rs` (`start_expensive_query_watchdog`); `tidb-stats-handle-util/src/auto_analyze_proc_id_generator.rs:101` | 3d, Phase 2 (§6.6) |
 | `max_prepared_stmt_count` counter | P | — | Shared: one process counter checked against each tenant's own limit. | `tidb-variable/src/vars.rs:1024` | Phase 4 |
 | Server info, topology | Tenant etcd | — | Isolated per runtime; the process record for TiProxy is missing. | `cluster_stack.rs:840` | 3h |
 | Keyspace identity, resource tags | RT | — | Mostly isolated. A few readers still use the configured keyspace name. | `tidb-ddl-ingest/src/util.rs:45`; `tidb-planner/src/plan_builder/stmt_build.rs:51`; `tidb-planner-extstore/src/lib.rs:56`; `tidb-server/src/http_status.rs` | 3a |
@@ -1328,8 +1447,9 @@ in parallel once Phase 1 lands.
 | **3f** | Status port multiplexing + AutoID service map + per-store globals, including the DXF task managers (§6.9, §6.10) | AUTO_ID_CACHE=1 tables in two tenants; IMPORT INTO per tenant |
 | **3g** | Session migration (§5.6): keyspace-bound session tokens, token logins through routing, tenant-scoped `SET SESSION_STATES`, parity check of the ported session-states code in multi-keyspace mode | §5.6 migration tests, including cross-tenant token replay rejection |
 | **3h. TiProxy** (pingcap/tiproxy `rust`) | K1–K6 (§5.7): multi-keyspace backends, username-prefix routing, migration guard and metering by session keyspace, per-keyspace drain, keyspace-compatible balancing | TiProxy unit tests plus the §5.6 migration tests through `tiproxy-rs --standalone` |
-| **4. Lifecycle** | Idle close, PD state watch and drain (using proxy session migration when present, §5.6), per-tenant `max_connections` and prepared-statement count (`PREPARED_STMT_COUNT`, §5.8), optional prefix alias (Q1) | Lifecycle tests; leak check that repeated open/close does not grow memory or file descriptors |
-| **5. Hardening** | Full isolation suite; footprint benchmark N=1/10/50; per-tenant memory quota; a per-runtime share of the process cache quotas (plan, stats, binding, schema caches, §5.8); docs | The isolation suite is the bar for calling the mode tenant-isolated |
+| **4. Lifecycle** | Idle close, PD state watch and drain (using proxy session migration when present, §5.6), per-tenant `max_connections` and prepared-statement count (`PREPARED_STMT_COUNT`, §5.9), optional prefix alias (Q1) | Lifecycle tests; leak check that repeated open/close does not grow memory or file descriptors |
+| **4b. Hibernation** | Per-tenant memory roots and quotas (no arenas in v1); one eviction decision (freeze or close) with a bounded drain; freeze with an atomically published, tenant-bound snapshot of schema and stats; thaw that always reloads accounts, grants, sysvars and bindings; hot/warm/cold policy (§5.8) | §5.8 tests: tenant B reuses A's released budget over repeated cycles; thaw matches a fresh node after a remote revoke and DDL; every bad snapshot falls back to a cold open |
+| **5. Hardening** | Full isolation suite; footprint benchmark N=1/10/50; per-tenant memory quota; a per-runtime share of the process cache quotas (plan, stats, binding, schema caches, §5.9); docs | The isolation suite is the bar for calling the mode tenant-isolated |
 
 Phase 2 may be developed alongside Phase 3.
 
