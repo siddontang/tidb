@@ -110,8 +110,11 @@ pub trait DelRateLimiter: Send + Sync {
     fn wait_del_token(&self, ctx: &Context) -> Result<()>;
 }
 
-/// Go `defaultDelRateLimiter`.
+/// Go `defaultDelRateLimiter`, over one keyspace's
+/// `tidb_ttl_delete_rate_limit`.
 pub struct DefaultDelRateLimiter {
+    /// The keyspace's vardef values (design §6.3).
+    vardef: std::sync::Arc<tidb_vardef::VardefSnapshot>,
     /// Go `limiter`; its limit ranges over `[1.0, +Inf]`, `+Inf` when
     /// `tidb_ttl_delete_rate_limit` is `0`.
     limiter: Mutex<RateLimiter>,
@@ -122,19 +125,27 @@ pub struct DefaultDelRateLimiter {
 
 /// Go `newDelRateLimiter`.
 pub fn new_del_rate_limiter() -> DefaultDelRateLimiter {
+    new_del_rate_limiter_for(tidb_vardef::snapshot::process())
+}
+
+/// Go `newDelRateLimiter` for the keyspace whose vardef values are `vardef`.
+pub fn new_del_rate_limiter_for(vardef: std::sync::Arc<tidb_vardef::VardefSnapshot>) -> DefaultDelRateLimiter {
     DefaultDelRateLimiter {
+        vardef,
         limiter: Mutex::new(RateLimiter::new()),
         limit: AtomicI64::new(0),
     }
 }
 
-/// Go `globalDelRateLimiter`.
-pub static GLOBAL_DEL_RATE_LIMITER: LazyLock<DefaultDelRateLimiter> = LazyLock::new(new_del_rate_limiter);
+/// Go `globalDelRateLimiter`: the process statics' limiter, which a pool
+/// without a keyspace of its own shares (see `SessionPool::del_rate_limiter`).
+pub static GLOBAL_DEL_RATE_LIMITER: LazyLock<std::sync::Arc<DefaultDelRateLimiter>> =
+    LazyLock::new(|| std::sync::Arc::new(new_del_rate_limiter()));
 
 impl DelRateLimiter for DefaultDelRateLimiter {
     fn wait_del_token(&self, ctx: &Context) -> Result<()> {
         let mut limit = self.limit.load(Ordering::SeqCst);
-        if tidb_vardef::TTL_DELETE_RATE_LIMIT.load(Ordering::SeqCst) != limit {
+        if self.vardef.ttl_delete_rate_limit().load(Ordering::SeqCst) != limit {
             limit = self.reset();
         }
 
@@ -162,7 +173,7 @@ impl DefaultDelRateLimiter {
     /// Go `reset`.
     fn reset(&self) -> i64 {
         let mut limiter = self.limiter.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let new_limit = tidb_vardef::TTL_DELETE_RATE_LIMIT.load(Ordering::SeqCst);
+        let new_limit = self.vardef.ttl_delete_rate_limit().load(Ordering::SeqCst);
         if new_limit != self.limit.load(Ordering::SeqCst) {
             self.limit.store(new_limit, Ordering::SeqCst);
             // When `TTLDeleteRateLimit > 0`, use the setting as the rate limit.
@@ -217,7 +228,7 @@ impl TtlDeleteTask {
         let mut left_rows: &[Vec<Datum>] = &self.rows;
         let se = new_table_session(raw_se, &self.tbl, &self.expire);
         while !left_rows.is_empty() && ctx.err().is_none() {
-            let max_batch = tidb_vardef::TTL_DELETE_BATCH_SIZE.load(Ordering::SeqCst);
+            let max_batch = raw_se.get_session_vars().vardef().ttl_delete_batch_size().load(Ordering::SeqCst);
             let del_batch;
             if (left_rows.len() as i64) < max_batch {
                 del_batch = left_rows;
@@ -446,8 +457,9 @@ fn delete_worker_loop(
     let tracer = Some(&tracer);
     tracer.enter_phase(PHASE_OTHER);
     let mut retry_buffer = new_ttl_del_retry_buffer();
+    let limiter = sess_pool.del_rate_limiter();
     let result = with_session(sess_pool, &mut |se| {
-        loop_with_session(base, tracer, del_ch, &mut retry_buffer, &*GLOBAL_DEL_RATE_LIMITER, se)
+        loop_with_session(base, tracer, del_ch, &mut retry_buffer, limiter.as_ref(), se)
     });
     tracer.end_phase();
     bg_logger().info("ttlDeleteWorker loop exited.", &[]);

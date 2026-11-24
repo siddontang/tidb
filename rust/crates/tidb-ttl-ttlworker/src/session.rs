@@ -36,12 +36,47 @@ pub trait SessionPool: Send + Sync {
     /// Go `withSession(pool, fn)`: a pooled session, prepared for TTL work
     /// and restored afterwards.
     fn with_session(&self, f: &mut dyn FnMut(&Session) -> Result<()>) -> Result<()>;
+
+    /// The pool's keyspace's values of the vardef global statics (Go
+    /// `vardef.TTL*`), which a multi-keyspace node keeps per keyspace
+    /// (design §6.3).
+    fn vardef(&self) -> Arc<tidb_vardef::VardefSnapshot> {
+        tidb_vardef::snapshot::process()
+    }
+
+    /// Go `globalDelRateLimiter`: the delete rate limiter the keyspace's
+    /// delete workers share.
+    fn del_rate_limiter(&self) -> Arc<dyn crate::del::DelRateLimiter> {
+        Arc::clone(&crate::del::GLOBAL_DEL_RATE_LIMITER) as Arc<dyn crate::del::DelRateLimiter>
+    }
 }
 
-/// A `syssession.Pool` of [`SysSessionContext`]s.
-pub struct SysSessionPool<C: SysSessionContext + ?Sized + 'static>(pub Arc<dyn tidb_syssession::Pool<C>>);
+/// A `syssession.Pool` of [`SysSessionContext`]s, with its keyspace's vardef
+/// values and the delete rate limiter they set.
+pub struct SysSessionPool<C: SysSessionContext + ?Sized + 'static>(
+    pub Arc<dyn tidb_syssession::Pool<C>>,
+    pub Arc<tidb_vardef::VardefSnapshot>,
+    pub Arc<crate::del::DefaultDelRateLimiter>,
+);
+
+impl<C: SysSessionContext + ?Sized + 'static> SysSessionPool<C> {
+    /// The pool over `pool` for the keyspace whose vardef values are
+    /// `vardef`.
+    pub fn new(pool: Arc<dyn tidb_syssession::Pool<C>>, vardef: Arc<tidb_vardef::VardefSnapshot>) -> Self {
+        let limiter = Arc::new(crate::del::new_del_rate_limiter_for(Arc::clone(&vardef)));
+        Self(pool, vardef, limiter)
+    }
+}
 
 impl<C: SysSessionContext + ?Sized + 'static> SessionPool for SysSessionPool<C> {
+    fn vardef(&self) -> Arc<tidb_vardef::VardefSnapshot> {
+        Arc::clone(&self.1)
+    }
+
+    fn del_rate_limiter(&self) -> Arc<dyn crate::del::DelRateLimiter> {
+        Arc::clone(&self.2) as Arc<dyn crate::del::DelRateLimiter>
+    }
+
     fn with_session(&self, f: &mut dyn FnMut(&Session) -> Result<()>) -> Result<()> {
         let mut outcome: Result<()> = Ok(());
         let pooled = self.0.with_session(&mut |s: &tidb_syssession::Session<C>| {
@@ -262,7 +297,7 @@ impl TableSession<'_> {
         sql: &str,
     ) -> (Vec<Row>, bool, Option<String>) {
         tracer.enter_phase(PHASE_OTHER);
-        if !tidb_vardef::ENABLE_TTL_JOB.load(std::sync::atomic::Ordering::SeqCst) {
+        if !self.session.get_session_vars().vardef().enable_ttl_job().load(std::sync::atomic::Ordering::SeqCst) {
             return (Vec::new(), false, Some("global TTL job is disabled".to_owned()));
         }
 

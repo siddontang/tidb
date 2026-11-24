@@ -303,9 +303,10 @@ pub fn find_task_with_id<'a>(
         .find(|task| task.scan_id() == scan_id && task.job_id() == job_id)
 }
 
-/// Go `getMaxRunningTasksLimit`.
-pub fn get_max_running_tasks_limit(store: &Store) -> i64 {
-    let ttl_running_task = tidb_vardef::TTL_RUNNING_TASKS.load(Ordering::SeqCst);
+/// Go `getMaxRunningTasksLimit`, with the keyspace's `tidb_ttl_running_tasks`
+/// in `vardef`.
+pub fn get_max_running_tasks_limit(vardef: &tidb_vardef::VardefSnapshot, store: &Store) -> i64 {
+    let ttl_running_task = vardef.ttl_running_tasks().load(Ordering::SeqCst);
     if ttl_running_task != -1 {
         return i64::from(ttl_running_task);
     }
@@ -370,10 +371,11 @@ impl TaskManager {
 
     /// Go `resizeWorkersWithSysVar`.
     pub fn resize_workers_with_sys_var(&mut self) {
-        if let Err(err) = self.resize_scan_workers(tidb_vardef::TTL_SCAN_WORKER_COUNT.load(Ordering::SeqCst) as usize) {
+        let vardef = self.sess_pool.vardef();
+        if let Err(err) = self.resize_scan_workers(vardef.ttl_scan_worker_count().load(Ordering::SeqCst) as usize) {
             self.logger.warn("fail to resize scan workers", &[field("error", err)]);
         }
-        if let Err(err) = self.resize_del_workers(tidb_vardef::TTL_DELETE_WORKER_COUNT.load(Ordering::SeqCst) as usize) {
+        if let Err(err) = self.resize_del_workers(vardef.ttl_delete_worker_count().load(Ordering::SeqCst) as usize) {
             self.logger.warn("fail to resize delete workers", &[field("error", err)]);
         }
     }
@@ -918,7 +920,7 @@ impl TaskManager {
             // always return true for already running task because it is already included in count
             return true;
         }
-        get_max_running_tasks_limit(&self.store) > count
+        get_max_running_tasks_limit(&self.sess_pool.vardef(), &self.store) > count
     }
 }
 

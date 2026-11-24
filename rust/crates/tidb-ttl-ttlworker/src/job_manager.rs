@@ -299,14 +299,18 @@ impl tidb_owner::Listener for TtlOwnerListener {
 
 impl JobManager {
     /// Go `NewJobManager` without options.
+    ///
+    /// `vardef` holds the keyspace's TTL settings (design §6.3): the
+    /// keyspace's domain's (`Domain::vardef`).
     pub fn new<C: SysSessionContext + ?Sized + 'static>(
         id: &str,
         sess_pool: Arc<dyn tidb_syssession::Pool<C>>,
         store: Store,
         etcd_cli: Option<Arc<EtcdClient>>,
         leader_func: Box<dyn Fn() -> bool + Send + Sync>,
+        vardef: Arc<tidb_vardef::VardefSnapshot>,
     ) -> Arc<Self> {
-        Self::new_with_external_workload_manager(id, sess_pool, store, etcd_cli, leader_func, None)
+        Self::new_with_external_workload_manager(id, sess_pool, store, etcd_cli, leader_func, None, vardef)
     }
 
     /// Go `NewJobManager(..., WithExternalWorkloadManager(extWorkloadMgr))`:
@@ -319,6 +323,7 @@ impl JobManager {
         etcd_cli: Option<Arc<EtcdClient>>,
         leader_func: Box<dyn Fn() -> bool + Send + Sync>,
         ext_workload: Option<Arc<dyn tidb_extworkload::Manager>>,
+        vardef: Arc<tidb_vardef::VardefSnapshot>,
     ) -> Arc<Self> {
         let base = BaseWorker::new(());
         let mut logger = bg_logger().with_fields(&[field("ttl-worker", "job-manager")]);
@@ -332,7 +337,7 @@ impl JobManager {
             None => (new_mock_command_client(), new_mock_notification_client()),
         };
 
-        let ttl_pool: Arc<dyn SessionPool> = Arc::new(SysSessionPool(Arc::clone(&sess_pool)));
+        let ttl_pool: Arc<dyn SessionPool> = Arc::new(SysSessionPool::new(Arc::clone(&sess_pool), vardef));
         let info_schema_cache = Arc::new(Mutex::new(InfoSchemaCache::new(get_update_info_schema_cache_interval())));
         let task_manager = new_task_manager(
             &base.ctx,
@@ -720,12 +725,13 @@ impl JobManagerState {
             }
         };
 
-        if !tidb_vardef::ENABLE_TTL_JOB.load(Ordering::SeqCst) {
+        let vardef = self.sess_pool.vardef();
+        if !vardef.enable_ttl_job().load(Ordering::SeqCst) {
             response_err("tidb_ttl_job_enable is disabled".to_owned());
             return;
         }
 
-        if !within_ttl_job_schedule_window(&session_now(se)) {
+        if !within_ttl_job_schedule_window(&vardef, &session_now(se)) {
             response_err("not in TTL job window".to_owned());
             return;
         }
@@ -1031,9 +1037,10 @@ impl JobManagerState {
             }
         }
 
-        let cancel_reason = if !tidb_vardef::ENABLE_TTL_JOB.load(Ordering::SeqCst) {
+        let vardef = self.sess_pool.vardef();
+        let cancel_reason = if !vardef.enable_ttl_job().load(Ordering::SeqCst) {
             Some("tidb_ttl_job_enable turned off")
-        } else if !within_ttl_job_schedule_window(now) {
+        } else if !within_ttl_job_schedule_window(&vardef, now) {
             Some("out of TTL job schedule window")
         } else {
             None
@@ -1646,7 +1653,7 @@ impl ManagerJobAdapter {
         };
 
         let cnt = row.get_int64(0);
-        let tasks_limit = get_max_running_tasks_limit(&self.store);
+        let tasks_limit = get_max_running_tasks_limit(&self.sess_pool.vardef(), &self.store);
         if cnt >= tasks_limit {
             bg_logger().warn(
                 "current TTL tasks count exceeds limit, delay create new job temporarily",
@@ -1712,6 +1719,10 @@ impl ManagerJobAdapter {
 }
 
 impl TtlJobAdapter for ManagerJobAdapter {
+    fn vardef(&self) -> Arc<tidb_vardef::VardefSnapshot> {
+        self.sess_pool.vardef()
+    }
+
     fn can_submit_job(&self, table_id: i64, physical_id: i64) -> bool {
         let mut ok = false;
         let result = with_session(self.sess_pool.as_ref(), &mut |se| {

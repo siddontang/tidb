@@ -153,6 +153,12 @@ pub trait SessionVars: Send + Sync {
     fn enable_paging(&self) -> bool;
     /// Go `InternalSQLScanUserTable = value`.
     fn set_internal_sql_scan_user_table(&self, value: bool);
+    /// The session's keyspace's values of the vardef global statics (Go
+    /// `vardef.TTL*`), which a multi-keyspace node keeps per keyspace
+    /// (design §6.3).
+    fn vardef(&self) -> std::sync::Arc<tidb_vardef::VardefSnapshot> {
+        tidb_vardef::snapshot::process()
+    }
 }
 
 /// `// boundary:` Go `infoschema.InfoSchema` (behind

@@ -327,17 +327,17 @@ impl tidb_kv::region_map::RegionStore for MockTikvStore {
 fn test_get_max_running_tasks_limit() {
     let store = |count: Option<usize>| -> tidb_ttl_ttlworker::Store { Some(Arc::new(MockTikvStore(count))) };
     tidb_vardef::TTL_RUNNING_TASKS.store(1, Ordering::SeqCst);
-    assert_eq!(get_max_running_tasks_limit(&store(None)), 1);
+    assert_eq!(get_max_running_tasks_limit(&tidb_vardef::snapshot::process(), &store(None)), 1);
 
     tidb_vardef::TTL_RUNNING_TASKS.store(2, Ordering::SeqCst);
-    assert_eq!(get_max_running_tasks_limit(&store(None)), 2);
+    assert_eq!(get_max_running_tasks_limit(&tidb_vardef::snapshot::process(), &store(None)), 2);
 
     tidb_vardef::TTL_RUNNING_TASKS.store(-1, Ordering::SeqCst);
-    assert_eq!(get_max_running_tasks_limit(&None), 256);
-    assert_eq!(get_max_running_tasks_limit(&store(None)), 256);
+    assert_eq!(get_max_running_tasks_limit(&tidb_vardef::snapshot::process(), &None), 256);
+    assert_eq!(get_max_running_tasks_limit(&tidb_vardef::snapshot::process(), &store(None)), 256);
 
     // two TiKV stores (Go's third store is TiFlash, which the count excludes)
-    assert_eq!(get_max_running_tasks_limit(&store(Some(2))), 2);
+    assert_eq!(get_max_running_tasks_limit(&tidb_vardef::snapshot::process(), &store(Some(2))), 2);
     // Go `getScanSplitCnt`: one range per TiKV store once there are more
     // than `splitScanCount`.
     assert_eq!(tidb_ttl_ttlworker::config::get_scan_split_cnt(&store(Some(2))), 64);

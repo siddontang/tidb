@@ -60,6 +60,11 @@ pub struct TtlJobTrace {
 pub trait TtlJobAdapter: Send + Sync {
     /// Go `Now`: the current time in the system time zone.
     fn now(&self) -> Result<GoTime>;
+    /// The keyspace's values of the vardef global statics (Go
+    /// `vardef.EnableTTLJob` and the schedule window), design §6.3.
+    fn vardef(&self) -> std::sync::Arc<tidb_vardef::VardefSnapshot> {
+        tidb_vardef::snapshot::process()
+    }
     /// Go `CanSubmitJob`.
     fn can_submit_job(&self, table_id: i64, physical_id: i64) -> bool;
     /// Go `SubmitJob`.
@@ -78,7 +83,9 @@ pub trait TtlJobAdapter: Send + Sync {
 
 /// Go `timeutil.WithinDayTimePeriod(TTLJobScheduleWindowStartTime,
 /// TTLJobScheduleWindowEndTime, now)`.
-pub fn within_ttl_job_schedule_window(now: &GoTime) -> bool {
+///
+/// `vardef` holds the keyspace's schedule window (design §6.3).
+pub fn within_ttl_job_schedule_window(vardef: &tidb_vardef::VardefSnapshot, now: &GoTime) -> bool {
     let read = |time: &std::sync::RwLock<tidb_vardef::DayTime>| {
         *time.read().unwrap_or_else(std::sync::PoisonError::into_inner)
     };
@@ -86,8 +93,8 @@ pub fn within_ttl_job_schedule_window(now: &GoTime) -> bool {
     let day = chrono::DateTime::<chrono::Utc>::from_timestamp(86_400, 0).expect("a valid instant");
     let at = |minutes: i64| day + chrono::Duration::minutes(minutes);
     tidb_timeutil::within_day_time_period(
-        at(read(&tidb_vardef::TTL_JOB_SCHEDULE_WINDOW_START_TIME).utc_minutes()),
-        at(read(&tidb_vardef::TTL_JOB_SCHEDULE_WINDOW_END_TIME).utc_minutes()),
+        at(read(vardef.ttl_job_schedule_window_start_time()).utc_minutes()),
+        at(read(vardef.ttl_job_schedule_window_end_time()).utc_minutes()),
         now.instant(),
     )
 }
@@ -137,14 +144,15 @@ impl Hook for TtlTimerHook {
         event: &dyn TimerShedEvent,
     ) -> tidb_timer::error::Result<PreSchedEventResult> {
         let mut r = PreSchedEventResult::default();
-        if !tidb_vardef::ENABLE_TTL_JOB.load(Ordering::SeqCst) {
+        let vardef = self.adapter.vardef();
+        if !vardef.enable_ttl_job().load(Ordering::SeqCst) {
             r.delay = MINUTE;
             return Ok(r);
         }
 
         let now = self.adapter.now().map_err(TimerError::message)?;
 
-        if !within_ttl_job_schedule_window(&now) {
+        if !within_ttl_job_schedule_window(&vardef, &now) {
             r.delay = MINUTE;
             return Ok(r);
         }

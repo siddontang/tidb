@@ -394,7 +394,7 @@ impl TtlScanTask {
 
             let mut sql = retry_sql.clone();
             if sql.is_empty() {
-                let limit = tidb_vardef::TTL_SCAN_BATCH_SIZE.load(Ordering::SeqCst);
+                let limit = sess.session.get_session_vars().vardef().ttl_scan_batch_size().load(Ordering::SeqCst);
                 sql = generator.next_sql(&last_result, limit).map_err(|err| err.to_string())?;
             }
 

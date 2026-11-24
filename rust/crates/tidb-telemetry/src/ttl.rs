@@ -139,6 +139,8 @@ fn warn_sql(message: &str, sql: &str, error: Option<&str>) {
 /// Go `getTTLUsageInfo`.
 pub(crate) fn get_ttl_usage_info(sctx: &dyn Session) -> TtlUsageCounter {
     let mut counter = TtlUsageCounter {
+        // Process-level: the telemetry reports the node's configured
+        // keyspace (multi-keyspace design §6.3).
         ttl_job_enabled: tidb_vardef::ENABLE_TTL_JOB.load(Ordering::Relaxed),
         ttl_hist_date: (chrono::Local::now() - chrono::Duration::hours(24))
             .format("%Y-%m-%d")

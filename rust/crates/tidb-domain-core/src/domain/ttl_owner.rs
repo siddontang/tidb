@@ -79,6 +79,8 @@ impl Domain {
             self.region_store.clone(),
             self.etcd_client(),
             Box::new(move || ddl.is_owner()),
+            // The keyspace's TTL settings (design §6.3).
+            self.vardef(),
         );
         if self.ttl_job_manager.set(Arc::clone(&manager)).is_err() {
             return None;

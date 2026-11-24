@@ -71,3 +71,60 @@ fn a_session_runs_its_statements_under_its_own_keyspace_values() {
     assert!(refused.contains("a foreign key constraint fails"), "{refused}");
     assert!(Arc::ptr_eq(&current(), &outer));
 }
+
+/// TTL (the first batch of migrated readers): a keyspace's TTL settings
+/// govern its own job manager's decisions -- its sessions' job switch, its
+/// running-task limit and its schedule window -- and not the configured
+/// keyspace's.
+#[test]
+fn ttl_decisions_follow_the_keyspace_settings() {
+    use std::sync::atomic::Ordering::SeqCst;
+    use tidb_ttl_ttlworker::session::{SessionPool as _, SysSessionPool};
+
+    let users = ConfiguredUserStore::parse("root\t%\tmysql_native_password\t\n")
+        .unwrap()
+        .with_global_vars(tidb_domain::global_sysvars::GlobalSysvars::new().with_keyspace_vardef());
+    let tenant = MockStoreDomain::create_with_users(Arc::new(users)).unwrap();
+    // A window that excludes now: from two to three hours ahead, in UTC.
+    let now = chrono::Utc::now();
+    let clock = |hours: i64| (now + chrono::Duration::hours(hours)).format("%H:%M +0000").to_string();
+    let mut admin = tenant.new_session().unwrap();
+    for sql in [
+        "set global tidb_ttl_job_enable = off".to_owned(),
+        "set global tidb_ttl_running_tasks = 3".to_owned(),
+        format!("set global tidb_ttl_job_schedule_window_start_time = '{}'", clock(2)),
+        format!("set global tidb_ttl_job_schedule_window_end_time = '{}'", clock(3)),
+    ] {
+        admin.run(&sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let configured = MockStoreDomain::create().unwrap();
+
+    let decisions = |store: &Arc<MockStoreDomain>| {
+        let domain = store.factory();
+        let pool = SysSessionPool::new(domain.advanced_sys_session_pool(), domain.vardef());
+        let mut session_switch = None;
+        pool.with_session(&mut |se| {
+            session_switch = Some(se.get_session_vars().vardef().enable_ttl_job().load(SeqCst));
+            Ok(())
+        })
+        .unwrap();
+        let vardef = pool.vardef();
+        (
+            session_switch.unwrap(),
+            tidb_ttl_ttlworker::task_manager::get_max_running_tasks_limit(&vardef, &None),
+            tidb_ttl_ttlworker::timer::within_ttl_job_schedule_window(&vardef, &tidb_timer::go_time::GoTime::now()),
+        )
+    };
+    let (enabled, limit, in_window) = decisions(&tenant);
+    assert!(!enabled, "the tenant's TTL job switch is off");
+    assert_eq!(limit, 3, "the tenant's running-task limit");
+    assert!(!in_window, "the tenant's window excludes now");
+
+    let (enabled, limit, in_window) = decisions(&configured);
+    assert_eq!(enabled, tidb_vardef::ENABLE_TTL_JOB.load(SeqCst), "the configured keyspace reads the process switch");
+    assert_ne!(limit, 3);
+    let minute = now.format("%H:%M").to_string();
+    if minute != "23:59" {
+        assert!(in_window, "the default window is the whole day");
+    }
+}

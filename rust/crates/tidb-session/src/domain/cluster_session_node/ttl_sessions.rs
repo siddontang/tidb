@@ -214,6 +214,12 @@ impl tidb_ttl::session::SessionContext for TtlClusterSessionContext {
 }
 
 impl SessionVars for TtlClusterSessionContext {
+    fn vardef(&self) -> std::sync::Arc<tidb_vardef::VardefSnapshot> {
+        self.state
+            .with_session(|session| Ok(session.session.vars.vardef()))
+            .unwrap_or_else(|_| tidb_vardef::snapshot::process())
+    }
+
     /// Go `StmtCtx.AffectedRows()` of the session's last statement.
     fn affected_rows(&self) -> u64 {
         self.state
