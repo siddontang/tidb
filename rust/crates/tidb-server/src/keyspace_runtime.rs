@@ -41,9 +41,6 @@ pub(crate) struct KeyspaceRuntime {
     pub(crate) gc_resolve_locks: Option<crate::http_status::GcResolveLocks>,
     /// Go `repository.SetupRepository(dom)`.
     workload_repository: Arc<tidb_workloadrepo::Worker>,
-    /// The keyspace whose own vardef values this runtime registered
-    /// (multi-keyspace design §6.3), unregistered when it retires.
-    own_vardef_keyspace: Option<String>,
 }
 
 impl KeyspaceRuntime {
@@ -69,11 +66,9 @@ impl KeyspaceRuntime {
     ) -> Result<(Self, ProductionReadProcessAuthority), RunConfiguredNodeError> {
         // Go `setGlobalVars`, before the store and the domain are created.
         let mut global_vars = tidb_domain::global_sysvars::GlobalSysvars::before_domain();
-        let own_vardef_keyspace = own_vardef.then(|| config.global_config.keyspace_name.clone());
-        if let Some(keyspace) = &own_vardef_keyspace {
+        if own_vardef {
+            // The domain hands the snapshot to its sessions and its DDL.
             global_vars = global_vars.with_keyspace_vardef();
-            // The keyspace's DDL steps find its values by its name.
-            tidb_vardef::snapshot::register_keyspace(keyspace, global_vars.vardef());
         }
         crate::set_global_vars::set_global_vars(config, &global_vars);
         let (mut stack, authority) =
@@ -140,7 +135,6 @@ impl KeyspaceRuntime {
                 auto_id,
                 gc_resolve_locks,
                 workload_repository,
-                own_vardef_keyspace,
             },
             authority,
         ))
@@ -172,9 +166,6 @@ impl KeyspaceRuntime {
             drop(worker);
         }
         self.stack.factory.close();
-        if let Some(keyspace) = &self.own_vardef_keyspace {
-            tidb_vardef::snapshot::unregister_keyspace(keyspace);
-        }
     }
 
     /// Releases what the keyspace's storage transactions ran under: the

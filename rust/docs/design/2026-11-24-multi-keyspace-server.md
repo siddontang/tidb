@@ -688,10 +688,15 @@ How the global statics are kept per keyspace (`tidb_vardef::snapshot`):
   whose accessors are the statics themselves, so they read exactly what they
   read before. Another keyspace of a multi-keyspace node owns its values.
 - Readers take the snapshot from the session (`SessionVars::vardef`) or the
-  domain (`Domain::vardef`). Code below the session tiers -- the DDL steps
-  and the DDL a statement submits -- reads `tidb_vardef::snapshot::current()`:
-  the snapshot its thread entered. A connection enters its keyspace's; a DDL
-  step enters the one registered for its store's keyspace.
+  domain (`Domain::vardef`, which background workers such as the TTL job
+  manager are handed). Code below the session tiers -- the DDL steps and the
+  DDL a statement submits -- reads `tidb_vardef::snapshot::current()`: the
+  snapshot its thread entered. A session enters its own while its store half
+  is lent (`Session::node_conn`), so every caller -- a connection, a pooled or
+  internal session -- runs its statements under its keyspace's values and
+  gets its own scope back afterwards; a DDL step enters the snapshot its
+  domain gave the DDL's session pool. There is no process-wide registry of
+  snapshots.
 - *Per keyspace: not yet* marks a global static that other code still
   writes directly (MDL, the DDL error limit, the analyze defaults, the
   schema validator's delta count, the cloud storage URI); it stays

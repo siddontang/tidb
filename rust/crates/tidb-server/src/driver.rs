@@ -470,12 +470,6 @@ pub trait QuerySessionFactory: Send + Sync + 'static {
     fn keyspace_context(&self) -> Option<Arc<tidb_keyspace::KeyspaceContext>> {
         None
     }
-
-    /// The keyspace's own values of the vardef global statics, when its
-    /// runtime keeps them (design §6.3); `None` is the process statics.
-    fn vardef(&self) -> Option<Arc<tidb_vardef::VardefSnapshot>> {
-        None
-    }
 }
 
 /// Go `shouldInstallConnectionAlive` (`pkg/server/conn.go`): EXECUTE, TRACE

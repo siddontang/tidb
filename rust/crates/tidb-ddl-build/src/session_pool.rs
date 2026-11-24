@@ -115,6 +115,13 @@ pub trait DdlSessionPool: Send + Sync {
         None
     }
 
+    /// The keyspace values of the vardef global statics the DDL runs with
+    /// (multi-keyspace design §6.3): its domain's. `None` where no node is
+    /// bound, which reads the process statics.
+    fn vardef(&self) -> Option<std::sync::Arc<tidb_vardef::VardefSnapshot>> {
+        None
+    }
+
     /// Go `sessionctx.Context.GetAdvisoryLock`'s backend for the DDL
     /// worker's session (`w.sess`): each lock is an internal session of the
     /// domain. `None` where no node is bound.

@@ -2534,6 +2534,10 @@ pub struct DdlJobSchemaState {
     /// resource-group tags carry (design §6.1). `None` for a run without a
     /// store of its own, which tags the process's configured keyspace.
     pub keyspace: Option<std::sync::Arc<tidb_keyspace::KeyspaceContext>>,
+    /// The vardef values of the keyspace the DDL serves (design §6.3), which
+    /// the step reads; `None` for a DDL without a domain (the process
+    /// statics).
+    pub vardef: Option<std::sync::Arc<tidb_vardef::VardefSnapshot>>,
     /// Go `jobContext.infoCache`: the schema a step reads beside its job's
     /// own schemas, which it reads from meta (`jobCtx.metaMut`). `None` reads
     /// the whole schema from the snapshot.
@@ -2552,6 +2556,7 @@ impl DdlJobSchemaState {
             worker,
             step_kv_context: None,
             keyspace: None,
+            vardef: None,
             info_cache: None,
         }
     }

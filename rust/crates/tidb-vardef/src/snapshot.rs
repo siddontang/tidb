@@ -23,15 +23,14 @@
 //! keyspace of a multi-keyspace node owns its values.
 //!
 //! A reader takes the snapshot from its session (`SessionVars::vardef`) or
-//! its runtime (`Domain::vardef`); code below the session tiers (the DDL
-//! owner's steps) takes the snapshot its thread entered ([`enter`],
-//! [`current`]), which a connection and a DDL step enter for their
-//! keyspace.
+//! its runtime (`Domain::vardef`); code below the session tiers (the DDL a
+//! statement submits, the DDL owner's steps) takes the snapshot its thread
+//! entered ([`enter`], [`current`]): a session enters its own while it runs
+//! a statement on its store, and a DDL step enters its DDL's.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicU8};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 #[allow(unused_imports)]
 use crate::{defaults, DayTime};
@@ -190,8 +189,8 @@ impl Drop for EnteredVardef {
     }
 }
 
-/// Makes `snapshot` the one [`current`] answers on this thread: a connection
-/// enters its keyspace's, a DDL step its runtime's.
+/// Makes `snapshot` the one [`current`] answers on this thread: a session
+/// enters its own while it runs a statement, a DDL step its DDL's.
 pub fn enter(snapshot: Arc<VardefSnapshot>) -> EnteredVardef {
     let previous = CURRENT.with(|current| current.borrow_mut().replace(snapshot));
     EnteredVardef {
@@ -203,31 +202,6 @@ pub fn enter(snapshot: Arc<VardefSnapshot>) -> EnteredVardef {
 /// The snapshot this thread entered, else the process-backed one.
 pub fn current() -> Arc<VardefSnapshot> {
     CURRENT.with(|current| current.borrow().clone()).unwrap_or_else(process)
-}
-
-/// The snapshots of the keyspaces that own their values, by keyspace name.
-static KEYSPACES: LazyLock<Mutex<HashMap<String, Arc<VardefSnapshot>>>> = LazyLock::new(Mutex::default);
-
-/// Registers keyspace `keyspace`'s own snapshot, so code that knows only its
-/// keyspace (a DDL step over its store) finds it.
-pub fn register_keyspace(keyspace: &str, snapshot: Arc<VardefSnapshot>) {
-    KEYSPACES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(keyspace.to_owned(), snapshot);
-}
-
-/// Forgets keyspace `keyspace`'s snapshot when its runtime closes.
-pub fn unregister_keyspace(keyspace: &str) {
-    KEYSPACES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(keyspace);
-}
-
-/// Keyspace `keyspace`'s snapshot: its own when it registered one, else the
-/// process-backed one.
-pub fn for_keyspace(keyspace: &str) -> Arc<VardefSnapshot> {
-    KEYSPACES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(keyspace)
-        .cloned()
-        .unwrap_or_else(process)
 }
 
 #[cfg(test)]
@@ -272,9 +246,5 @@ mod tests {
             assert!(current().is_per_keyspace());
         }
         assert!(!current().is_per_keyspace());
-        register_keyspace("vardef_test_ks", Arc::clone(&own));
-        assert!(for_keyspace("vardef_test_ks").is_per_keyspace());
-        unregister_keyspace("vardef_test_ks");
-        assert!(!for_keyspace("vardef_test_ks").is_per_keyspace());
     }
 }

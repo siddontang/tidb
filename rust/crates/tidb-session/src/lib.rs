@@ -3851,6 +3851,8 @@ mod tests_fix_control;
 #[cfg(test)]
 mod tests_foreign_key;
 #[cfg(test)]
+mod tests_keyspace_vardef;
+#[cfg(test)]
 mod tests_generated_columns;
 #[cfg(test)]
 mod tests_global_vars;

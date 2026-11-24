@@ -336,6 +336,10 @@ impl DdlSessionPool for NodeDdlSessionPool {
         self.sess_pool.get().cloned()
     }
 
+    fn vardef(&self) -> Option<Arc<tidb_vardef::VardefSnapshot>> {
+        self.domain.get().and_then(Weak::upgrade).map(|domain| domain.vardef())
+    }
+
     fn ddl_event_ch(
         &self,
     ) -> Option<crossbeam_channel::Sender<tidb_ddl_notifier::SchemaChangeEvent>> {

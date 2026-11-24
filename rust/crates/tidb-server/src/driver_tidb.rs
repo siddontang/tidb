@@ -66,10 +66,6 @@ impl QuerySessionFactory for Domain {
     fn keyspace_context(&self) -> Option<Arc<tidb_keyspace::KeyspaceContext>> {
         Domain::keyspace_context(self).cloned()
     }
-
-    fn vardef(&self) -> Option<Arc<tidb_vardef::VardefSnapshot>> {
-        Some(Domain::vardef(self)).filter(|vardef| vardef.is_per_keyspace())
-    }
 }
 
 /// Go `TiDBContext`: the connection's session, as the protocol layer drives it.

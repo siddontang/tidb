@@ -1002,6 +1002,7 @@ pub fn run_persisted_ddl_job<S: StoreClient>(
     }
     let sess_pool = backfiller.session_pool().ok_or_else(||
         ClusterDdlError::NotCommitted("the DDL worker has no session pool".to_owned()))?;
+    let vardef = sess_pool.vardef();
     let worker = crate::cluster_ddl::DdlStepWorker {
         sess_pool,
         step_buffer: MutationBuffer::new(),
@@ -1017,6 +1018,7 @@ pub fn run_persisted_ddl_job<S: StoreClient>(
         tidb_vardef::is_mdl_enabled(tidb_config_kerneltype::is_next_gen()), job_w.clone(), worker,
     );
     schema_state.info_cache = schema_sync.info_cache();
+    schema_state.vardef = vardef;
     let reorg_slot = add_index_reorg::ReorgSlot::default();
     let outcome = (|| loop {
         let result = transit_one_job_step_and_wait_sync(
@@ -1576,9 +1578,11 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
     owner_id: &str,
 ) -> Result<DdlPhaseOutcome, ClusterDdlError> {
     (phase.check_owner)().map_err(ClusterDdlError::SchemaSync)?;
-    // The step reads its keyspace's vardef values (multi-keyspace design
-    // §6.3): the DDL runs for the keyspace of the store it opens.
-    let _vardef = tidb_vardef::snapshot::enter(tidb_vardef::snapshot::for_keyspace(opener.store().get_keyspace()));
+    // The step reads its DDL's keyspace vardef values (multi-keyspace design
+    // §6.3), which its domain handed the DDL's session pool.
+    let _vardef = tidb_vardef::snapshot::enter(
+        phase.schema_state.vardef.clone().unwrap_or_else(tidb_vardef::snapshot::process),
+    );
     // Go `transitOneJobStepAndWaitSync` checks the previous schema barrier
     // before `transitOneJobStep`'s hook and prepareTxn. A cancellation in
     // beforeTransitOneJobStep must be visible at the new transaction's TSO.

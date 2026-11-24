@@ -395,6 +395,9 @@ impl NodeConn {
 pub struct ClusterServerSession<'s> {
     session: &'s mut Session,
     node: NodeLoan<'s>,
+    /// The session's vardef snapshot, entered on this thread while the store
+    /// half is lent; leaving restores the caller's.
+    _vardef: Option<tidb_vardef::snapshot::EnteredVardef>,
 }
 
 /// The store half a [`ClusterServerSession`] works on: taken from the
@@ -443,9 +446,14 @@ impl Session {
     /// On a session with no store.
     pub fn node_conn(&mut self) -> ClusterServerSession<'_> {
         let node = self.node.take().expect("a session on the store");
+        // The statement runs under the session's own keyspace values (design
+        // §6.3): the DDL it submits reads them on this thread, whichever
+        // caller runs it (a connection, an internal or pooled session).
+        let vardef = tidb_vardef::snapshot::enter(self.vars.vardef());
         ClusterServerSession {
             session: self,
             node: NodeLoan::Taken(Some(node)),
+            _vardef: Some(vardef),
         }
     }
 
@@ -505,6 +513,7 @@ impl<'s> ClusterServerSession<'s> {
         ClusterServerSession {
             session: &mut *self.session,
             node: NodeLoan::Borrowed(&mut self.node),
+            _vardef: None,
         }
     }
 }
