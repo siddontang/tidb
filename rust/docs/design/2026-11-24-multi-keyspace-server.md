@@ -823,11 +823,14 @@ process. Hooks other packages register on a domain (GC, materialized views,
 the workload repository) act on that domain's keyspace and are not listed.
 The process settings `setGlobalVars` seeds directly are seeded once per node,
 by the configured keyspace's runtime; a later keyspace's open seeds only its
-own registry.
+own registry. Likewise only the table over the process statics binds the
+process's slots to its store -- the PD client option callbacks and the
+external-timestamp slot -- and applies `tidb_cloud_storage_uri`; another
+keyspace's domain answers `tidb_external_ts` from its own store.
 
 <!-- BEGIN generated: set-global hook destinations -->
 
-145 variables with a `SetGlobal` hook: 52 keyspace, 93 process.
+145 variables with a `SetGlobal` hook: 53 keyspace, 92 process.
 
 | System variable | Registry scope | Hook writes | Class |
 | --- | --- | --- | --- |
@@ -904,7 +907,7 @@ own registry.
 | `tidb_enable_tso_follower_proxy` | GLOBAL | the process vardef static `ENABLE_TSO_FOLLOWER_PROXY` | process |
 | `tidb_expensive_query_time_threshold` | INSTANCE | the process vardef static `EXPENSIVE_QUERY_TIME_THRESHOLD` | process |
 | `tidb_expensive_txn_time_threshold` | INSTANCE | the process vardef static `EXPENSIVE_TXN_TIME_THRESHOLD` | process |
-| `tidb_external_ts` | GLOBAL | the process external timestamp slot | process |
+| `tidb_external_ts` | GLOBAL | the keyspace store's external timestamp (its own provider; the process slot is the configured keyspace's) | keyspace |
 | `tidb_force_priority` | INSTANCE | the process vardef static `FORCE_PRIORITY` | process |
 | `tidb_general_log` | INSTANCE | the process vardef static `PROCESS_GENERAL_LOG` | process |
 | `tidb_generate_binary_plan` | GLOBAL | the process log and trace | process |

@@ -115,6 +115,10 @@ pub struct GlobalSysvars {
     /// statics to (multi-keyspace design §6.3): the process statics, or the
     /// keyspace's own on a multi-keyspace node's other keyspaces.
     vardef: Arc<tidb_vardef::VardefSnapshot>,
+    /// The store `tidb_external_ts` reads and writes for a keyspace that owns
+    /// its vardef values (its domain installs it); a table over the process
+    /// statics uses the process slot. Shared by every clone.
+    external_timestamp: Arc<std::sync::OnceLock<Arc<dyn tidb_variable::vars::ExternalTimestampProvider>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -271,6 +275,7 @@ impl Default for GlobalSysvars {
             resolved: Arc::new(RwLock::new(EMPTY_RESOLVED.with(|it| it.clone()))),
             refresh_lock: Arc::default(),
             vardef: tidb_vardef::snapshot::process(),
+            external_timestamp: Arc::default(),
         }
     }
 }
@@ -414,6 +419,27 @@ impl GlobalSysvars {
         self
     }
 
+    /// The store `tidb_external_ts` of this table's keyspace lives in, for a
+    /// keyspace that owns its vardef values (design §6.3).
+    pub fn set_external_timestamp_provider(&self, provider: Arc<dyn tidb_variable::vars::ExternalTimestampProvider>) {
+        let _ = self.external_timestamp.set(provider);
+    }
+
+    /// `tidb_external_ts` from this keyspace's own store, when it has one.
+    fn own_external_timestamp(&self, name: &str) -> Option<&Arc<dyn tidb_variable::vars::ExternalTimestampProvider>> {
+        if !name.eq_ignore_ascii_case(tidb_vardef::tidb_vars::TIDB_EXTERNAL_TS) {
+            return None;
+        }
+        self.external_timestamp.get()
+    }
+
+    /// Whether this table publishes process-wide settings: a live table over
+    /// the process statics. A keyspace that owns its vardef values never does
+    /// (design §6.3).
+    fn publishes_process_settings(&self) -> bool {
+        self.publishes_runtime_settings && !self.vardef.is_per_keyspace()
+    }
+
     /// The values this table's keyspace reads the vardef global statics
     /// from: the process statics unless it owns its own.
     pub fn vardef(&self) -> Arc<tidb_vardef::VardefSnapshot> {
@@ -474,8 +500,10 @@ impl GlobalSysvars {
     /// `rebuildSysVarCache`: the domain takes the sysvar cache over, and every
     /// variable's SetGlobal hook runs with the value the startup left it.
     pub fn arm_domain_hooks(&self) {
-        // Go `initDomainSysVars`: the domain fills `variable`'s slots.
-        if self.publishes_runtime_settings {
+        // Go `initDomainSysVars`: the domain fills `variable`'s slots -- the
+        // process's, so only a table over the process statics does (design
+        // §6.3): another keyspace's open must not rebind them to its store.
+        if self.publishes_process_settings() {
             install_pd_client_dynamic_option(Arc::clone(&self.pd_region_policy));
         }
         if self
@@ -582,7 +610,10 @@ impl GlobalSysvars {
             .pd_region_policy
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(policy.clone());
-        if self.publishes_runtime_settings {
+        // The PD client options are process settings (design §6.3): only the
+        // table over the process statics binds the process's option callbacks
+        // to its store and seeds that store's client.
+        if self.publishes_process_settings() {
             install_pd_client_dynamic_option(Arc::clone(&self.pd_region_policy));
             policy.set_follower_handle(enabled(
                 tidb_vardef::tidb_vars::PD_ENABLE_FOLLOWER_HANDLE_REGION,
@@ -610,6 +641,9 @@ impl GlobalSysvars {
     pub fn get(&self, name: &str) -> Result<String, VarError> {
         if let Some(value) = self.run_get_global_hook(name) {
             return Ok(value);
+        }
+        if let Some(provider) = self.own_external_timestamp(name) {
+            return provider.get().map(|ts| ts.to_string()).map_err(VarError::unknown);
         }
         let Some(index) = tidb_variable::sysvar::sys_var_index_lookup(name) else {
             return Err(tidb_terror::MysqlError::from_terror(
@@ -834,6 +868,9 @@ impl GlobalSysvars {
         if let Some(value) = self.run_get_global_hook(def.name) {
             return Ok(value);
         }
+        if let Some(provider) = self.own_external_timestamp(def.name) {
+            return provider.get().map(|ts| ts.to_string()).map_err(VarError::unknown);
+        }
         if let Some(value) = self.instance_plan_cache_limit_getter(def) {
             return Ok(value);
         }
@@ -1016,6 +1053,15 @@ impl GlobalSysvars {
         {
             return;
         }
+        // `tidb_external_ts` of a keyspace that owns its vardef values lives in
+        // its own store (design §6.3), not behind the process slot.
+        if let Some(provider) = self.own_external_timestamp(name) {
+            let zone = tidb_variable::vars::SessionVars::new().session_time_zone();
+            if let Ok(ts) = tidb_variable::vars::parse_read_timestamp(value, &zone, true) {
+                let _ = provider.set(ts);
+            }
+            return;
+        }
         // A keyspace that owns its vardef values never writes the process's
         // state (design §6.3): a process variable's hook would apply the
         // keyspace's value (an explicit write, or a row its rebuild loaded)
@@ -1109,7 +1155,8 @@ impl GlobalSysvars {
         }
         let stored_value = validated.value;
         if key == tidb_vardef::tidb_vars::TIDB_CLOUD_STORAGE_URI {
-            if self.publishes_runtime_settings {
+            // The URI is a process setting (design §6.3).
+            if self.publishes_process_settings() {
                 tidb_variable::cloud_storage::set_cloud_storage_uri(&tidb_gocontext::Context::background(), &stored_value).map_err(VarError::unknown)?;
             } else {
                 tidb_variable::cloud_storage::validate_cloud_storage_uri(&tidb_gocontext::Context::background(), &stored_value).map_err(VarError::unknown)?;
@@ -1550,8 +1597,10 @@ impl crate::sysvar_cache::SysVarCacheDeps for SysVarCacheRebuild<'_> {
         sv: &crate::sysvar_cache::SysVarSpec,
         value: &str,
     ) -> Result<(), String> {
+        // The URI is a process setting (design §6.3): a keyspace that owns its
+        // vardef values never applies it, not even its default.
         if sv.name == tidb_vardef::tidb_vars::TIDB_CLOUD_STORAGE_URI
-            && self.0.publishes_runtime_settings
+            && self.0.publishes_process_settings()
             && self.0.domain_hooks.load(std::sync::atomic::Ordering::SeqCst)
         {
             tidb_variable::cloud_storage::set_cloud_storage_uri(&tidb_gocontext::Context::background(), value)?;

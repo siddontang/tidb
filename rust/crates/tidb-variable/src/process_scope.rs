@@ -135,7 +135,7 @@ pub const HOOK_DESTINATIONS: &[HookDestination] = &[
     HookDestination { sysvar: "tidb_enable_tso_follower_proxy", scope: HookScope::Process, writes: "the process vardef static `ENABLE_TSO_FOLLOWER_PROXY`" },
     HookDestination { sysvar: "tidb_expensive_query_time_threshold", scope: HookScope::Process, writes: "the process vardef static `EXPENSIVE_QUERY_TIME_THRESHOLD`" },
     HookDestination { sysvar: "tidb_expensive_txn_time_threshold", scope: HookScope::Process, writes: "the process vardef static `EXPENSIVE_TXN_TIME_THRESHOLD`" },
-    HookDestination { sysvar: "tidb_external_ts", scope: HookScope::Process, writes: "the process external timestamp slot" },
+    HookDestination { sysvar: "tidb_external_ts", scope: HookScope::Keyspace, writes: "the keyspace store's external timestamp (its own provider; the process slot is the configured keyspace's)" },
     HookDestination { sysvar: "tidb_force_priority", scope: HookScope::Process, writes: "the process vardef static `FORCE_PRIORITY`" },
     HookDestination { sysvar: "tidb_general_log", scope: HookScope::Process, writes: "the process vardef static `PROCESS_GENERAL_LOG`" },
     HookDestination { sysvar: "tidb_generate_binary_plan", scope: HookScope::Process, writes: "the process log and trace" },
@@ -261,7 +261,10 @@ mod tests {
         for hook in HOOK_DESTINATIONS {
             let is_kept = kept.contains(&hook.sysvar);
             match hook.scope {
-                HookScope::Keyspace => assert!(is_kept || hook.writes.starts_with("none"), "{hook:?}"),
+                HookScope::Keyspace => assert!(
+                    is_kept || hook.writes.starts_with("none") || hook.writes.starts_with("the keyspace store"),
+                    "{hook:?}"
+                ),
                 HookScope::Process => assert!(!is_kept, "{hook:?}"),
             }
         }

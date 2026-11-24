@@ -1040,10 +1040,16 @@ impl Domain {
         sys_session_opener: SysSessionOpener,
     ) -> Self {
         // Go `initDomainSysVars`: `variable.SetExternalTimestamp` /
-        // `GetExternalTimestamp`.
-        tidb_variable::domain_slots::set_external_timestamp_funcs(Arc::new(ClusterExternalTimestamp(
-            Arc::clone(&transactions),
-        )));
+        // `GetExternalTimestamp` over this domain's store. The process slot
+        // is the configured keyspace's; a keyspace that owns its vardef values
+        // answers `tidb_external_ts` from its own store (design §6.3), so a
+        // later keyspace's domain does not take the slot over.
+        let external_timestamp = Arc::new(ClusterExternalTimestamp(Arc::clone(&transactions)));
+        if global_vars.vardef().is_per_keyspace() {
+            global_vars.set_external_timestamp_provider(external_timestamp);
+        } else {
+            tidb_variable::domain_slots::set_external_timestamp_funcs(external_timestamp);
+        }
         let boot_skipped =
             cluster_session_catalog(&catalog.get_latest(), &stats.load(), auto_ids.as_ref())
                 .skipped;

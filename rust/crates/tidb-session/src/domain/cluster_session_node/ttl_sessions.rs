@@ -214,10 +214,10 @@ impl tidb_ttl::session::SessionContext for TtlClusterSessionContext {
 }
 
 impl SessionVars for TtlClusterSessionContext {
+    /// The session's domain's: no session lock, and no fallback to the
+    /// process statics once the session closes.
     fn vardef(&self) -> std::sync::Arc<tidb_vardef::VardefSnapshot> {
-        self.state
-            .with_session(|session| Ok(session.session.vars.vardef()))
-            .unwrap_or_else(|_| tidb_vardef::snapshot::process())
+        self.domain.vardef()
     }
 
     /// Go `StmtCtx.AffectedRows()` of the session's last statement.
