@@ -23,6 +23,25 @@ use tidb_sessmgr::ProcessRegistry;
 
 type ReplyStream<T> = Pin<Box<dyn futures::Stream<Item = Result<T, tonic::Status>> + Send>>;
 
+/// Design §6.8: a node serving several keyspaces publishes this one status
+/// port in every keyspace's server info, and this service answers for its
+/// configured keyspace (its process list, statement summary, slow log). A
+/// request names no keyspace, so it is answered only when its user carries
+/// the configured keyspace's prefix; a request with no user (a remote KILL)
+/// or another keyspace's user is refused, until peer requests name their
+/// keyspace (status port multiplexing, phase 3f).
+fn refuse_other_keyspaces(dag: &tipb::DagRequest) -> Result<(), String> {
+    if !tidb_keyspace::is_multi_keyspace_mode() {
+        return Ok(());
+    }
+    let configured = tidb_keyspace::get_keyspace_name_by_settings();
+    let user = dag.user.as_ref().and_then(|user| user.user_name.as_deref()).unwrap_or("");
+    if tidb_keyspace::keyspace_of_user(user) == Some(configured.as_str()) {
+        return Ok(());
+    }
+    Err("a multi-keyspace node answers peer requests of its configured keyspace's users only".to_owned())
+}
+
 /// Runs one statement on this instance alone, as Go's remote-origin plans do.
 pub(crate) type BroadcastQueryRunner = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
@@ -87,6 +106,7 @@ impl PeerService {
             return Err(format!("unsupported request type {}", request.tp));
         }
         let dag = tipb::DagRequest::decode(request.data.as_slice()).map_err(|e| e.to_string())?;
+        refuse_other_keyspaces(&dag)?;
         // Go `rpcServer.handleCopRequest` serves every request on a fresh
         // session over the node's store (`createSession`).
         let mut session = (self.session_factory)()?;

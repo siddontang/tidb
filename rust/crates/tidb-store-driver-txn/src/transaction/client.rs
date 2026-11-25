@@ -223,6 +223,10 @@ impl tikv_client::KvFilter for TidbKvFilter {
     }
 }
 impl<S: PdClient> TikvTxn<S> {
+    /// The keyspace of the transaction's store (empty for an API-v1 store).
+    pub fn store_keyspace(&self) -> &str {
+        self.store.get_keyspace()
+    }
     /// The immutable transaction start timestamp.
     pub const fn start_ts(&self) -> u64 {
         self.start_ts

@@ -29,9 +29,11 @@ pub fn configure_deadlock_history(capacity: usize, collect_retryable: bool) {
     GLOBAL_DEADLOCK_HISTORY.resize(capacity);
 }
 
-pub fn record_deadlock(detail: &DeadlockError) {
+/// Records a deadlock a transaction of keyspace `keyspace` detected (the
+/// store's keyspace, empty for an API-v1 store).
+pub fn record_deadlock(keyspace: &str, detail: &DeadlockError) {
     if detail.is_retryable && !COLLECT_RETRYABLE.load(Ordering::Acquire) {
         return;
     }
-    GLOBAL_DEADLOCK_HISTORY.push(err_deadlock_to_deadlock_record(detail));
+    GLOBAL_DEADLOCK_HISTORY.push_in_keyspace(keyspace, err_deadlock_to_deadlock_record(detail));
 }

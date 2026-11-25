@@ -1396,6 +1396,9 @@ impl crate::mem_table_retrieval::MemTableRetriever for CatalogTablesRetriever {
             return Ok(set_data_for_keyspace_meta());
         }
         if table.go_lower_eq("TIDB_HOT_REGIONS") {
+            // PD's hot regions are every keyspace's, matched to this
+            // catalog by table ID, which collides across keyspaces (3b).
+            crate::multi_keyspace::refuse_on_multi_keyspace_node("TIDB_HOT_REGIONS")?;
             return set_data_for_tidb_hot_regions(catalog, store.as_ref());
         }
         if table.go_lower_eq("TABLE_STORAGE_STATS") {

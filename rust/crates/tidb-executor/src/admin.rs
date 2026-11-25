@@ -72,6 +72,8 @@ pub fn flush_stmt(flush: &tidb_ast::FlushStmt) -> Result<StmtOutput, DriverError
             ));
         }
         tidb_ast::FlushStmtType::ClientErrorsSummary => {
+            // The counters are every keyspace's (design §6.8).
+            crate::multi_keyspace::refuse_on_multi_keyspace_node("FLUSH CLIENT_ERRORS_SUMMARY")?;
             tidb_errno::infoschema::flush_stats();
         }
         tidb_ast::FlushStmtType::Status
@@ -132,6 +134,11 @@ pub fn ddl_jobs_not_found(job_ids: &[i64]) -> Vec<Option<String>> {
 }
 
 pub trait AdminExec: crate::index_advisor::RecommendIndexExec {
+    /// The keyspace whose slow-query memory `ADMIN SHOW SLOW` reads (the
+    /// session's; design §6.8).
+    fn slow_query_keyspace(&self) -> String {
+        String::new()
+    }
     /// Go `admin.getCount`: `ExecRestrictedSQL(ctx,
     /// []OptionFuncAlias{ExecOptionWithSnapshot(snapshot)}, sql)` under
     /// `kv.InternalTxnAdmin`, run while `CheckIndicesCount` holds the
@@ -370,7 +377,7 @@ pub trait AdminExec: crate::index_advisor::RecommendIndexExec {
         show: &tidb_ast::AdminShowSlowStmt,
     ) -> Result<StmtOutput, DriverError> {
         use tidb_datatype::{core_time_from_datetime, Time, TimeType};
-        let records = tidb_domain::topn_slow_query::show_slow_query(&show.mode, show.count);
+        let records = tidb_domain::topn_slow_query::show_slow_query(&self.slow_query_keyspace(), &show.mode, show.count);
         let varchar = || FieldType::new(FieldTypeCode::Varchar);
         let rows = records
             .into_iter()

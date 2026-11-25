@@ -437,6 +437,17 @@ impl ProcessRegistry {
         }
     }
 
+    /// A registry whose completed transactions go to a recorder of its own
+    /// ([`tidb_txninfo::TransactionHistoryRecorder::fork`] of the process's),
+    /// as each keyspace's of a multi-keyspace node does (design §6.8).
+    #[must_use]
+    pub fn with_own_transaction_history() -> Self {
+        Self {
+            transaction_history: tidb_txninfo::RECORDER.fork(),
+            ..Self::default()
+        }
+    }
+
     /// Completed transaction rows from this process's shared recorder.
     pub fn transaction_history_rows(&self) -> Vec<Vec<tidb_datatype::Datum>> {
         self.transaction_history.rows()

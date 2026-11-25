@@ -156,6 +156,12 @@ pub struct ViewerState {
     pub hides_cluster_metadata: bool,
     /// Go `getDDLOwner`'s server ID, when the session's node has a DDL.
     pub ddl_owner_server_id: Option<Arc<dyn Fn() -> Result<u64, String> + Send + Sync>>,
+    /// The session's keyspace on a node serving several keyspaces, `None`
+    /// on a single-keyspace node. Diagnostic rows from process-wide owners
+    /// (statement summary, slow log, deadlock history) are filtered to it,
+    /// and sources that cannot tell keyspaces apart are refused or empty
+    /// (`rust/docs/design/2026-11-24-multi-keyspace-server.md` §6.8).
+    pub keyspace: Option<String>,
 }
 
 impl ViewerState {
@@ -236,6 +242,7 @@ impl ViewerState {
                 .as_deref()
                 .map(|identity| identity.split_once('@').map_or(identity, |(user, _)| user))
                 .map(str::to_owned),
+            keyspace: self.keyspace.clone(),
             ..Default::default()
         };
         let live: Vec<_> = extractors
@@ -324,6 +331,7 @@ impl ViewerState {
             digests,
             time_ranges,
             self.scan_concurrency,
+            self.keyspace.as_deref(),
         )
     }
 }
@@ -676,6 +684,13 @@ pub fn memory_usage_table_rows() -> Vec<Vec<tidb_datatype::Datum>> {
 /// The rows of a statement-summary table for `user` (`None`: every user,
 /// as Go's restricted SQL reads them), over the v1 map or the persistent v2
 /// owner the instance configuration selects.
+///
+/// On a node serving several keyspaces, `keyspace` is the viewer's: the v1
+/// map is keyed by keyspace and read for it alone, and the evicted rollup,
+/// which sums every keyspace's evicted statements, reads as empty. The
+/// persistent v2 owner (its memory and its files) has no keyspace key yet,
+/// so it is refused there (design §6.8).
+#[allow(clippy::too_many_arguments)]
 pub fn statement_summary_rows(
     table_name: &str,
     columns: &[(String, tidb_datatype::FieldType)],
@@ -685,11 +700,20 @@ pub fn statement_summary_rows(
     digests: Option<&std::collections::HashSet<String>>,
     time_ranges: Vec<tidb_stmtsummary::v2::reader::StmtTimeRange>,
     scan_concurrency: usize,
+    keyspace: Option<&str>,
 ) -> Result<Vec<Vec<tidb_datatype::Datum>>, DriverError> {
     use tidb_ast::CiString;
     use tidb_model::ColumnInfo;
     use tidb_stmtsummary::reader::{StmtSummaryChecker, StmtSummaryReader};
 
+    let persistent = tidb_config::config_tree::config::get_global_config()
+        .instance
+        .stmt_summary_enable_persistent;
+    if keyspace.is_some() && persistent {
+        return Err(DriverError::from(tidb_plannererrors::ERR_NOT_SUPPORTED_YET.gen_with_stack_by_args(&[
+            "persistent statement summary (tidb_stmt_summary_enable_persistent) on a multi-keyspace node".into(),
+        ])));
+    }
     if table_name.go_lower_eq("STATEMENTS_SUMMARY_EVICTED") {
         if !has_process {
             return Err(DriverError::from(
@@ -697,10 +721,10 @@ pub fn statement_summary_rows(
                     .gen_with_stack_by_args(&["PROCESS".into()]),
             ));
         }
-        let full: Vec<Vec<tidb_datatype::Datum>> = if tidb_config::config_tree::config::get_global_config()
-            .instance
-            .stmt_summary_enable_persistent
-        {
+        if keyspace.is_some() {
+            return Ok(Vec::new());
+        }
+        let full: Vec<Vec<tidb_datatype::Datum>> = if persistent {
             tidb_stmtsummary::v2::stmtsummary::global_stmt_summary()
                 .map(|summary| summary.evicted())
                 .filter(|row| !row.is_empty())
@@ -736,9 +760,6 @@ pub fn statement_summary_rows(
             ..ColumnInfo::default()
         })
         .collect();
-    let persistent = tidb_config::config_tree::config::get_global_config()
-        .instance
-        .stmt_summary_enable_persistent;
     let cumulative = table_name.go_lower_eq("TIDB_STATEMENTS_STATS");
     let history = table_name.go_lower_eq("STATEMENTS_SUMMARY_HISTORY");
     if persistent {
@@ -789,8 +810,14 @@ pub fn statement_summary_rows(
         }
         return Ok(rows);
     }
-    let mut reader =
-        StmtSummaryReader::new(user, has_process, columns, String::new(), zone.clone());
+    let mut reader = StmtSummaryReader::new(
+        user,
+        has_process,
+        columns,
+        String::new(),
+        zone.clone(),
+        keyspace.map(str::to_owned),
+    );
     reader.set_checker(digests.cloned().map(StmtSummaryChecker::new));
     Ok(if cumulative {
         reader.get_stmt_summary_cumulative_rows()
@@ -810,6 +837,12 @@ pub fn set_data_for_client_errors_summary(
     use chrono::{DateTime, Local};
     use tidb_datatype::{core_time_from_datetime, CoreTime, Datum, Time, TimeType};
     use tidb_errno::infoschema::{self, ErrorStats};
+
+    // The counters are the process's, every keyspace's errors by user, by
+    // host and in total: none on a node serving several keyspaces (§6.8).
+    if tidb_keyspace::is_multi_keyspace_mode() {
+        return Ok(Vec::new());
+    }
 
     fn text(value: &str) -> Datum {
         Datum::new_string_datum(value.as_bytes())

@@ -1136,7 +1136,12 @@ impl Domain {
             catalog,
             privileges,
             pushdown_blacklists: Default::default(),
-            processes: ProcessRegistry::default(),
+            // TRX_SUMMARY per keyspace on a multi-keyspace node (§6.8).
+            processes: if tidb_keyspace::is_multi_keyspace_mode() {
+                ProcessRegistry::with_own_transaction_history()
+            } else {
+                ProcessRegistry::default()
+            },
             auto_ids,
             mpp_client: None,
             kv_client: None,
@@ -1852,6 +1857,9 @@ impl Domain {
 
     /// Go `Domain.store.GetKeyspace`: set from the actual store during initialization.
     pub fn install_store_keyspace(&self, keyspace: String) {
+        if !keyspace.is_empty() {
+            self.bind_statistics(&keyspace);
+        }
         self.store_keyspace.set(keyspace).expect("store identity installed once");
     }
 
@@ -1863,6 +1871,7 @@ impl Domain {
     /// Binds the keyspace identity this domain's runtime serves, once,
     /// before its sessions open.
     pub fn install_keyspace_context(&self, keyspace: tidb_keyspace::KeyspaceContext) {
+        self.bind_statistics(keyspace.name());
         self.keyspace.set(Some(Arc::new(keyspace))).expect("keyspace identity installed once");
     }
 
@@ -2020,9 +2029,33 @@ impl Domain {
         self
     }
 
+    /// The domain's status providers are its keyspace's: a node serving
+    /// several keyspaces shows them to that keyspace only (design §6.8).
+    /// Binds the ones registered before the keyspace was known.
+    fn bind_statistics(&self, keyspace: &str) {
+        for statistics in self
+            .statistics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            tidb_variable::statusvar::bind_statistics_to_keyspace(statistics, keyspace);
+        }
+    }
+
     /// Go `variable.RegisterStatistics`, kept for the domain's close.
     fn register_statistics(&self, statistics: Arc<dyn tidb_variable::statusvar::Statistics>) {
-        tidb_variable::statusvar::register_statistics(Arc::clone(&statistics));
+        // Under the domain's keyspace once it is known (`bind_statistics`
+        // binds the ones registered before).
+        let keyspace = match self.keyspace.get().and_then(Option::as_ref) {
+            Some(keyspace) => keyspace.name().to_owned(),
+            None => self.store_keyspace().to_owned(),
+        };
+        if keyspace.is_empty() {
+            tidb_variable::statusvar::register_statistics(Arc::clone(&statistics));
+        } else {
+            tidb_variable::statusvar::register_keyspace_statistics(&keyspace, Arc::clone(&statistics));
+        }
         self.statistics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

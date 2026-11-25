@@ -150,6 +150,8 @@ fn fnv1a_digest(sql_digests: &[String]) -> u64 {
 #[derive(Debug)]
 pub struct TransactionHistoryRecorder {
     state: std::sync::Mutex<HistoryState>,
+    /// The recorders [`Self::fork`] made, which follow this one's settings.
+    forks: std::sync::Mutex<Vec<std::sync::Weak<TransactionHistoryRecorder>>>,
 }
 
 #[derive(Debug)]
@@ -166,6 +168,36 @@ impl TransactionHistoryRecorder {
                 min_duration,
                 summaries: TransactionSummaryCache::new(capacity),
             }),
+            forks: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A recorder of its own with this one's settings, which it keeps
+    /// following: a node serving several keyspaces gives each keyspace's
+    /// process list one, so `TRX_SUMMARY` holds only that keyspace's
+    /// transactions (multi-keyspace design §6.8).
+    pub fn fork(&self) -> std::sync::Arc<Self> {
+        let (capacity, min_duration) = {
+            let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (state.summaries.capacity(), state.min_duration)
+        };
+        let fork = std::sync::Arc::new(Self::new(capacity, min_duration));
+        let mut forks = self.forks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        forks.retain(|fork| fork.strong_count() > 0);
+        forks.push(std::sync::Arc::downgrade(&fork));
+        fork
+    }
+
+    fn each_fork(&self, apply: impl Fn(&Self)) {
+        let forks: Vec<_> = self
+            .forks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        for fork in forks {
+            apply(&fork);
         }
     }
 
@@ -201,6 +233,7 @@ impl TransactionHistoryRecorder {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .min_duration = duration;
+        self.each_fork(|fork| fork.set_min_duration(duration));
     }
 
     /// Resizes immediately, evicting oldest entries; zero clears and disables retention.
@@ -210,6 +243,7 @@ impl TransactionHistoryRecorder {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .summaries
             .resize(capacity);
+        self.each_fork(|fork| fork.resize(capacity));
     }
 
     /// Returns source FNV digests and ordered JSON SQL-digest arrays, newest first.
@@ -241,3 +275,38 @@ pub static RECORDER: std::sync::LazyLock<std::sync::Arc<TransactionHistoryRecord
             std::time::Duration::from_secs(1),
         ))
     });
+
+#[cfg(test)]
+mod fork_tests {
+    use super::TransactionHistoryRecorder;
+    use std::time::{Duration, SystemTime};
+
+    /// Design §6.8: each keyspace of a multi-keyspace node records into a
+    /// fork of the process's recorder, so one keyspace's transactions never
+    /// show in another's `TRX_SUMMARY`; the forks keep following the
+    /// process's capacity and minimum duration.
+    #[test]
+    fn forks_record_apart_and_follow_the_process_settings() {
+        let process = TransactionHistoryRecorder::new(0, Duration::from_secs(1));
+        let (a, b) = (process.fork(), process.fork());
+        let millis = (SystemTime::now() - Duration::from_secs(10))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let ts = u64::try_from(millis).unwrap() << 18;
+        a.on_transaction_end(ts, vec!["d1".into()]);
+        assert!(a.rows().is_empty(), "capacity zero records nothing");
+        process.resize(8);
+        process.set_min_duration(Duration::ZERO);
+        a.on_transaction_end(ts, vec!["d1".into()]);
+        b.on_transaction_end(ts, vec!["d2".into()]);
+        b.on_transaction_end(ts, vec!["d3".into()]);
+        assert_eq!(a.rows().len(), 1);
+        assert_eq!(b.rows().len(), 2);
+        assert!(process.rows().is_empty());
+        drop(a);
+        process.resize(1);
+        assert_eq!(b.rows().len(), 1);
+    }
+}
+

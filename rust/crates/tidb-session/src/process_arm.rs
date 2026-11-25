@@ -88,6 +88,7 @@ impl Session {
             config_scoped: self.has_scoped_privilege("", "", tidb_mysql::ConfigPriv),
             hides_cluster_metadata: self.sem_hides_cluster_metadata(),
             ddl_owner_server_id: self.ddl_owner_server_id(),
+            keyspace: tidb_keyspace::is_multi_keyspace_mode().then(|| self.keyspace_context().name().to_owned()),
         }
     }
 

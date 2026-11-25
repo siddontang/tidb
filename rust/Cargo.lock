@@ -5960,6 +5960,7 @@ dependencies = [
  "tidb-globalconn",
  "tidb-go-net",
  "tidb-gocontext",
+ "tidb-keyspace",
  "tidb-log",
  "tidb-logutil",
  "tidb-memory",

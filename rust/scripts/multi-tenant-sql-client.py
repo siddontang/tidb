@@ -9,6 +9,7 @@ tenants with similar DDL histories for the physical table-ID collision case.
 """
 
 import os
+import time
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -278,6 +279,110 @@ class TenantSQLTests(unittest.TestCase):
                 job.result()
         self.assertEqual(self.marker(self.clients[0]), ((5,),))
         self.assertEqual(self.marker(self.clients[1]), ((42,),))
+
+    # Phase 3e (design §6.8): diagnostics from process-wide owners.
+
+    def scalar(self, cursor, sql, args=None):
+        cursor.execute(sql, args)
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    def test_statement_summary_rows_are_tenant_local(self):
+        a, b = self.clients
+        alias = "probe_" + uuid.uuid4().hex[:12]
+        for cursor, runs in ((a, 2), (b, 1)):
+            for _ in range(runs):
+                cursor.execute(f"SELECT 1 AS {alias}")
+                cursor.fetchall()
+        for cursor, want in ((a, 2), (b, 1)):
+            for table in ("statements_summary", "statements_summary_history",
+                          "cluster_statements_summary"):
+                got = self.scalar(cursor, f"SELECT SUM(exec_count) FROM information_schema.{table} "
+                                          "WHERE digest_text LIKE %s", ("%" + alias + "%",))
+                self.assertEqual(int(got), want, table)
+            self.assertEqual(self.scalar(cursor, "SELECT COUNT(*) FROM information_schema."
+                                                 "statements_summary_evicted"), 0)
+
+    def test_slow_query_entries_are_tenant_local(self):
+        markers = ["slow_" + uuid.uuid4().hex[:12] for _ in self.clients]
+        for cursor, marker in zip(self.clients, markers):
+            cursor.execute(f"SELECT SLEEP(0.4), '{marker}'")
+            cursor.fetchall()
+        for cursor, own, other in zip(self.clients, markers, reversed(markers)):
+            for table in ("slow_query", "cluster_slow_query"):
+                count = lambda marker: self.scalar(
+                    cursor, f"SELECT COUNT(*) FROM information_schema.{table} WHERE query LIKE %s",
+                    ("%" + marker + "%",))
+                self.assertEqual(count(own), 1, table)
+                self.assertEqual(count(other), 0, table)
+            cursor.execute("ADMIN SHOW SLOW RECENT 200")
+            texts = " ".join(str(row[0]) for row in cursor.fetchall())
+            self.assertIn(own, texts)
+            self.assertNotIn(other, texts)
+
+    def test_show_status_is_tenant_local(self):
+        a, b = self.clients
+        status = lambda cursor: (cursor.execute("SHOW STATUS LIKE 'ddl_schema_version'"),
+                                 cursor.fetchall()[0][1])[1]
+        before = status(a), status(b)
+        a.execute("CREATE TABLE status_probe (id INT)")
+        self.assertNotEqual(status(a), before[0])
+        self.assertEqual(status(b), before[1])
+
+    def test_lock_waits_deadlocks_and_transactions_are_tenant_local(self):
+        a, b = self.clients
+        a.execute("INSERT INTO t VALUES (2, 1)")
+        holder = self.connect(self.tenants[0]).cursor()
+        waiter = self.connect(self.tenants[0]).cursor()
+        for cursor in (holder, waiter):
+            cursor.execute("USE " + self.schema)
+            cursor.execute("SET innodb_lock_wait_timeout = 20")
+        holder.execute("BEGIN PESSIMISTIC")
+        holder.execute("SELECT 1 AS trx_probe")
+        holder.execute("UPDATE t SET marker = 3 WHERE id = 1")
+        holder_ts = self.scalar(holder, "SELECT @@tidb_current_ts")
+        waiter.execute("BEGIN PESSIMISTIC")
+        waiter.execute("UPDATE t SET marker = 4 WHERE id = 2")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            blocked = pool.submit(waiter.execute, "UPDATE t SET marker = 4 WHERE id = 1")
+            waits = 0
+            for _ in range(50):
+                waits = self.scalar(a, "SELECT COUNT(*) FROM information_schema.data_lock_waits "
+                                       "WHERE current_holding_trx_id = %s", (holder_ts,))
+                if waits:
+                    break
+                time.sleep(0.1)
+            self.assertGreater(waits, 0, "the tenant sees its own lock wait")
+            self.assertEqual(self.scalar(b, "SELECT COUNT(*) FROM information_schema.data_lock_waits"), 0)
+            self.assertEqual(self.scalar(b, "SELECT COUNT(*) FROM information_schema.cluster_tidb_trx "
+                                            "WHERE id = %s", (holder_ts,)), 0)
+            # Close the cycle: the holder now waits for the waiter's row 2.
+            with self.assertRaises(pymysql.err.OperationalError) as raised:
+                holder.execute("UPDATE t SET marker = 5 WHERE id = 2")
+                blocked.result(timeout=30)
+            self.assertEqual(raised.exception.args[0], 1213)
+            try:
+                blocked.result(timeout=30)
+            except pymysql.err.MySQLError:
+                pass
+        for cursor in (holder, waiter):
+            cursor.execute("ROLLBACK")
+        deadlock = lambda cursor: self.scalar(
+            cursor, "SELECT COUNT(*) FROM information_schema.deadlocks "
+                    "WHERE try_lock_trx_id = %s OR trx_holding_lock = %s", (holder_ts, holder_ts))
+        self.assertGreater(deadlock(a), 0, "the tenant sees its own deadlock")
+        self.assertEqual(deadlock(b), 0)
+
+    def test_process_wide_sources_are_refused_or_empty(self):
+        for cursor in self.clients:
+            for sql in ("SELECT * FROM metrics_schema.up",
+                        "SELECT * FROM information_schema.cluster_log "
+                        "WHERE time > '2026-01-01 00:00:00' AND time < '2030-01-01 00:00:00'"):
+                with self.assertRaises(pymysql.err.MySQLError) as raised:
+                    cursor.execute(sql)
+                self.assertEqual(raised.exception.args[0], 1235, sql)
+            for table in ("client_errors_summary_global", "memory_usage_ops_history"):
+                self.assertEqual(self.scalar(cursor, f"SELECT COUNT(*) FROM information_schema.{table}"), 0)
 
 
 if __name__ == "__main__":

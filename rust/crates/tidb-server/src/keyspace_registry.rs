@@ -100,14 +100,6 @@ impl MultiKeyspaceDev {
     }
 }
 
-/// Splits `<keyspace>.<account>` at the first dot. Keyspace names never
-/// contain a dot (`tidb_naming::check_keyspace_name`), so the prefix is
-/// unambiguous; `None` when the name has no prefix.
-pub(crate) fn keyspace_of_user(user: &str) -> Option<&str> {
-    let (keyspace, account) = user.split_once('.')?;
-    (!keyspace.is_empty() && !account.is_empty()).then_some(keyspace)
-}
-
 /// What a connection is served by once its keyspace is known: the
 /// keyspace's session factory and accounts.
 pub(crate) type Routed<F> = (Arc<F>, Arc<ConfiguredUserStore>);
@@ -448,7 +440,7 @@ impl ConnectionRouter<Domain> for KeyspaceRegistry {
         // A user without a prefix is served by the node's configured
         // keyspace: the design's `default-keyspace` (§4), which keeps plain
         // `root` and TiUP's readiness probe working in development mode.
-        let routed = match keyspace_of_user(user) {
+        let routed = match tidb_keyspace::keyspace_of_user(user) {
             Some(keyspace) if keyspace != self.primary_keyspace => {
                 if !self.allowed(keyspace) {
                     return None;
@@ -465,15 +457,6 @@ impl ConnectionRouter<Domain> for KeyspaceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn keyspace_of_user_splits_at_the_first_dot() {
-        assert_eq!(keyspace_of_user("keyspace1.root"), Some("keyspace1"));
-        assert_eq!(keyspace_of_user("ks.app.reader"), Some("ks"));
-        assert_eq!(keyspace_of_user("root"), None);
-        assert_eq!(keyspace_of_user(".root"), None);
-        assert_eq!(keyspace_of_user("ks."), None);
-    }
 
     /// Records the kills an expensive-query watchdog sends a process.
     #[derive(Default)]

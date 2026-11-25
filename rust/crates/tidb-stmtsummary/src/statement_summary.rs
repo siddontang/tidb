@@ -104,6 +104,21 @@ impl StmtDigestKey {
         }
     }
 
+    /// Separates the statement's keyspace into the key: on a node serving
+    /// several keyspaces, two tenants running the same statement get two
+    /// summaries (design §6.8). An empty keyspace (a classic node) leaves
+    /// the key as Go's; a `0xFF` byte, which no UTF-8 name holds, starts
+    /// the segment.
+    pub fn append_keyspace(&mut self, keyspace: &str) {
+        if keyspace.is_empty() {
+            return;
+        }
+        let keyspace_len = u32::try_from(keyspace.len()).unwrap_or(u32::MAX);
+        self.hash.push(0xFF);
+        self.hash.extend_from_slice(&keyspace_len.to_be_bytes());
+        self.hash.extend_from_slice(keyspace.as_bytes());
+    }
+
     /// Go `(*StmtDigestKey).Hash`: implements `SimpleLRUCache.Key`.
     ///
     /// Only when the current SQL is `commit` is `prevSQL` recorded; otherwise
@@ -1126,6 +1141,9 @@ pub struct StmtSummaryByDigest {
     pub binding_sql: String,
     /// Go `bindingDigest`.
     pub binding_digest: String,
+    /// The keyspace of the statements (Go `StmtExecInfo.KeyspaceName`),
+    /// which is part of the key ([`StmtDigestKey::append_keyspace`]).
+    pub keyspace_name: String,
 }
 
 impl StmtSummaryByDigest {
@@ -1163,6 +1181,7 @@ impl StmtSummaryByDigest {
             plan_digest = sei.lazy_info.plan_digest();
         }
         self.schema_name.clone_from(&sei.schema_name);
+        self.keyspace_name.clone_from(&sei.keyspace_name);
         self.digest.clone_from(&sei.digest);
         self.plan_digest = plan_digest;
         self.stmt_type.clone_from(&sei.stmt_ctx.stmt_type);
@@ -1475,6 +1494,7 @@ impl StmtSummaryByDigestMap {
             &sei.resource_group_name,
             user_for_key,
         );
+        key.append_keyspace(&sei.keyspace_name);
 
         // Check again. Statements could be added before disabling the flag and
         // after Clear().

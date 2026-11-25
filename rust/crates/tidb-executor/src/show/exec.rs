@@ -128,7 +128,8 @@ pub trait ShowExec: crate::simple::account_password::AccountPasswordExec {
     where
         Self: crate::sessionctx::SessionContext,
     {
-        let status_vars = tidb_variable::statusvar::get_status_vars(Some(self.session_vars()))
+        let keyspace = self.viewer_state().keyspace;
+        let status_vars = tidb_variable::statusvar::get_keyspace_status_vars(Some(self.session_vars()), keyspace.as_deref())
             .map_err(|error| DriverError::Mysql(tidb_terror::MysqlError::unknown(error)))?;
         Ok(status_vars
             .into_iter()

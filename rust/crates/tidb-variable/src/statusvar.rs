@@ -47,15 +47,43 @@ pub struct StatusVal {
 }
 
 /// Go `statisticsList`, holding the default provider Go's `init` registers.
-static STATISTICS_LIST: LazyLock<RwLock<Vec<Arc<dyn Statistics>>>> =
-    LazyLock::new(|| RwLock::new(vec![Arc::new(DefaultStatusStat) as Arc<dyn Statistics>]));
+/// Each provider is the process's (`None`) or one keyspace runtime's: a node
+/// serving several keyspaces registers one domain and GC worker per
+/// keyspace, whose statuses share names (multi-keyspace design §6.8).
+#[allow(clippy::type_complexity)]
+static STATISTICS_LIST: LazyLock<RwLock<Vec<(Option<String>, Arc<dyn Statistics>)>>> =
+    LazyLock::new(|| RwLock::new(vec![(None, Arc::new(DefaultStatusStat) as Arc<dyn Statistics>)]));
 
 /// Go `RegisterStatistics`.
 pub fn register_statistics(statistics: Arc<dyn Statistics>) {
     STATISTICS_LIST
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(statistics);
+        .push((None, statistics));
+}
+
+/// [`register_statistics`] for a provider of `keyspace`'s runtime, which
+/// [`get_keyspace_status_vars`] reads for that keyspace only (and
+/// [`get_status_vars`], a single-keyspace node's, reads as any other).
+pub fn register_keyspace_statistics(keyspace: &str, statistics: Arc<dyn Statistics>) {
+    STATISTICS_LIST
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((Some(keyspace.to_owned()), statistics));
+}
+
+/// Marks the registered `statistics` as `keyspace`'s runtime's, for a
+/// provider registered before its runtime knew its keyspace.
+pub fn bind_statistics_to_keyspace(statistics: &Arc<dyn Statistics>, keyspace: &str) {
+    let mut list = STATISTICS_LIST
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((owner, _)) = list
+        .iter_mut()
+        .find(|(_, registered)| Arc::ptr_eq(registered, statistics))
+    {
+        *owner = Some(keyspace.to_owned());
+    }
 }
 
 /// Go `UnregisterStatistics`.
@@ -65,7 +93,7 @@ pub fn unregister_statistics(statistics: &Arc<dyn Statistics>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(index) = list
         .iter()
-        .rposition(|registered| Arc::ptr_eq(registered, statistics))
+        .rposition(|(_, registered)| Arc::ptr_eq(registered, statistics))
     {
         list.swap_remove(index);
     }
@@ -76,11 +104,24 @@ pub fn unregister_statistics(statistics: &Arc<dyn Statistics>) {
 pub fn get_status_vars(
     vars: Option<&SessionVars>,
 ) -> Result<BTreeMap<String, StatusVal>, String> {
+    get_keyspace_status_vars(vars, None)
+}
+
+/// [`get_status_vars`] as `keyspace` sees them: the process's providers and
+/// `keyspace`'s runtime's, never another keyspace's. `None` (a
+/// single-keyspace node) reads every provider.
+pub fn get_keyspace_status_vars(
+    vars: Option<&SessionVars>,
+    keyspace: Option<&str>,
+) -> Result<BTreeMap<String, StatusVal>, String> {
     let list = STATISTICS_LIST
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut status_vars = BTreeMap::new();
-    for statistics in list.iter() {
+    for (owner, statistics) in list.iter() {
+        if keyspace.is_some() && owner.is_some() && owner.as_deref() != keyspace {
+            continue;
+        }
         for (name, value) in statistics.stats(vars)? {
             let scope = statistics.get_scope(&name);
             status_vars.insert(name, StatusVal { scope, value });

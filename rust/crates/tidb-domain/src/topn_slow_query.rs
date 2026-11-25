@@ -487,18 +487,36 @@ struct DomainSlowQueries {
     last_expired: std::time::Instant,
 }
 
-static SLOW_QUERIES: std::sync::LazyLock<std::sync::Mutex<DomainSlowQueries>> =
-    std::sync::LazyLock::new(|| {
+impl DomainSlowQueries {
+    fn new() -> Self {
         let config = tidb_config::config_tree::config::get_global_config();
-        std::sync::Mutex::new(DomainSlowQueries {
+        Self {
             queries: TopNSlowQueries::new(
                 usize::try_from(config.in_mem_slow_query_topn_num).unwrap_or(0),
                 std::time::Duration::from_secs(60 * 60 * 24 * 7),
                 usize::try_from(config.in_mem_slow_query_recent_num).unwrap_or(0),
             ),
             last_expired: std::time::Instant::now(),
-        })
-    });
+        }
+    }
+}
+
+/// One slow-query memory per keyspace, as each Go domain holds its own. A
+/// single-keyspace node keeps one, under the empty name; a node serving
+/// several keyspaces keeps one per keyspace (design §6.8).
+static SLOW_QUERIES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, DomainSlowQueries>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The key of `keyspace`'s slow-query memory: its name on a node serving
+/// several keyspaces, the one memory otherwise.
+fn slow_queries_key(keyspace: &str) -> String {
+    if tidb_keyspace::is_multi_keyspace_mode() {
+        keyspace.to_owned()
+    } else {
+        String::new()
+    }
+}
 
 /// Go `topNSlowQueryLoop`'s ticker: every ten minutes the user and internal
 /// heaps drop entries older than the period.
@@ -510,22 +528,25 @@ fn remove_expired_slow_queries(store: &mut DomainSlowQueries) {
     }
 }
 
-/// Go `domain.LogSlowQuery`: hands the statement to the slow-query memory.
-pub fn log_slow_query(info: SlowQueryInfo) {
-    let mut store = SLOW_QUERIES
+/// Go `domain.LogSlowQuery`: hands the statement to the slow-query memory
+/// of its keyspace.
+pub fn log_slow_query(keyspace: &str, info: SlowQueryInfo) {
+    let mut stores = SLOW_QUERIES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    remove_expired_slow_queries(&mut store);
+    let store = stores.entry(slow_queries_key(keyspace)).or_insert_with(DomainSlowQueries::new);
+    remove_expired_slow_queries(store);
     store.queries.append(info);
 }
 
 /// Go `Domain.ShowSlowQuery`: `QueryTop` for `ADMIN SHOW SLOW TOP`,
-/// `QueryRecent` for `ADMIN SHOW SLOW RECENT`.
-pub fn show_slow_query(mode: &tidb_ast::AdminShowSlowMode, count: u64) -> Vec<SlowQueryInfo> {
-    let mut store = SLOW_QUERIES
+/// `QueryRecent` for `ADMIN SHOW SLOW RECENT`, over `keyspace`'s memory.
+pub fn show_slow_query(keyspace: &str, mode: &tidb_ast::AdminShowSlowMode, count: u64) -> Vec<SlowQueryInfo> {
+    let mut stores = SLOW_QUERIES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    remove_expired_slow_queries(&mut store);
+    let store = stores.entry(slow_queries_key(keyspace)).or_insert_with(DomainSlowQueries::new);
+    remove_expired_slow_queries(store);
     let count = usize::try_from(count).unwrap_or(usize::MAX);
     match mode {
         tidb_ast::AdminShowSlowMode::Recent => store.queries.query_recent(count),

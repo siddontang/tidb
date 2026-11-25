@@ -177,6 +177,17 @@ pub enum UsernamePolicy {
     },
 }
 
+/// The keyspace a prefixed account name `<keyspace>.<account>` names,
+/// split at the first dot (the prefix [`UsernamePolicy::Prefix`] gives
+/// accounts). Keyspace names never contain a dot
+/// (`tidb_naming::check_keyspace_name`), so the prefix is unambiguous;
+/// `None` when the name has no prefix.
+#[must_use]
+pub fn keyspace_of_user(user: &str) -> Option<&str> {
+    let (keyspace, account) = user.split_once('.')?;
+    (!keyspace.is_empty() && !account.is_empty()).then_some(keyspace)
+}
+
 /// Go `GetUsernamePolicy`: the prefix policy in Starter deployments, the
 /// permissive default otherwise. This is the process's configured keyspace's
 /// policy; a statement or a login uses its keyspace's
@@ -341,6 +352,16 @@ impl UsernamePolicy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keyspace_of_user_splits_at_the_first_dot() {
+        use super::keyspace_of_user;
+        assert_eq!(keyspace_of_user("keyspace1.root"), Some("keyspace1"));
+        assert_eq!(keyspace_of_user("ks.app.reader"), Some("ks"));
+        assert_eq!(keyspace_of_user("root"), None);
+        assert_eq!(keyspace_of_user(".root"), None);
+        assert_eq!(keyspace_of_user("ks."), None);
+    }
+
     use super::*;
 
     struct FakeCodec {

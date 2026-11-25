@@ -563,7 +563,8 @@ pub trait ExecStmtObservation: crate::sessionctx::SessionContext {
                     .join(",")
             )
         };
-        tidb_domain::topn_slow_query::log_slow_query(tidb_domain::topn_slow_query::SlowQueryInfo {
+        let keyspace = self.observed_keyspace_name();
+        tidb_domain::topn_slow_query::log_slow_query(&keyspace, tidb_domain::topn_slow_query::SlowQueryInfo {
             sql: items.sql,
             start: Some(observation.start_time.into()),
             duration: elapsed,

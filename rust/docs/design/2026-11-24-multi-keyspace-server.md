@@ -768,21 +768,21 @@ operator listener exists, Op means node config.
 | TTL jobs and timers | TS + RT | SQL | Isolated: job manager per domain; delete rate per keyspace. | `tidb-ttl-ttlworker/src/del.rs:118` | — |
 | MV service, workload repository, runaway, RU writer, telemetry | RT | — | Isolated per domain. | `keyspace_runtime.rs` | — |
 | IMPORT INTO, BR, PLAN REPLAYER, external storage | P | — | Shared; refused in multi-keyspace mode. Each runtime open overwrites the import store, BRIE node and cluster ID. | `keyspace_runtime.rs:100`; `tidb-executor/src/builder.rs`; `tidb-executor/src/admin.rs` | 3f |
-| INFORMATION_SCHEMA, PERFORMANCE_SCHEMA, SYS | RT + P | — | Table definitions and catalog rows are per runtime. Diagnostic rows still come from process-wide providers: the statement summary, `slow_query`, deadlock, transaction-summary and `CLUSTER_*` tables (§6.8). The processlist is per runtime (§6.6). | `tidb-infoschema/src/lib.rs:2266` | 3e |
-| METRICS_SCHEMA | P | — | Shared: `PROMETHEUS_STATE` belongs to the last-opened runtime, and metrics carry no keyspace label. | `tidb-domain-infosync/src/prometheus_addr.rs:86` | 3b, 3e |
+| INFORMATION_SCHEMA, PERFORMANCE_SCHEMA, SYS | RT + P | — | Isolated (§6.8): table definitions, catalog rows, processlist, `TIDB_TRX` and index usage are per runtime; the process-wide diagnostics are keyed by keyspace or filtered to the session's; `CLUSTER_*` tables read this node only. Refused (1235): `CLUSTER_LOG`, `TIDB_HOT_REGIONS(_HISTORY)` (3b), the profile tables. Empty: `CLIENT_ERRORS_SUMMARY_*`, `MEMORY_USAGE_OPS_HISTORY`. | `tidb-executor/src/memtable_reader.rs` (`ViewerState::keyspace`) | Rest: §6.8 |
+| METRICS_SCHEMA | P | — | Refused (1235) in multi-keyspace mode, and with it the metric-backed summaries and inspections: `PROMETHEUS_STATE` belongs to the last-opened runtime, and metrics carry no keyspace label. | `tidb-executor/src/driver/physical_builder.rs` (metric scan) | 3b, metrics labels (§5.5) |
 | Instance plan cache, stats, binding and schema caches | RT | Cfg (limits) | Isolated, but each runtime gets the full process quota, so memory grows with the number of tenants. | `tidb-session/src/domain/cluster_session_node/node_services.rs:37` | Phase 5 |
-| Statement summary v1 and v2 | P | — | Shared. | `tidb-stmtsummary/src/statement_summary.rs:46`; `v2/stmtsummary.rs:138` | 3e |
-| Slow log, `slow_query`, top-N slow | P | — | Shared: entries carry the keyspace, but nothing filters on it. | `tidb-domain/src/topn_slow_query.rs:490` | 3e |
-| Deadlock history, transaction summary | P | — | Shared. | `tidb-deadlockhistory/src/lib.rs:214`; `tidb-txninfo/src/lib.rs:237` | 3e |
-| Top SQL | P | — | Shared: the reporter binds one keyspace. | `tidb-topsql/src/lib.rs:45` | 3e |
-| `SHOW STATUS` providers | P | — | Shared: one process list (`STATISTICS_LIST`); each domain and GC worker registers into it, and a later provider wins on name. | `tidb-variable/src/statusvar.rs:50`; `tidb-gcworker/src/gc_worker.rs:314` | 3e (§6.8) |
+| Statement summary v1 and v2 | P | — | v1 isolated: one process map keyed by keyspace, read for the session's keyspace; the evicted rollup (every keyspace's) reads as empty. Capacity is shared (noisy neighbour). v2 (persistent) is refused (1235): its records and files have no keyspace key. | `tidb-stmtsummary/src/statement_summary.rs` (`append_keyspace`); `tidb-executor/src/memtable_reader.rs` (`statement_summary_rows`) | v2: later |
+| Slow log, `slow_query`, top-N slow | P | — | Isolated: one slow log; `slow_query` reads the entries whose `Keyspace_name` is the session's. `ADMIN SHOW SLOW` keeps one memory per keyspace. | `tidb-executor/src/slow_query.rs` (`SlowLogChecker::keyspace`); `tidb-domain/src/topn_slow_query.rs` | — |
+| Deadlock history, transaction summary, lock waits | P | — | Isolated: deadlocks carry the detecting store's keyspace and are read for the session's (capacity shared); each keyspace's process list records into its own fork of the transaction-summary recorder; `DATA_LOCK_WAITS` keeps the store's keyspace's waits (TiKV answers with every keyspace's). | `tidb-deadlockhistory/src/lib.rs` (`push_in_keyspace`); `tidb-txninfo/src/lib.rs` (`fork`); `tidb-txnkv/src/driver/tikv_store.rs` (`own_lock_waits`) | — |
+| Top SQL | P | — | Shared: the reporter binds one keyspace. Not readable through SQL; reports go to the collector. | `tidb-topsql/src/lib.rs:45` | Later (§6.8) |
+| `SHOW STATUS` providers | P | — | Isolated: one process list whose providers are keyed by keyspace (each domain's and GC worker's); a session reads the process providers and its keyspace's. | `tidb-variable/src/statusvar.rs` (`get_keyspace_status_vars`) | — |
 | Processlist, `KILL`, connection IDs | RT + P | — | Isolated: processlist per domain; one process server ID, reserved in SYSTEM and in each tenant before it is published, and one process connection-ID allocator; `KILL` of another tenant's ID finds nothing. | `tidb-server/src/keyspace_runtime.rs` (`ProcessServerId`); `tidb-domain/src/server_id.rs` | — |
 | Expensive-query watchdog | RT + P | — | Isolated: each runtime runs its own over its own processes and settings. It recognizes auto-analyze sessions through the process-wide `GLOBAL_AUTO_ANALYZE_PROCESS_LIST`, whose connection IDs are unique in the process (§6.6). | `keyspace_registry.rs` (`start_expensive_query_watchdog`); `tidb-stats-handle-util/src/auto_analyze_proc_id_generator.rs:101` | — |
 | `max_prepared_stmt_count` counter | P | — | Shared: one process counter checked against each tenant's own limit. | `tidb-variable/src/vars.rs:1024` | Phase 4 |
 | Server info, topology | Tenant etcd | — | Isolated per runtime; the process record for TiProxy is missing. | `cluster_stack.rs:840` | 3h |
 | Keyspace identity, resource tags | RT | — | Mostly isolated. A few readers still use the configured keyspace name. | `tidb-ddl-ingest/src/util.rs:45`; `tidb-planner/src/plan_builder/stmt_build.rs:51`; `tidb-planner-extstore/src/lib.rs:56`; `tidb-server/src/http_status.rs` | 3a |
 | Logging | P (one file) | Cfg | Shared by design; each record carries the tenant. | `tidb-logutil/src/tenant.rs` | — |
-| Metrics | P | — | Shared: no keyspace label. | `tidb-metrics` | 3e, §5.5 |
+| Metrics | P | — | Shared: no keyspace label. Not readable by a tenant: METRICS_SCHEMA is refused, and the status port is operator-only (§5.5). | `tidb-metrics` | §5.5 |
 | Password validation, history, lockout | TS + RT | SQL | Isolated (vardef appendix: kept per keyspace). | §6.3 appendix | — |
 | Signing cert, JWKS, LDAP, SEM, extensions | P | Cfg | Shared by design. Session tokens are not bound to a keyspace. | `tidb-sessionstates/src/session_token.rs:189` | 3g |
 | `require_secure_transport` | P | Op | A process static, while §6.7 checks it per tenant. | `tidb-tls/src/lib.rs:28` | Phase 2 (§6.7) |
@@ -799,8 +799,8 @@ operator listener exists, Op means node config.
   overlap (3d).
 - Wrong data: with overlapping table IDs, `TABLE_ROW_STATS_CACHE` can give one
   tenant another tenant's sizes in information-schema tables (3d).
-- Leaks: statement summary, `slow_query`, deadlocks, transaction summary, Top
-  SQL, METRICS_SCHEMA and `SHOW STATUS` (3e).
+- Diagnostics (§6.8): what has no keyspace-correct source is refused or
+  empty; Top SQL reports still name one keyspace (not SQL-readable).
 - Exhaustion: one tenant's prepared statements count against another tenant's
   limit; one process connection cap; the memory top-1 kill can pick a tenant
   that is not the cause (Phases 4 and 5).
@@ -1318,7 +1318,9 @@ unknown ID), and `EXPLAIN FOR CONNECTION` answers `ER_NO_SUCH_THREAD`.
   failpoint `github.com/pingcap/tidb/pkg/domain/forceServerIDCandidate`
   (`return(<id>)`, set at startup through `GO_FAILPOINTS` in a `failpoints`
   build) forces a real node's first candidate. The two-node run has not been
-  done: it needs a `failpoints` nextgen build beside the regular ones.
+  done: it needs a `failpoints` nextgen build beside the regular ones. A
+  remote `KILL` into a multi-keyspace node is refused for now: the request
+  names no keyspace (§6.8).
 
 **Mixed-fleet test.** One multi-keyspace node and one single-keyspace
 **nextgen** node serve the same tenant, with a failpoint that forces
@@ -1357,6 +1359,65 @@ overlapping candidate IDs. Check:
 | Metrics | the `keyspace_name` const label is fixed at registration | A variable `keyspace` label on per-tenant series, bounded by `max-keyspaces` |
 | `CLUSTER_*` tables, `SHOW PROCESSLIST`, `KILL` | | Filtered to the caller's keyspace |
 | `SHOW STATUS` | one process provider list (`tidb-variable/src/statusvar.rs:50`); every domain and GC worker registers into it, a later provider wins on name | One provider list per runtime |
+
+**Status (development mode, phase 3e).** The rule: a process-wide owner is
+keyed by keyspace or filtered at read time by the session's keyspace, never by
+a numeric ID alone (table and connection IDs collide across tenants). The
+least invasive tenant-correct choice was taken per surface; the process-wide
+owners stay, so a single-keyspace node is unchanged. A session reads its
+keyspace through `ViewerState::keyspace`, which is `None` on a
+single-keyspace node.
+
+- **Statement summary v1:** one process map, keyed by keyspace
+  (`StmtDigestKey::append_keyspace`); each record keeps its keyspace and the
+  reader reads the session's only, in the current, history, `CLUSTER_` and
+  cumulative (`TIDB_STATEMENTS_STATS`) tables. The evicted rollup sums every
+  keyspace's evicted statements, so `STATEMENTS_SUMMARY_EVICTED` and the
+  rollup row read as empty. The capacity (`tidb_stmt_summary_max_stmt_count`)
+  is shared: one tenant can evict another's (noisy neighbour, not a leak).
+- **Statement summary v2 (persistent):** refused (1235); its memory and files
+  have no keyspace key.
+- **Slow log:** one file, each entry with `Keyspace_name`; `slow_query` reads
+  the session's keyspace's entries, so an entry with no keyspace reads for
+  none (this also covers a session that points `tidb_slow_query_file`
+  elsewhere). `ADMIN SHOW SLOW` keeps one top-N memory per keyspace.
+- **Deadlocks:** each record carries the keyspace of the store whose
+  transaction detected it (a wait cycle never crosses keyspaces: their keys
+  are disjoint), and `DEADLOCKS` reads the session's. The capacity is shared.
+- **`DATA_LOCK_WAITS`:** TiKV answers `GetLockWaitInfo` with every
+  keyspace's waits; an API-v2 store keeps its keyspace's, with the prefix
+  decoded, and drops the rest (this also fixes the raw keys a single-keyspace
+  nextgen node showed).
+- **`TRX_SUMMARY`:** each domain's process list records into its own fork of
+  the process recorder, which follows the process's capacity and minimum
+  duration. `TIDB_TRX` and the processlist were per runtime already (§6.6).
+- **`SHOW STATUS`:** the provider list is keyed by keyspace (each domain's
+  and GC worker's providers carry their keyspace); a session reads the
+  process providers and its keyspace's.
+- **`CLUSTER_*` tables:** read this node only. Every keyspace's server info
+  names the one status port, whose peer service answers for the configured
+  keyspace and cannot tell which keyspace asks. That service, on a
+  multi-keyspace node, answers only requests whose user carries the
+  configured keyspace's prefix; a request with no user (a remote `KILL`) or
+  another keyspace's user is refused, so a remote `KILL` into a
+  multi-keyspace node does not work yet (3f, status port multiplexing).
+- **Refused (1235):** METRICS_SCHEMA (and the metric-backed summaries and
+  inspections), `CLUSTER_LOG` (the node's log holds every keyspace's records),
+  `TIDB_HOT_REGIONS` and `TIDB_HOT_REGIONS_HISTORY` (PD's regions matched to
+  the catalog by table ID; 3b), the `PERFORMANCE_SCHEMA` profile tables (the
+  process's and the cluster's), `FLUSH CLIENT_ERRORS_SUMMARY`.
+- **Empty:** `CLIENT_ERRORS_SUMMARY_GLOBAL`, `_BY_USER` and `_BY_HOST` (the
+  process's error counters), `MEMORY_USAGE_OPS_HISTORY` (the process's memory
+  kills, with other tenants' statements).
+- **Left as they are:** `MEMORY_USAGE`, `CLUSTER_INFO`, `CLUSTER_CONFIG`,
+  `CLUSTER_LOAD`, `CLUSTER_HARDWARE`, `CLUSTER_SYSTEMINFO`,
+  `TIKV_STORE_STATUS`: infrastructure the tenants share, not another tenant's
+  data (Starter hides them with SEM). `TIDB_INDEX_USAGE`, the processlist and
+  `TIDB_TRX` are per domain.
+- **Deferred:** Top SQL (not SQL-readable; its reports name one keyspace),
+  metrics keyspace labels (§5.5), the v2 statement summary, peer requests
+  that name their keyspace (3f), and the TiFlash system tables (not checked
+  yet; 3b).
 
 ### 6.9 Status port and AutoID service
 
@@ -1495,7 +1556,7 @@ in parallel once Phase 1 lands.
 | **3b** | PD/infosync singletons into `RuntimeServices` (§6.2), including a keyspace-qualified placement group ID | Resource-group, placement and label-rule SQL per tenant |
 | **3c** | `SET GLOBAL` / vardef split (§6.3), with the generated classification appendix | `SET GLOBAL` isolation tests for every global-scoped atomic |
 | **3d** | ID-keyed caches and DDL version state into the runtime (§6.4) and transaction/GC maps (§6.5) | Stats and DDL concurrency in two tenants; GC safe point per tenant |
-| **3e** | Observability isolation (§6.8), including the `SHOW STATUS` providers | Processlist, KILL, statement summary and slow-query filtering tests |
+| **3e** | Observability isolation (§6.8), including the `SHOW STATUS` providers. **Done in development mode**; the deferred items are listed in §6.8 | Processlist, KILL, statement summary and slow-query filtering tests |
 | **3f** | Status port multiplexing + AutoID service map + per-store globals, including the DXF task managers (§6.9, §6.10) | AUTO_ID_CACHE=1 tables in two tenants; IMPORT INTO per tenant |
 | **3g** | Session migration (§5.6): keyspace-bound session tokens, token logins through routing, tenant-scoped `SET SESSION_STATES`, parity check of the ported session-states code in multi-keyspace mode | §5.6 migration tests, including cross-tenant token replay rejection |
 | **3h. TiProxy** (pingcap/tiproxy `rust`) | K1–K6 (§5.7): multi-keyspace backends, username-prefix routing, migration guard and metering by session keyspace, per-keyspace drain, keyspace-compatible balancing | TiProxy unit tests plus the §5.6 migration tests through `tiproxy-rs --standalone` |

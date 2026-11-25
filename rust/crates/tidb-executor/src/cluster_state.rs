@@ -205,6 +205,8 @@ impl ViewerState {
         let Some(extractor) = extractors.iter().find(|extractor| !extractor.skip_request) else {
             return Ok(Vec::new());
         };
+        // The node's one log holds every keyspace's records (design §6.8).
+        crate::multi_keyspace::refuse_on_multi_keyspace_node("CLUSTER_LOG")?;
         if !self.process_scoped {
             return Err(DriverError::from(
                 tidb_plannererrors::ERR_SPECIFIC_ACCESS_DENIED
@@ -542,6 +544,9 @@ impl ViewerState {
                 )?
             }
             "MEMORY_USAGE" => crate::memtable_reader::memory_usage_table_rows(),
+            // The process's memory kills, of any keyspace's sessions: none
+            // on a node serving several keyspaces (design §6.8).
+            "MEMORY_USAGE_OPS_HISTORY" if self.keyspace.is_some() => Vec::new(),
             "MEMORY_USAGE_OPS_HISTORY" => {
                 tidb_servermemorylimit::GLOBAL_MEMORY_OPS_HISTORY_MANAGER.get_rows()
             }
@@ -811,7 +816,16 @@ use tidb_charset::Collation;
                 user_name: Some(name.to_owned()),
                 user_host: Some(host.to_owned()),
             });
-        let client: Arc<dyn tidb_txnkv::Client> = match (&self.server_info_syncer, &self.cluster_peer) {
+        // A node serving several keyspaces reads its `CLUSTER_*` tables
+        // here only (design §6.8): every keyspace's server info names this
+        // node's one status port, whose peer service cannot tell which
+        // keyspace asks, and a peer may be such a node too.
+        let peers = if self.keyspace.is_some() {
+            (None, None)
+        } else {
+            (self.server_info_syncer.as_ref(), self.cluster_peer.as_ref())
+        };
+        let client: Arc<dyn tidb_txnkv::Client> = match peers {
             (Some(syncer), Some(peer)) => {
                 let syncer = Arc::clone(syncer);
                 Arc::new(crate::cluster_peer::TiDbMemCopClient::new(
@@ -876,7 +890,9 @@ use tidb_charset::Collation;
             COL_CURRENT_SQL_DIGEST, COL_DEADLOCK_ID, COL_KEY, COL_OCCUR_TIME, COL_RETRYABLE,
             COL_TRX_HOLDING_LOCK, COL_TRY_LOCK_TRX_ID, GLOBAL_DEADLOCK_HISTORY,
         };
-        let records = GLOBAL_DEADLOCK_HISTORY.get_all();
+        // On a node serving several keyspaces, the history keeps every
+        // keyspace's records: the viewer reads its own (design §6.8).
+        let records = GLOBAL_DEADLOCK_HISTORY.get_all_in_keyspace(self.keyspace.as_deref());
         let texts = if needs_text {
             self.sql_digest_texts(ctx, 
                 records.iter().flat_map(|record| {
@@ -951,6 +967,9 @@ use tidb_charset::Collation;
         if extractor.skip_request {
             return Ok(Vec::new());
         }
+        // PD's hot regions are every keyspace's, matched to this catalog by
+        // table ID, which collides across keyspaces (phase 3b).
+        crate::multi_keyspace::refuse_on_multi_keyspace_node("TIDB_HOT_REGIONS_HISTORY")?;
         if !self.process_scoped {
             return Err(DriverError::from(
                 tidb_plannererrors::ERR_SPECIFIC_ACCESS_DENIED
@@ -1086,8 +1105,9 @@ impl tidb_txnkv::Client for LocalTiDbCopClient {
         (|| -> Result<Box<dyn tidb_txnkv::Response + Send>, String> {
         use prost::Message;
         let metadata = request.metadata();
-        // A session that discovers TiDBs but cannot reach them.
-        if let Some(syncer) = self.viewer.server_info_syncer.as_deref() {
+        // A session that discovers TiDBs but cannot reach them. A
+        // multi-keyspace node answers from itself alone (design §6.8).
+        if let Some(syncer) = self.viewer.server_info_syncer.as_deref().filter(|_| self.viewer.keyspace.is_none()) {
             let local_id = syncer.get_local_server_info().static_info.id;
             if syncer
                 .get_all_server_info()?

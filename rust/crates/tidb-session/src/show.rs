@@ -307,6 +307,10 @@ impl tidb_executor::index_advisor::RecommendIndexExec for Session {
 }
 
 impl tidb_executor::admin::AdminExec for Session {
+    fn slow_query_keyspace(&self) -> String {
+        self.keyspace_context().name().to_owned()
+    }
+
     fn brie_sql_killer(&self) -> std::sync::Arc<tidb_sqlkiller::SqlKiller> {
         self.sql_killer()
     }

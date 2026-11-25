@@ -1311,6 +1311,9 @@ fn build_mem_table(
                 let unknown = |error: String| {
                     retrieval_error(DriverError::Mysql(crate::driver::MysqlError::unknown(error)))
                 };
+                // The process's metrics carry no keyspace (design §6.8).
+                crate::multi_keyspace::refuse_on_multi_keyspace_node("METRICS_SCHEMA")
+                    .map_err(retrieval_error)?;
                 let rows = crate::metrics_reader::MetricRetriever {
                     table: &table,
                     extractor: &extractor,

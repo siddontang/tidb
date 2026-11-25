@@ -68,12 +68,21 @@ pub struct SlowLogChecker {
     pub enable_time_check: bool,
     /// Go `SlowQueryExtractor.TimeRanges`, inclusive on both ends.
     pub time_ranges: Vec<(DateTime<Utc>, DateTime<Utc>)>,
+    /// The viewer's keyspace on a node serving several keyspaces, whose
+    /// one slow log holds every keyspace's entries: only entries whose
+    /// `Keyspace_name` is this keyspace are read (design §6.8).
+    pub keyspace: Option<String>,
 }
 
 impl SlowLogChecker {
     /// Go `hasPrivilege`.
     fn has_privilege(&self, user_name: &str) -> bool {
         self.has_process_priv || self.user.as_deref().is_none_or(|user| user == user_name)
+    }
+
+    /// Whether an entry of `keyspace_name` belongs to the viewer's keyspace.
+    fn is_keyspace_visible(&self, keyspace_name: &str) -> bool {
+        self.keyspace.as_deref().is_none_or(|keyspace| keyspace == keyspace_name)
     }
 
     /// Go `isTimeValid`.
@@ -943,6 +952,7 @@ impl Parser<'_> {
         let mut data = Vec::new();
         let mut row: Vec<Option<Datum>> = Vec::new();
         let mut user = String::new();
+        let mut keyspace_name = String::new();
         let mut start_flag = false;
         for (line, line_num) in log {
             let (line, line_num) = (line.as_str(), *line_num);
@@ -950,6 +960,7 @@ impl Parser<'_> {
                 if let Some(value) = line.strip_prefix(SLOW_LOG_START_PREFIX_STR) {
                     row = vec![None; self.columns.len()];
                     user.clear();
+                    keyspace_name.clear();
                     if self.set_column_value(warnings, &mut row, "Time", value, line_num) {
                         start_flag = true;
                     }
@@ -1001,6 +1012,9 @@ impl Parser<'_> {
                     } else {
                         let (fields, values) = split_by_colon(rest);
                         for (field, value) in fields.iter().zip(values.iter()) {
+                            if *field == tidb_variable::slow_log::SLOW_LOG_KEYSPACE_NAME {
+                                value.clone_into(&mut keyspace_name);
+                            }
                             if !self.set_column_value(warnings, &mut row, field, value, line_num) {
                                 start_flag = false;
                                 break;
@@ -1016,7 +1030,7 @@ impl Parser<'_> {
                     if line.starts_with("use") {
                         continue;
                     }
-                    if !self.checker.has_privilege(&user) {
+                    if !self.checker.has_privilege(&user) || !self.checker.is_keyspace_visible(&keyspace_name) {
                         start_flag = false;
                         continue;
                     }
@@ -1585,6 +1599,51 @@ mod tests {
             let want: Vec<&str> = want.iter().copied().filter(|line| !line.is_empty()).collect();
             assert_eq!(got, want, "{start}");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Design §6.8: a node serving several keyspaces writes one slow log;
+    /// a keyspace's reader sees the entries whose `Keyspace_name` is its
+    /// own, in both scan directions, and an entry naming no keyspace (a
+    /// process-wide one) reads for no keyspace.
+    #[test]
+    fn a_keyspace_reads_only_its_slow_log_entries() {
+        let dir = std::env::temp_dir().join(format!("slow-query-keyspace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tenants.log");
+        std::fs::write(
+            &path,
+            "# Time: 2020-02-15T18:00:01.000000+08:00\n# Keyspace_name: keyspace_a\n# Keyspace_ID: 1\nselect 'a1';\n\
+             # Time: 2020-02-15T18:00:02.000000+08:00\n# Keyspace_name: keyspace_b\n# Keyspace_ID: 2\nselect 'b1';\n\
+             # Time: 2020-02-15T18:00:03.000000+08:00\nselect 'none';\n\
+             # Time: 2020-02-15T18:00:04.000000+08:00\n# Keyspace_name: keyspace_a\n# Keyspace_ID: 1\nselect 'a2';\n",
+        )
+        .unwrap();
+        let columns = tidb_infoschema::infoschema_meta::table_schema("SLOW_QUERY").unwrap();
+        let read = |keyspace: Option<&str>, desc: bool| {
+            let checker = SlowLogChecker {
+                has_process_priv: true,
+                keyspace: keyspace.map(str::to_owned),
+                ..Default::default()
+            };
+            let read = retrieve_slow_query_rows(
+                &columns,
+                &checker,
+                &SessionTimeZone::utc(),
+                path.to_str().unwrap(),
+                None,
+                0,
+                desc,
+                4,
+            )
+            .unwrap();
+            queries(&columns, &read.rows)
+        };
+        assert_eq!(read(Some("keyspace_a"), false), ["select 'a1';", "select 'a2';"]);
+        assert_eq!(read(Some("keyspace_a"), true), ["select 'a2';", "select 'a1';"]);
+        assert_eq!(read(Some("keyspace_b"), false), ["select 'b1';"]);
+        assert!(read(Some("keyspace_c"), false).is_empty());
+        assert_eq!(read(None, false).len(), 4, "a single-keyspace node reads every entry");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -55,6 +55,9 @@ pub struct StmtSummaryReader<'a> {
     checker: Option<StmtSummaryChecker>,
     /// Go `tz *time.Location`.
     tz: SessionTimeZone,
+    /// The viewer's keyspace on a node serving several keyspaces: only its
+    /// summaries are read, and the evicted rollup (every keyspace's) is not.
+    keyspace: Option<String>,
 }
 
 impl std::fmt::Debug for StmtSummaryReader<'_> {
@@ -72,6 +75,10 @@ impl std::fmt::Debug for StmtSummaryReader<'_> {
 
 impl StmtSummaryReader<'static> {
     /// Go `NewStmtSummaryReader`: returns a new statement summaries reader.
+    /// `keyspace` is the viewer's on a node serving several keyspaces: the
+    /// reader reads only its summaries, without the evicted rollup, which
+    /// sums every keyspace's (design §6.8); `None` reads every summary, as
+    /// Go does.
     ///
     /// # Panics
     ///
@@ -82,6 +89,7 @@ impl StmtSummaryReader<'static> {
         cols: Vec<ColumnInfo>,
         instance_addr: String,
         tz: SessionTimeZone,
+        keyspace: Option<String>,
     ) -> Self {
         // initialize column value factories.
         let column_value_factories = cols
@@ -104,6 +112,7 @@ impl StmtSummaryReader<'static> {
             column_value_factories,
             checker: None,
             tz,
+            keyspace,
         }
     }
 }
@@ -119,6 +128,11 @@ impl StmtSummaryReader<'_> {
         self.checker = checker;
     }
 
+    /// Whether `ssbd` is outside the reader's keyspace.
+    fn is_other_keyspace(&self, ssbd: &StmtSummaryByDigest) -> bool {
+        self.keyspace.as_ref().is_some_and(|keyspace| *keyspace != ssbd.keyspace_name)
+    }
+
     /// Go `(*stmtSummaryReader).GetStmtSummaryCumulativeRows`: gets statement
     /// summary rows with cumulative metrics.
     ///
@@ -131,6 +145,9 @@ impl StmtSummaryReader<'_> {
         let mut rows = Vec::with_capacity(values.len());
         for value in &values {
             let ssbd = value.lock().unwrap();
+            if self.is_other_keyspace(&ssbd) {
+                continue;
+            }
             if let Some(checker) = &self.checker {
                 if !checker.is_digest_valid(&ssbd.digest) {
                     continue;
@@ -157,6 +174,9 @@ impl StmtSummaryReader<'_> {
         for value in &values {
             {
                 let ssbd = value.lock().unwrap();
+                if self.is_other_keyspace(&ssbd) {
+                    continue;
+                }
                 if let Some(checker) = &self.checker {
                     if !checker.is_digest_valid(&ssbd.digest) {
                         continue;
@@ -167,7 +187,7 @@ impl StmtSummaryReader<'_> {
                 rows.push(record);
             }
         }
-        if self.checker.is_none() {
+        if self.checker.is_none() && self.keyspace.is_none() {
             if let Some(other_datum) = self.get_stmt_evicted_other_row(begin_time) {
                 rows.push(other_datum);
             }
@@ -183,10 +203,13 @@ impl StmtSummaryReader<'_> {
         let history_size = self.ss_map.history_size();
         let mut rows = Vec::with_capacity(values.len() * history_size);
         for value in &values {
+            if self.is_other_keyspace(&value.lock().unwrap()) {
+                continue;
+            }
             rows.extend(self.get_stmt_by_digest_history_row(value, history_size));
         }
 
-        if self.checker.is_none() {
+        if self.checker.is_none() && self.keyspace.is_none() {
             rows.extend(self.get_stmt_evicted_other_history_row(history_size));
         }
         rows
@@ -1251,7 +1274,7 @@ pub(crate) mod tests {
             })
             .collect();
         let mut reader: StmtSummaryReader<'a> =
-            StmtSummaryReader::new(None, true, cols, String::new(), SessionTimeZone::utc());
+            StmtSummaryReader::new(None, true, cols, String::new(), SessionTimeZone::utc(), None);
         reader.ss_map = ss_map;
         reader
     }
@@ -2094,5 +2117,50 @@ pub(crate) mod tests {
         reader.has_process_priv = true;
         let datums = reader.get_stmt_summary_current_rows();
         assert_eq!(datums.len(), loops);
+    }
+
+    /// Design §6.8: two keyspaces of one node running the same statement get
+    /// a summary each, and a reader of one keyspace sees its own in the
+    /// current and history views, never the other's nor the
+    /// evicted rollup, which sums every keyspace's.
+    #[test]
+    fn a_keyspace_reader_sees_only_its_keyspace() {
+        let ss_map = StmtSummaryByDigestMap::new();
+        ss_map.set_max_stmt_count(2).unwrap();
+        ss_map.set_begin_time_for_cur_interval(Utc::now().timestamp() + 60);
+        let mut a = generate_any_exec_info();
+        a.keyspace_name = "keyspace_a".to_owned();
+        let mut b = generate_any_exec_info();
+        b.keyspace_name = "keyspace_b".to_owned();
+        ss_map.add_statement(&a);
+        ss_map.add_statement(&b);
+        ss_map.add_statement(&a);
+        assert_eq!(ss_map.summary_map_size(), 2, "one summary per keyspace");
+
+        let exec_count = |rows: &[Vec<Datum>]| -> Vec<Datum> { rows.iter().map(|row| row[11].clone()).collect() };
+        // A reader of `keyspace`, over the test reader's columns.
+        let reader_of = |keyspace: &str| {
+            let mut reader = new_stmt_summary_reader_for_test(&ss_map);
+            reader.keyspace = Some(keyspace.to_owned());
+            reader
+        };
+        let reader = reader_of("keyspace_a");
+        assert_eq!(exec_count(&reader.get_stmt_summary_current_rows()), [Datum::new_int(2)]);
+        assert_eq!(exec_count(&reader.get_stmt_summary_history_rows()), [Datum::new_int(2)]);
+        assert_eq!(exec_count(&reader_of("keyspace_b").get_stmt_summary_current_rows()), [Datum::new_int(1)]);
+        assert!(reader_of("keyspace_c").get_stmt_summary_current_rows().is_empty());
+        assert!(reader_of("keyspace_c").get_stmt_summary_history_rows().is_empty());
+
+        // A third summary evicts one into the rollup, which a keyspace
+        // reader never shows; an unfiltered reader still does, as Go's.
+        let mut c = generate_any_exec_info();
+        c.keyspace_name = "keyspace_a".to_owned();
+        c.digest = "other_digest".to_owned();
+        ss_map.add_statement(&c);
+        assert_eq!(ss_map.evicted().unwrap().lock().unwrap().history_len(), 1);
+        let digests: Vec<Datum> = reader_of("keyspace_a").get_stmt_summary_current_rows().iter().map(|row| row[4].clone()).collect();
+        assert!(!digests.contains(&Datum::Null), "the rollup row: {digests:?}");
+        let unfiltered = new_stmt_summary_reader_for_test(&ss_map);
+        assert!(unfiltered.get_stmt_summary_current_rows().iter().any(|row| row[4] == Datum::Null));
     }
 }

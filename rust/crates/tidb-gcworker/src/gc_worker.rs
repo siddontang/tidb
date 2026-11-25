@@ -310,10 +310,16 @@ impl GcWorker {
             std::process::id(),
             go_time_now_string()
         );
+        let keyspace_name = deps.store.keyspace_meta().map(|meta| meta.name).unwrap_or_default();
         let worker = Self::with_identity(deps, uuid, desc, keyspace_id);
-        tidb_variable::statusvar::register_statistics(Arc::new(GcStatistics(Arc::clone(
-            &worker.job,
-        ))));
+        let statistics = Arc::new(GcStatistics(Arc::clone(&worker.job)));
+        // Each keyspace runtime of a multi-keyspace node runs its own GC
+        // worker, whose `tidb_gc_*` statuses are its keyspace's (§6.8).
+        if !keyspace_name.is_empty() {
+            tidb_variable::statusvar::register_keyspace_statistics(&keyspace_name, statistics);
+        } else {
+            tidb_variable::statusvar::register_statistics(statistics);
+        }
         Ok(worker)
     }
 

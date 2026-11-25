@@ -120,6 +120,11 @@ impl MemTableRetriever for PerfSchemaRetriever {
         _catalog: &SessionExtendedInfoSchema,
         ctx: &tidb_sessionctx::StmtContext,
     ) -> Result<Vec<Vec<Datum>>, DriverError> {
+        // The profiles are the whole process's and the cluster's, not one
+        // keyspace's (design §6.8).
+        if read.table_name.to_ascii_lowercase().contains("_profile_") {
+            tidb_executor::multi_keyspace::refuse_on_multi_keyspace_node("PERFORMANCE_SCHEMA profiles")?;
+        }
         let sctx = StatementPerfSchema { retriever: self, ctx };
         tidb_infoschema_perfschema::tables::get_rows(&read.table_name.to_ascii_lowercase(), &sctx)
             .map_err(|error| DriverError::Mysql(tidb_terror::MysqlError::unknown(error)))

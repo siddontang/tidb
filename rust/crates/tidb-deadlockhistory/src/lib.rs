@@ -145,7 +145,8 @@ impl DeadlockRecord {
 #[derive(Debug)]
 struct HistoryState {
     capacity: usize,
-    deadlocks: VecDeque<Arc<DeadlockRecord>>,
+    /// Each record with the keyspace whose transaction detected it.
+    deadlocks: VecDeque<(String, Arc<DeadlockRecord>)>,
     next_id: u64,
 }
 
@@ -180,7 +181,14 @@ impl DeadlockHistory {
     }
 
     /// Assigns an ID and appends `record`; capacity zero ignores it entirely.
-    pub fn push(&self, mut record: DeadlockRecord) {
+    pub fn push(&self, record: DeadlockRecord) {
+        self.push_in_keyspace("", record);
+    }
+
+    /// [`Self::push`] for a deadlock a transaction of `keyspace` detected.
+    /// A wait cycle never crosses keyspaces (their keys are disjoint), so
+    /// the whole record is that keyspace's (design §6.8).
+    pub fn push_in_keyspace(&self, keyspace: &str, mut record: DeadlockRecord) {
         let mut state = self.lock();
         if state.capacity == 0 {
             return;
@@ -190,12 +198,22 @@ impl DeadlockHistory {
         if state.deadlocks.len() == state.capacity {
             state.deadlocks.pop_front();
         }
-        state.deadlocks.push_back(Arc::new(record));
+        state.deadlocks.push_back((keyspace.to_owned(), Arc::new(record)));
     }
 
     /// Returns an ordered snapshot from oldest to newest.
     pub fn get_all(&self) -> Vec<Arc<DeadlockRecord>> {
-        self.lock().deadlocks.iter().cloned().collect()
+        self.get_all_in_keyspace(None)
+    }
+
+    /// [`Self::get_all`] of `keyspace`'s records (`None`: every record).
+    pub fn get_all_in_keyspace(&self, keyspace: Option<&str>) -> Vec<Arc<DeadlockRecord>> {
+        self.lock()
+            .deadlocks
+            .iter()
+            .filter(|(recorded, _)| keyspace.is_none_or(|keyspace| keyspace == recorded))
+            .map(|(_, record)| Arc::clone(record))
+            .collect()
     }
 
     /// Clears records while retaining capacity and the next monotonic ID.

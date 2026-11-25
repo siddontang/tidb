@@ -454,6 +454,19 @@ impl<PdC: PdClient> TikvStore<PdC> {
     /// moves on.
     pub fn get_lock_waits(&self) -> Result<Vec<tidb_proto::KvrpcWaitForEntry>, String> {
         const LOCK_WAIT_INFO_TIMEOUT: Duration = Duration::from_secs(30);
+        // A TiKV answers with every keyspace's waits, their keys encoded
+        // with their keyspace's prefix. An API-v2 store keeps its own
+        // keyspace's, decoded (client-go's codec decodes this response),
+        // and drops the rest: another keyspace's waits are not this
+        // store's to show (multi-keyspace design §6.8).
+        let codec = match self.store.keyspace().context_keyspace_id() {
+            Some(id) if self.store.keyspace().api_version() == tikv_client::proto::kvrpcpb::ApiVersion::V2 => Some(
+                tikv_client::request::ApiV2Codec::new(tikv_client::request::KeyMode::Txn, id)
+                    .map_err(|error| error.to_string())?,
+            ),
+            _ => None,
+        };
+        let own_entries = |entries| own_lock_waits(codec.as_ref(), entries);
         self.block_on(async {
             let stores = self
                 .store
@@ -485,7 +498,7 @@ impl<PdC: PdClient> TikvStore<PdC> {
                     }
                 };
                 match response.downcast::<tikv_client::proto::kvrpcpb::GetLockWaitInfoResponse>() {
-                    Ok(response) => result.extend(response.entries),
+                    Ok(response) => result.extend(own_entries(response.entries)),
                     Err(_) => tidb_logutil::bg_logger()
                         .warn("lock wait info from store is nil", &[]),
                 }
@@ -645,6 +658,54 @@ where
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         }),
         Err(_) => runtime.block_on(operation),
+    }
+}
+
+/// The lock waits of an API-v2 store's keyspace among `entries` (every
+/// keyspace's, as a TiKV answers), their keys decoded by `codec`; every
+/// entry for an API-v1 store (`None`).
+fn own_lock_waits(
+    codec: Option<&tikv_client::request::ApiV2Codec>,
+    entries: Vec<tidb_proto::KvrpcWaitForEntry>,
+) -> Vec<tidb_proto::KvrpcWaitForEntry> {
+    let Some(codec) = codec else {
+        return entries;
+    };
+    entries
+        .into_iter()
+        .filter_map(|mut entry| {
+            if entry.key.is_empty() {
+                return None;
+            }
+            entry.key = codec.decode_key(&entry.key).ok()?;
+            Some(entry)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod lock_wait_tests {
+    use super::*;
+    use tikv_client::request::{ApiV2Codec, KeyMode};
+
+    /// Design §6.8: a TiKV answers `GetLockWaitInfo` with every keyspace's
+    /// waits; a keyspace's store keeps its own, decoded, and never another
+    /// keyspace's, even with the same raw key.
+    #[test]
+    fn a_keyspace_store_keeps_only_its_own_lock_waits() {
+        let (a, b) = (ApiV2Codec::new(KeyMode::Txn, 1).unwrap(), ApiV2Codec::new(KeyMode::Txn, 2).unwrap());
+        let entry = |codec: &ApiV2Codec, txn: u64| tidb_proto::KvrpcWaitForEntry {
+            txn,
+            wait_for_txn: txn + 1,
+            key: codec.encode_key(b"t\x80\x00\x00\x00\x00\x00\x00\x64_r1"),
+            ..Default::default()
+        };
+        let entries = vec![entry(&a, 10), entry(&b, 20), entry(&a, 30)];
+        let own = own_lock_waits(Some(&a), entries.clone());
+        assert_eq!(own.iter().map(|entry| entry.txn).collect::<Vec<_>>(), [10, 30]);
+        assert_eq!(own[0].key, b"t\x80\x00\x00\x00\x00\x00\x00\x64_r1", "decoded");
+        assert_eq!(own_lock_waits(Some(&b), entries.clone()).iter().map(|entry| entry.txn).collect::<Vec<_>>(), [20]);
+        assert_eq!(own_lock_waits(None, entries).len(), 3, "an API-v1 store keeps every entry");
     }
 }
 

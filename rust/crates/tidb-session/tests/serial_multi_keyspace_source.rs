@@ -1122,3 +1122,125 @@ fn a_multi_keyspace_node_refuses_flashback_cluster() {
     assert_eq!(row_text(session.run("select count(*) from mysql.tidb_ddl_job")), [["0"]]);
     tidb_keyspace::set_multi_keyspace_mode(false);
 }
+
+/// Design §6.8 (phase 3e): two keyspaces of one node read only their own
+/// diagnostics from the process-wide owners. Both run the same statement:
+/// each sees only its own statement-summary rows (current, history,
+/// `CLUSTER_` and cumulative) and its own `ADMIN SHOW SLOW` entries, never
+/// the evicted rollup; each sees only its own deadlocks; `SHOW STATUS`
+/// reports each keyspace's own DDL statuses. The sources that cannot tell
+/// keyspaces apart are refused or read as empty.
+#[test]
+fn a_tenant_reads_only_its_own_diagnostics() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    // The mock bootstrap's resource-group DDL is refused in
+    // multi-keyspace mode, so the keyspaces open before the mode is on.
+    let _modes = ProcessModes::set("ks_a", tidb_config_deploymode::get(), false);
+    let a_store = MockStoreDomain::create_for_keyspace("ks_a").unwrap();
+    let b_store = MockStoreDomain::create_for_keyspace("ks_b").unwrap();
+    let (mut a, mut b) = (a_store.new_session().unwrap(), b_store.new_session().unwrap());
+    // A user's statements, which the summary records (an internal
+    // session's are not).
+    a.set_user("root@%".into(), "root@localhost".into());
+    b.set_user("root@%".into(), "root@localhost".into());
+    tidb_keyspace::set_multi_keyspace_mode(true);
+    let run = |session: &mut Session, sql: &str| {
+        session.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    };
+    let one = |session: &mut Session, sql: &str| -> String {
+        row_text(session.run(sql)).into_iter().next().and_then(|row| row.into_iter().next()).unwrap_or_default()
+    };
+
+    // The statement summary, keyed by keyspace.
+    tidb_stmtsummary::statement_summary::STMT_SUMMARY_BY_DIGEST_MAP.clear();
+    for _ in 0..2 {
+        run(&mut a, "select 1 as tenant_probe");
+    }
+    run(&mut b, "select 1 as tenant_probe");
+    let probe = "where digest_text like '%tenant_probe%'";
+    for (session, want) in [(&mut a, "2"), (&mut b, "1")] {
+        for table in ["statements_summary", "statements_summary_history", "cluster_statements_summary"] {
+            assert_eq!(one(session, &format!("select sum(exec_count) from information_schema.{table} {probe}")), want, "{table}");
+        }
+        assert_eq!(one(session, &format!("select count(*) from information_schema.tidb_statements_stats {probe}")), "1");
+        assert_eq!(one(session, "select count(*) from information_schema.statements_summary_evicted"), "0");
+        assert_eq!(one(session, "select count(*) from information_schema.statements_summary where digest is null"), "0");
+    }
+
+    // ADMIN SHOW SLOW, one memory per keyspace.
+    tidb_keyspace::set_multi_keyspace_mode(false);
+    run(&mut a, "set global tidb_slow_log_threshold = 0");
+    tidb_keyspace::set_multi_keyspace_mode(true);
+    run(&mut a, "select 'tenant slow probe a'");
+    run(&mut b, "select 'tenant slow probe b'");
+    let slow = |session: &mut Session| -> Vec<String> {
+        row_text(session.run("admin show slow recent 100"))
+            .into_iter()
+            .map(|row| row[0].clone())
+            .filter(|sql| sql.contains("tenant slow probe"))
+            .collect()
+    };
+    assert_eq!(slow(&mut a), ["select 'tenant slow probe a'"]);
+    assert_eq!(slow(&mut b), ["select 'tenant slow probe b'"]);
+    tidb_keyspace::set_multi_keyspace_mode(false);
+    run(&mut a, "set global tidb_slow_log_threshold = 300");
+    tidb_keyspace::set_multi_keyspace_mode(true);
+
+    // Deadlocks, recorded with the detecting transaction's keyspace.
+    tidb_deadlockhistory::recording::configure_deadlock_history(10, false);
+    let record = || tidb_deadlockhistory::DeadlockRecord {
+        occur_time: tidb_datatype::Time::new(
+            tidb_datatype::CoreTime::from_date(2026, 11, 25, 9, 0, 0, 0),
+            tidb_datatype::TimeType::Timestamp,
+            6,
+        )
+        .unwrap(),
+        wait_chain: vec![tidb_deadlockhistory::WaitChainItem {
+            sql_digest: String::new(),
+            key: Vec::new(),
+            all_sql_digests: Vec::new(),
+            try_lock_txn: 1,
+            txn_holding_lock: 2,
+        }],
+        id: 0,
+        is_retryable: false,
+    };
+    tidb_deadlockhistory::GLOBAL_DEADLOCK_HISTORY.push_in_keyspace("ks_a", record());
+    tidb_deadlockhistory::GLOBAL_DEADLOCK_HISTORY.push_in_keyspace("ks_a", record());
+    tidb_deadlockhistory::GLOBAL_DEADLOCK_HISTORY.push_in_keyspace("ks_b", record());
+    assert_eq!(one(&mut a, "select count(*) from information_schema.deadlocks"), "2");
+    assert_eq!(one(&mut b, "select count(*) from information_schema.cluster_deadlocks"), "1");
+    tidb_deadlockhistory::recording::configure_deadlock_history(0, false);
+
+    // SHOW STATUS: each domain's DDL statuses are its keyspace's.
+    let status = |session: &mut Session, name: &str| -> String {
+        row_text(session.run(&format!("show status like '{name}'"))).remove(0).remove(1)
+    };
+    let (a_version, b_version) = (status(&mut a, "ddl_schema_version"), status(&mut b, "ddl_schema_version"));
+    run(&mut a, "create table test.status_probe (a int)");
+    assert_ne!(status(&mut a, "ddl_schema_version"), a_version, "the keyspace's own DDL shows");
+    assert_eq!(status(&mut b, "ddl_schema_version"), b_version, "another keyspace's DDL does not");
+
+    // No keyspace-correct source: refused, or nothing.
+    for sql in [
+        "select * from metrics_schema.up",
+        "select * from information_schema.cluster_log where time > '2026-01-01 00:00:00' and time < '2027-01-01 00:00:00'",
+        "flush client_errors_summary",
+        "select * from information_schema.tidb_hot_regions",
+        "select * from performance_schema.tidb_profile_cpu",
+    ] {
+        let (code, message) = refusal(&mut b, sql).unwrap_or_else(|| panic!("{sql} ran"));
+        assert_eq!(code, 1235, "{sql}: {message}");
+    }
+    for table in [
+        "client_errors_summary_global",
+        "client_errors_summary_by_user",
+        "client_errors_summary_by_host",
+        "memory_usage_ops_history",
+    ] {
+        assert!(row_text(b.run(&format!("select * from information_schema.{table}"))).is_empty(), "{table}");
+    }
+}

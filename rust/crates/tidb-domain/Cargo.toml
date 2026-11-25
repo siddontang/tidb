@@ -23,6 +23,7 @@ tidb-domain-serverinfo = { path = "../tidb-domain-serverinfo" }
 tidb-replayer = { path = "../tidb-replayer" }
 tidb-globalconn = { path = "../tidb-globalconn" }
 tidb-failpoint = { path = "../tidb-failpoint" }
+tidb-keyspace = { path = "../tidb-keyspace" }
 tidb-logutil = { path = "../tidb-logutil" }
 tidb-memory = { path = "../tidb-memory" }
 tidb-printer = { path = "../tidb-printer" }
