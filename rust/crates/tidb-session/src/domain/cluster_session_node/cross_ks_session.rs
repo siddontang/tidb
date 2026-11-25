@@ -85,6 +85,7 @@ pub(crate) fn create_cross_ks_session_over(
         follower: catalog_follower::CatalogFollower::new(
             target.info_cache.clone(),
             loaded.schema_meta_version(),
+            loaded.schema_ts(),
             loaded.skipped_tables().to_vec(),
         ),
         commit_hooks: Box::new(move |session, schema_version| {

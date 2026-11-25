@@ -294,6 +294,7 @@ impl DomainSessions for Domain {
             follower: catalog_follower::CatalogFollower::new(
                 Arc::clone(&self.catalog),
                 loaded.schema_meta_version(),
+                loaded.schema_ts(),
                 loaded.skipped_tables().to_vec(),
             ),
             commit_hooks: Box::new({

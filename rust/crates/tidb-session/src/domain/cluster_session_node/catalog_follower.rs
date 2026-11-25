@@ -37,6 +37,14 @@ pub(super) struct CatalogFollower {
     /// The schema version the session's tables were built from. A move in
     /// `catalog` past this is what makes the connection rebuild them.
     schema_version: i64,
+    /// The timestamp the session's schema reads at (`schema_ts`). A V2
+    /// schema's moves on every reload, with no DDL (Go loader's
+    /// `CloneAndUpdateTS`); the session takes the newer one, as Go's takes
+    /// `domain.InfoSchema()` for every transaction. A session kept on the
+    /// old one would keep lowering the domain's recent info-schema TS
+    /// (`keep_alive`), so the min-start-ts report, and GC, would stay at the
+    /// last DDL while the session runs statements.
+    schema_ts: u64,
     /// Tables of the cluster the connection's catalog could not include,
     /// answered by name when a statement names one. Rebuilt with the catalog.
     pub(super) skipped: Vec<SkippedTable>,
@@ -46,11 +54,13 @@ impl CatalogFollower {
     pub(super) fn new(
         catalog: Arc<InfoCache>,
         schema_version: i64,
+        schema_ts: u64,
         skipped: Vec<SkippedTable>,
     ) -> Self {
         Self {
             catalog,
             schema_version,
+            schema_ts,
             skipped,
         }
     }
@@ -76,7 +86,7 @@ impl CatalogFollower {
         let loaded = self.catalog.get_latest();
         // Go pins InfoSchema independently of Domain.StatsHandle. Statistics
         // reads already see current publications, including inside a transaction.
-        if loaded.schema_meta_version() == self.schema_version {
+        if loaded.schema_meta_version() == self.schema_version && loaded.schema_ts() == self.schema_ts {
             return;
         }
         let shared = session.shared_catalog();
@@ -84,6 +94,7 @@ impl CatalogFollower {
         *catalog = (*loaded).clone();
         drop(catalog);
         self.schema_version = loaded.schema_meta_version();
+        self.schema_ts = loaded.schema_ts();
         session.set_plan_cache_schema_version(loaded.schema_meta_version() as u64);
         session.set_info_schema(Arc::clone(&loaded));
         self.skipped = loaded.skipped_tables().to_vec();

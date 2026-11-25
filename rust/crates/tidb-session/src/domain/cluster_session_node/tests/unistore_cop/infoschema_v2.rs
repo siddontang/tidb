@@ -330,3 +330,30 @@ fn v2_dropped_repartitioned_table_releases_its_placement_policy() {
         .execute_write("DROP PLACEMENT POLICY pp1")
         .unwrap();
 }
+
+/// Go loader's `CloneAndUpdateTS` and the per-transaction
+/// `domain.InfoSchema()`: a reload with no DDL moves the V2 schema's
+/// timestamp, and the session's next statement reads with the newer schema.
+/// Kept on the old one, its table reads lowered the domain's recent
+/// info-schema TS to the last DDL on every statement, so the min-start-ts
+/// report (and GC) stayed there while the session ran.
+#[test]
+fn a_session_reads_with_the_schema_ts_a_reload_refreshed() {
+    let (stack, _users) = cop_backed_stack();
+    let mut session = stack.factory.open_session(session_context(19005)).unwrap();
+    for sql in ["CREATE DATABASE refresh_ts", "USE refresh_ts", "CREATE TABLE t (a BIGINT)", "INSERT INTO t VALUES (1)"] {
+        session.node_conn().execute_write(sql).unwrap();
+    }
+    assert_eq!(displayed(rows(&mut session, "SELECT a FROM t")), [["1"]]);
+    let old = stack.factory.catalog.get_latest();
+    assert!(old.is_v2());
+    let shared = session.shared_catalog();
+    let session_ts = || shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).schema_ts();
+    assert_eq!(session_ts(), old.schema_ts());
+    // A reload with no DDL, a second later.
+    let fresh = old.schema_ts() + (1000 << 18);
+    stack.factory.catalog.refresh_snapshot_ts(fresh);
+    assert_eq!(stack.factory.catalog.get_latest().schema_meta_version(), old.schema_meta_version());
+    assert_eq!(displayed(rows(&mut session, "SELECT a FROM t")), [["1"]]);
+    assert_eq!(session_ts(), fresh, "the session kept the schema of the last DDL");
+}
