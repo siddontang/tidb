@@ -149,7 +149,9 @@ impl<S: PdClient> TikvTxn<S> {
             sql_staging: false,
             check_existence: false,
             start_ts,
-            _start_ts_guard: tidb_txnkv::inner_txn::ACTIVE_START_TS.hold(start_ts),
+            _start_ts_guard: tidb_txnkv::inner_txn::ACTIVE_START_TS
+                .of(tidb_keyspace::KeyspaceCodec::keyspace_id(store))
+                .hold(start_ts),
             authority_id,
             snapshot_stats,
             reader_snapshot_stats: None,

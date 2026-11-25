@@ -293,7 +293,9 @@ pub fn cluster_session_stack(
         let info_cache = InfoCacheMinTs(Arc::clone(&factory.catalog));
         runner
             .start_min_start_ts_reporter(move || {
-                let active = tidb_txnkv::ACTIVE_START_TS.snapshot();
+                // This keyspace's transactions only (design §6.5).
+                let keyspace_id = opener.keyspace_id();
+                let active = tidb_txnkv::ACTIVE_START_TS.snapshot_for(keyspace_id);
                 let pl = tidb_sessmgr::processinfo::SessionManager::show_process_list(&processes);
                 let internal = processes.internal_session_start_ts(|id| tidb_stats_handle_util::GLOBAL_AUTO_ANALYZE_PROCESS_LIST.contains(id));
                 // Go `ReportMinStartTS`: `store.CurrentVersion(kv.GlobalTxnScope)`.
@@ -310,7 +312,7 @@ pub fn cluster_session_stack(
                     version,
                     max_wait,
                     &info_cache,
-                    &tidb_txnkv::GLOBAL_INNER_TXN_START_TS,
+                    &tidb_txnkv::GLOBAL_INNER_TXN_START_TS.of(keyspace_id),
                 ))
             })
             .map_err(|error| RunConfiguredNodeError::Engine(SqlQueryError::unknown(error)))?;

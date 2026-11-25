@@ -757,7 +757,7 @@ operator listener exists, Op means node config.
 | Statistics (`mysql.stats_*`, cache, owner, auto-analyze queue) | TS + RT | SQL (ANALYZE) | Isolated per domain; auto-analyze reads its keyspace's settings. | `cluster_stack.rs:810,944` | — |
 | Stats globals keyed by table ID (`TABLE_ROW_STATS_CACHE`, async and sync load queues, `GLOBAL_AUTO_ANALYZE_PROCESS_LIST`) | P | — | Shared: table IDs collide. Process IDs do not: they come from the one process allocator (§6.6). | `tidb-stats-handle-cache/src/stats_table_row_cache.rs:61`; `tidb-stats-asyncload/src/lib.rs:26`; `tidb-stats-handle-syncload/src/sync_load.rs:75`; `tidb-stats-handle-util/src/auto_analyze_proc_id_generator.rs:101` | 3d |
 | GC worker, delete ranges, GC settings, safe points | TS + PD (per keyspace) | SQL (GC settings) | Isolated: one GC worker per runtime. | `keyspace_runtime.rs` | — |
-| min-start-ts report | Tenant etcd | — | Shared: every tenant's report reads the process-wide `ACTIVE_START_TS`, `GLOBAL_INNER_TXN_START_TS` and auto-analyze list. | `cluster_stack.rs:293`; `tidb-txnkv/src/inner_txn.rs:28,153` | Phase 2 (§6.5) |
+| min-start-ts report | Tenant etcd | — | Isolated: `ACTIVE_START_TS` and `GLOBAL_INNER_TXN_START_TS` keep one set per keyspace ID of the store a transaction reads, and each runtime's report reads its own set, its own process list and internal sessions. Statement results and cursors kept past their transaction cannot name their keyspace: they hold a shared set every report reads (conservative: another tenant's GC waits for them). The auto-analyze list only names process IDs, unique in the process (§6.6). | `cluster_stack.rs` (`start_min_start_ts_reporter`); `tidb-txnkv/src/inner_txn.rs` (`PerKeyspace`) | — |
 | TSO, PD client, region cache, TiKV channels | RT | — | Isolated: one store per keyspace. The tokio pool is shared by design. | `tikv_store.rs:93,127,158` | — |
 | AutoID allocators (default caching) | RT | — | Isolated per domain. | `cluster_stack.rs:793` | — |
 | AutoID service (`AUTO_ID_CACHE=1`) | P | — | Shared: only the configured runtime serves it, bound to one keyspace. Refused in multi-keyspace mode. | `keyspace_registry.rs`; `tidb-autoid-service/src/lib.rs:354` | 3f |
@@ -792,8 +792,8 @@ operator listener exists, Op means node config.
 
 **Cross-tenant risks today**, all in development mode only:
 
-- GC: one tenant's long transactions and auto-analyze, timed by its own TSO,
-  hold back another tenant's reported min-start-ts (Phase 2).
+- GC: a statement result or cursor kept past its transaction holds back
+  every tenant's reported min-start-ts (conservative, §6.5).
 - DDL: a peer on an old version in one tenant's fleet sets the job version
   for every tenant on the node; reorganization contexts collide when job IDs
   overlap (3d).
@@ -1221,7 +1221,11 @@ Moving it into the `Domain` is preferred, because it closes with the tenant.
 - `GLOBAL_INNER_TXN_START_TS` and `ACTIVE_START_TS` (`tidb-txnkv/src/inner_txn.rs:28,153`)
   feed the min-start-ts report used for GC safe points. TSO can differ per
   keyspace group, so these become a map keyed by keyspace ID, and each
-  runtime's reporter reads only its own entry.
+  runtime's reporter reads only its own entry. **Done:** a transaction, a
+  snapshot read and an inner transaction (`NewTxnStorage::keyspace_id`) are
+  held under the keyspace ID of the store they read. A statement result or
+  cursor kept past its transaction does not know its store, so it holds a
+  shared entry that every report reads (as a single-keyspace node does).
 - `DEFAULT_RESOURCE_GROUP` (`tidb-meta/src/transaction.rs:59`) moves per runtime.
 - The GC worker already takes the domain and store (`tidb-gcworker/src/node.rs:49`),
   so it runs once per runtime.

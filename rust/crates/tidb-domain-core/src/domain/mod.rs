@@ -242,6 +242,15 @@ impl TableStorageStatsProvider for ClusterTableStorageStatsProvider {
     }
 }
 
+impl Domain {
+    /// Pins snapshot timestamp `ts` against this domain's keyspace's GC
+    /// (its min-start-ts report) until the guard drops (design §6.5).
+    #[must_use]
+    pub fn hold_start_ts(&self, ts: u64) -> tidb_txnkv::StartTsGuard {
+        tidb_txnkv::ACTIVE_START_TS.of(self.transactions.keyspace_id()).hold(ts)
+    }
+}
+
 pub struct ClusterApproximateTableCountProvider {
     pub transactions: Arc<dyn ClusterTransactions>,
     pub cache: Arc<Mutex<tidb_pdhelper::ApproximateTableCountCache>>,

@@ -70,6 +70,14 @@ impl<S: tikv_client::PdClient> RealOptimisticTransactionOpener<S> {
     pub fn store(&self) -> &TikvStore<S> {
         &self.store
     }
+
+    /// Go `GetCodec().GetKeyspaceID()` of the store (`u32::MAX` for an
+    /// API-V1 store): the keyspace whose min-start-ts report holds GC back
+    /// for this opener's transactions.
+    #[must_use]
+    pub fn keyspace_id(&self) -> u32 {
+        tidb_keyspace::KeyspaceCodec::keyspace_id(&self.store)
+    }
 }
 
 impl RealOptimisticTransactionOpener {

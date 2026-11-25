@@ -364,6 +364,10 @@ where
             .map(|transaction| MetaTxn::new(transaction, self.timeout))
             .map_err(|error| MetaTxnError::terminal(error.to_string()))
     }
+
+    fn keyspace_id(&self) -> u32 {
+        self.opener.keyspace_id()
+    }
 }
 
 /// Go `kv.Storage` for metadata transactions, retaining the opened store.

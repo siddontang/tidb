@@ -915,7 +915,7 @@ fn snapshot_provider_batch_preserves_transaction_writes_and_timestamp() {
             Ok(HistoricalRead {
                 catalog: schema.unwrap().clone(),
                 store: store.clone(),
-                timestamp_hold: Arc::new(tidb_txnkv::ACTIVE_START_TS.hold(ts)),
+                timestamp_hold: Arc::new(tidb_txnkv::ACTIVE_START_TS.shared().hold(ts)),
             })
         }));
         session.run(&format!("BEGIN {mode}")).unwrap();
@@ -929,7 +929,7 @@ fn snapshot_provider_batch_preserves_transaction_writes_and_timestamp() {
         );
         assert!(session.in_transaction());
         assert_eq!(session.current_tso().value(), ordinary_ts);
-        assert!(!tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&100));
+        assert!(!tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&100));
         assert!(session.run("SELECT missing FROM sp_batch").is_err());
         assert!(session.in_transaction());
         session.run("SET tidb_snapshot=''").unwrap();
@@ -962,7 +962,7 @@ fn snapshot_provider_batch_result_close_preserves_outer_transaction_and_cursor_p
         Ok(HistoricalRead {
             catalog: schema.unwrap().clone(),
             store: store.clone(),
-            timestamp_hold: Arc::new(tidb_txnkv::ACTIVE_START_TS.hold(ts)),
+            timestamp_hold: Arc::new(tidb_txnkv::ACTIVE_START_TS.shared().hold(ts)),
         })
     }));
     session.run("BEGIN").unwrap();
@@ -974,18 +974,18 @@ fn snapshot_provider_batch_result_close_preserves_outer_transaction_and_cursor_p
     else {
         panic!("query")
     };
-    assert!(tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&987654321));
+    assert!(tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&987654321));
     let mut authority = session.result_materialization_authority();
     let cursor_pin = authority.take_start_ts_guard();
     result.close(&mut session).unwrap();
     result.close(&mut session).unwrap();
     assert!(session.in_transaction());
     assert!(
-        tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&987654321),
+        tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&987654321),
         "cursor outlives the statement"
     );
     drop(cursor_pin);
-    assert!(!tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&987654321));
+    assert!(!tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&987654321));
     session.run("SET tidb_snapshot=''").unwrap();
     session.run("ROLLBACK").unwrap();
 }

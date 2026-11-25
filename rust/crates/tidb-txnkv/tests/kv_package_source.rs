@@ -615,7 +615,7 @@ fn statement_kv_context_cell_publishes_the_running_statement() {
 #[test]
 fn package_retry_and_inner_txn_defaults_are_pinned() {
     assert_eq!(MAX_RETRY_COUNT, 100);
-    assert!(!GLOBAL_INNER_TXN_START_TS.contains(0));
+    assert!(!GLOBAL_INNER_TXN_START_TS.of(u32::MAX).contains(0));
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -699,6 +699,9 @@ impl NewTxnStorage for MockNewStorage {
             ..MockNewTransaction::default()
         })
     }
+    fn keyspace_id(&self) -> u32 {
+        u32::MAX
+    }
 }
 
 #[derive(Default)]
@@ -717,6 +720,9 @@ impl NewTxnStorage for RetryOnceStorage {
             commit_error: (self.starts == 1).then_some(MockError::Retryable),
             ..MockNewTransaction::default()
         })
+    }
+    fn keyspace_id(&self) -> u32 {
+        u32::MAX
     }
 }
 

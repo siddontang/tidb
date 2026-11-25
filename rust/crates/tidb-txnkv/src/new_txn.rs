@@ -65,6 +65,10 @@ pub trait NewTxnStorage {
 
     /// Begins a fresh transaction.
     fn begin(&mut self) -> Result<Self::Transaction, Self::Error>;
+    /// The keyspace ID of the store the transactions read (`u32::MAX` for
+    /// an API-V1 store): the keyspace whose min-start-ts report holds GC
+    /// back for them.
+    fn keyspace_id(&self) -> u32;
 }
 
 /// Retry classification required by the package loop.
@@ -113,7 +117,7 @@ where
         storage,
         retryable,
         MAX_RETRY_COUNT,
-        &GLOBAL_INNER_TXN_START_TS,
+        &GLOBAL_INNER_TXN_START_TS.of(storage.keyspace_id()),
         callback,
         |attempt| {
             let delay = retry_backoff_delay(attempt);
@@ -310,6 +314,9 @@ mod tests {
             self.attempts.set(self.attempts.get() + 1);
             Ok(MustFailTxn)
         }
+        fn keyspace_id(&self) -> u32 {
+            u32::MAX
+        }
     }
 
     /// A storage whose callback errors are surfaced verbatim.
@@ -321,6 +328,9 @@ mod tests {
         type Error = MockTxnError;
         fn begin(&mut self) -> Result<Self::Transaction, Self::Error> {
             Ok(MustFailTxn)
+        }
+        fn keyspace_id(&self) -> u32 {
+            u32::MAX
         }
     }
 
@@ -338,7 +348,7 @@ mod tests {
             &mut storage,
             true,
             5,
-            &GLOBAL_INNER_TXN_START_TS,
+            &GLOBAL_INNER_TXN_START_TS.of(u32::MAX),
             |_txn: &mut MustFailTxn| Ok(()),
             &mut no_sleep,
         );
@@ -352,7 +362,7 @@ mod tests {
             &mut storage,
             true,
             5,
-            &GLOBAL_INNER_TXN_START_TS,
+            &GLOBAL_INNER_TXN_START_TS.of(u32::MAX),
             |_txn: &mut MustFailTxn| Err::<(), MockTxnError>(MockTxnError::Retryable),
             &mut no_sleep,
         );
@@ -366,7 +376,7 @@ mod tests {
             &mut storage,
             true,
             5,
-            &GLOBAL_INNER_TXN_START_TS,
+            &GLOBAL_INNER_TXN_START_TS.of(u32::MAX),
             |txn: &mut MustFailTxn| {
                 attempts.set(attempts.get() + 1);
                 txn.rollback().ok();
@@ -376,5 +386,57 @@ mod tests {
         );
         assert!(error.is_err());
         assert_eq!(attempts.get(), 1);
+    }
+
+    /// A storage of keyspace 7 whose transactions start at `start_ts`.
+    struct KeyspaceStorage {
+        start_ts: u64,
+    }
+
+    struct KeyspaceTxn(u64);
+
+    impl TxnResourceGroup for KeyspaceTxn {
+        fn set_resource_group_name(&mut self, _name: &str) {}
+    }
+
+    impl NewTxnTransaction for KeyspaceTxn {
+        type Error = MockTxnError;
+        fn start_ts(&self) -> u64 {
+            self.0
+        }
+        fn set_option(&mut self, _option: OptionKey, _value: TxnOptionValue) {}
+        fn rollback(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn commit(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl NewTxnStorage for KeyspaceStorage {
+        type Transaction = KeyspaceTxn;
+        type Error = MockTxnError;
+        fn begin(&mut self) -> Result<Self::Transaction, Self::Error> {
+            Ok(KeyspaceTxn(self.start_ts))
+        }
+        fn keyspace_id(&self) -> u32 {
+            7
+        }
+    }
+
+    /// Design §6.5: an inner transaction is tracked under the keyspace of
+    /// the store it reads, whose min-start-ts report alone reads it.
+    #[test]
+    fn an_inner_transaction_is_tracked_in_its_store_keyspace() {
+        let start_ts = 0x7e57_0000_0001;
+        let mut storage = KeyspaceStorage { start_ts };
+        run_in_new_txn(&RunInNewTxnContext::default(), &mut storage, false, |_txn: &mut KeyspaceTxn| {
+            assert!(GLOBAL_INNER_TXN_START_TS.of(7).contains(start_ts));
+            assert!(!GLOBAL_INNER_TXN_START_TS.of(8).contains(start_ts));
+            assert!(!GLOBAL_INNER_TXN_START_TS.shared().contains(start_ts));
+            Ok(())
+        })
+        .unwrap();
+        assert!(!GLOBAL_INNER_TXN_START_TS.of(7).contains(start_ts));
     }
 }

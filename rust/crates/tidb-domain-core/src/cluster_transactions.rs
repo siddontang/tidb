@@ -1798,6 +1798,10 @@ struct ClusterWriteTxnStorage(Arc<dyn ClusterTransactions>);
 
 impl tidb_txnkv::NewTxnStorage for ClusterWriteTxnStorage {
     type Transaction = ClusterWriteTxn;
+
+    fn keyspace_id(&self) -> u32 {
+        self.0.keyspace_id()
+    }
     type Error = ClusterWriteTxnError;
 
     fn begin(&mut self) -> Result<ClusterWriteTxn, ClusterWriteTxnError> {
@@ -1914,6 +1918,10 @@ impl tidb_txnkv::NewTxnTransaction for ClusterNewTxn {
 
 impl tidb_txnkv::NewTxnStorage for ClusterNewTxnStorage {
     type Transaction = ClusterNewTxn;
+
+    fn keyspace_id(&self) -> u32 {
+        self.0.keyspace_id()
+    }
     type Error = ClusterNewTxnError;
 
     fn begin(&mut self) -> Result<ClusterNewTxn, ClusterNewTxnError> {

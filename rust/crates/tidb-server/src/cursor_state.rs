@@ -311,7 +311,9 @@ impl CursorState {
                 .map(|current| current.value() as u64)
                 .filter(|ts| *ts != 0 && *ts != u64::MAX)
             {
-                self._start_ts_guard = Some(Arc::new(tidb_txnkv::ACTIVE_START_TS.hold(ts)));
+                // The cursor does not know its store's keyspace: it holds
+                // back every keyspace's GC (design §6.5).
+                self._start_ts_guard = Some(Arc::new(tidb_txnkv::ACTIVE_START_TS.shared().hold(ts)));
             }
         }
     }
@@ -593,7 +595,7 @@ mod tests {
             },
         )
         .expect("cursor spill releases memory before CANCEL");
-        assert!(tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&765432109));
+        assert!(tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&765432109));
         assert!(cursor.rows.already_spilled());
         assert_eq!(cursor.fetch_plan(u32::MAX), (64, true));
         assert_eq!(session_tracker.bytes_consumed(), 0);
@@ -604,7 +606,7 @@ mod tests {
         assert_eq!(lifecycle.lock().unwrap().close, 1);
 
         drop(cursor);
-        assert!(!tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&765432109));
+        assert!(!tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&765432109));
         assert_eq!(session_tracker.bytes_consumed(), 0);
         assert_eq!(disk_tracker.bytes_consumed(), 0);
         assert_eq!(storage.global_tracker().bytes_consumed(), 0);

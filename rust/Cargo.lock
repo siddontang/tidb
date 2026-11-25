@@ -10907,6 +10907,7 @@ dependencies = [
  "tidb-failpoint",
  "tidb-gocontext",
  "tidb-hack",
+ "tidb-keyspace",
  "tidb-kv",
  "tidb-meta",
  "tidb-metrics",

@@ -16,17 +16,79 @@
 //!
 //! This owner keeps the synchronized process-global set, minimum selection,
 //! timestamp conversion, and long-running diagnostic side effect together.
+//!
+//! Go keeps one process-wide set: a node serves one keyspace. Here each set
+//! is one keyspace's ([`PerKeyspace`]), keyed by the keyspace ID of the store
+//! the transaction reads, so a node serving several keyspaces reports each
+//! keyspace's min-start-ts from that keyspace's transactions only
+//! (`rust/docs/design/2026-11-24-multi-keyspace-server.md`, §6.5).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 
 /// Duration after which an internal transaction is considered long-running.
 pub const TIME_TO_PRINT_LONG_INTERNAL_TXN: Duration = Duration::from_secs(5 * 60);
 
-/// Process-global inner-transaction timestamp registry.
-pub static GLOBAL_INNER_TXN_START_TS: LazyLock<InnerTxnStartTsBox> =
-    LazyLock::new(InnerTxnStartTsBox::new);
+/// Process-global inner-transaction timestamp registry, one set per
+/// keyspace ID.
+pub static GLOBAL_INNER_TXN_START_TS: LazyLock<PerKeyspace<InnerTxnStartTsBox>> =
+    LazyLock::new(PerKeyspace::default);
+
+/// One `T` per keyspace ID (the store's codec keyspace ID, `u32::MAX` for an
+/// API-V1 store), and one [`Self::shared`] by every keyspace. An entry lives
+/// as long as the process: a keyspace's is tiny and may be opened again.
+#[derive(Debug)]
+pub struct PerKeyspace<T> {
+    entries: Mutex<HashMap<u32, Arc<T>>>,
+    shared: Arc<T>,
+}
+
+impl<T: Default> Default for PerKeyspace<T> {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            shared: Arc::default(),
+        }
+    }
+}
+
+impl<T: Default> PerKeyspace<T> {
+    /// The entry every keyspace reads beside its own, for a holder that
+    /// cannot name its store's keyspace: it holds back every keyspace, as a
+    /// node serving one keyspace does.
+    #[must_use]
+    pub fn shared(&self) -> Arc<T> {
+        Arc::clone(&self.shared)
+    }
+
+    /// Keyspace `keyspace_id`'s entry, created on first use.
+    #[must_use]
+    pub fn of(&self, keyspace_id: u32) -> Arc<T> {
+        Arc::clone(
+            self.entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(keyspace_id)
+                .or_default(),
+        )
+    }
+
+    /// Every keyspace's entry and the shared one, for a check across
+    /// keyspaces.
+    #[must_use]
+    pub fn all(&self) -> Vec<Arc<T>> {
+        let mut all: Vec<_> = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        all.push(self.shared());
+        all
+    }
+}
 
 /// Synchronized set of inner-transaction start timestamps.
 ///
@@ -149,8 +211,27 @@ impl Drop for StartTsGuard {
     }
 }
 
-/// Shared by real storage transactions and cursors that outlive their transaction.
-pub static ACTIVE_START_TS: LazyLock<ActiveStartTs> = LazyLock::new(ActiveStartTs::default);
+/// Shared by real storage transactions and cursors that outlive their
+/// transaction, one set per keyspace ID of the store they read.
+pub static ACTIVE_START_TS: LazyLock<PerKeyspace<ActiveStartTs>> = LazyLock::new(PerKeyspace::default);
+
+impl PerKeyspace<ActiveStartTs> {
+    /// The timestamps keyspace `keyspace_id`'s min-start-ts report holds GC
+    /// back for: its own and the shared ones.
+    #[must_use]
+    pub fn snapshot_for(&self, keyspace_id: u32) -> Vec<u64> {
+        let mut timestamps = self.of(keyspace_id).snapshot();
+        timestamps.extend(self.shared.snapshot());
+        timestamps
+    }
+
+    /// [`ActiveStartTs::snapshot`] of every keyspace, for a check across
+    /// keyspaces.
+    #[must_use]
+    pub fn snapshot_all(&self) -> Vec<u64> {
+        self.all().iter().flat_map(|active| active.snapshot()).collect()
+    }
+}
 
 /// Go ReportMinStartTS range selection. CurrentVersion's logical bits are
 /// discarded; timestamps at either boundary cannot lower the report.
@@ -402,5 +483,33 @@ mod tests {
         assert!(!box_.contains(ts1));
         assert!(!box_.contains(ts2));
         assert!(!box_.contains(ts3));
+    }
+
+    /// Design §6.5: one keyspace's min-start-ts report reads its own
+    /// transactions and the shared holders, never another keyspace's, so a
+    /// long transaction in one keyspace does not hold back another's GC.
+    #[test]
+    fn a_keyspace_reports_only_its_own_start_ts() {
+        let active = PerKeyspace::<ActiveStartTs>::default();
+        let inner = PerKeyspace::<InnerTxnStartTsBox>::default();
+        let now_ms: u64 = 1_700_000_000_000;
+        let now = now_ms << 18;
+        let (a_old, b_older, shared) = ((now_ms - 60_000) << 18, (now_ms - 120_000) << 18, (now_ms - 90_000) << 18);
+        let _a = active.of(1).hold(a_old);
+        let b = active.of(2).hold(b_older);
+        inner.of(2).store_inner_txn_ts(b_older - 1);
+        assert_eq!(active.snapshot_for(1), [a_old]);
+        assert_eq!(report_min_start_ts(now, 86_400, active.snapshot_for(1), &inner.of(1)), a_old);
+        assert_eq!(report_min_start_ts(now, 86_400, active.snapshot_for(2), &inner.of(2)), b_older - 1);
+        drop(b);
+        inner.of(2).delete_inner_txn_ts(b_older - 1);
+        assert_eq!(report_min_start_ts(now, 86_400, active.snapshot_for(2), &inner.of(2)), now);
+        // A holder that cannot name its keyspace holds every keyspace back.
+        let _shared = active.shared().hold(shared);
+        assert_eq!(report_min_start_ts(now, 86_400, active.snapshot_for(1), &inner.of(1)), shared);
+        assert_eq!(report_min_start_ts(now, 86_400, active.snapshot_for(2), &inner.of(2)), shared);
+        let mut all = active.snapshot_all();
+        all.sort_unstable();
+        assert_eq!(all, [shared, a_old]);
     }
 }

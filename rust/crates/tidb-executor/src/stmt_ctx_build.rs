@@ -2231,8 +2231,10 @@ impl ResultMaterializationAuthority {
     /// Retains the snapshot across transaction completion until result/cursor close.
     #[must_use]
     pub fn with_start_ts(mut self, start_ts: u64) -> Self {
+        // The result does not know its store's keyspace: it holds back
+        // every keyspace's GC (design §6.5).
         self.start_ts_guard = (start_ts != 0 && start_ts != u64::MAX)
-            .then(|| Arc::new(tidb_txnkv::ACTIVE_START_TS.hold(start_ts)));
+            .then(|| Arc::new(tidb_txnkv::ACTIVE_START_TS.shared().hold(start_ts)));
         self
     }
 

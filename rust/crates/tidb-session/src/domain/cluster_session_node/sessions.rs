@@ -350,7 +350,7 @@ impl DomainSessions for Domain {
             // Go plans a stale read from the domain's current statistics.
             let statistics_view = Arc::clone(&self.statistics_view);
             session.set_historical_read_provider(Arc::new(move |ts, resource_group, schema| {
-                let hold = Arc::new(tidb_txnkv::ACTIVE_START_TS.hold(ts));
+                let hold = Arc::new(tidb_txnkv::ACTIVE_START_TS.of(transactions.keyspace_id()).hold(ts));
                 let snapshot = transactions
                     .open_snapshot_at(ts, resource_group)
                     .map_err(tidb_driver_error::DriverError::unsupported)?;
@@ -409,7 +409,7 @@ impl DomainSessions for Domain {
             let stale_ts_transactions = Arc::clone(&transactions);
             session.set_stale_timestamp_provider(Arc::new(move || stale_ts_transactions.stale_timestamp()));
             session.set_snapshot_schema_provider(Arc::new(move |ts, resource_group, validate| {
-                let _hold = tidb_txnkv::ACTIVE_START_TS.hold(ts);
+                let _hold = tidb_txnkv::ACTIVE_START_TS.of(transactions.keyspace_id()).hold(ts);
                 let snapshot = transactions
                     .open_snapshot_at(ts, resource_group)
                     .map_err(tidb_driver_error::DriverError::unsupported)?;
@@ -1732,7 +1732,7 @@ pub fn get_snapshot_info_schema(
     domain: &Domain,
     ts: u64,
 ) -> Result<tidb_infoschema::SessionExtendedInfoSchema, tidb_driver_error::DriverError> {
-    let _hold = tidb_txnkv::ACTIVE_START_TS.hold(ts);
+    let _hold = domain.hold_start_ts(ts);
     let snapshot = domain
         .transactions
         .open_snapshot_at(ts, tidb_model::DEFAULT_RESOURCE_GROUP_NAME)
@@ -1760,7 +1760,7 @@ pub fn build_import_query_info_schema(
     q: &tidb_executor_importer::query_source::QuerySource,
     parent: &tidb_infoschema::SessionExtendedInfoSchema,
 ) -> Result<tidb_infoschema::SessionExtendedInfoSchema, tidb_driver_error::DriverError> {
-    let _hold = tidb_txnkv::ACTIVE_START_TS.hold(q.read_ts);
+    let _hold = domain.hold_start_ts(q.read_ts);
     let snapshot = domain
         .transactions
         .open_snapshot_at(q.read_ts, tidb_model::DEFAULT_RESOURCE_GROUP_NAME)
