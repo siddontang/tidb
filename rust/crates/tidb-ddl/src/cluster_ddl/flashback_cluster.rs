@@ -142,8 +142,8 @@ enum PdScheduleOwnership {
 /// the step that left `DELETE_ONLY`, so a later state proves the close and
 /// `DELETE_ONLY` proves nothing; a current limit of zero does not tell the
 /// job's close from an operator's. This port never advances such a job past
-/// `DELETE_ONLY` without recording its own close (`on_flashback_cluster`),
-/// so a later state with no record is still a Go node's close.
+/// `DELETE_ONLY` (`on_flashback_cluster` cancels it there), so a later state
+/// with no record is still a Go node's close.
 fn pd_schedule_ownership(schema_state: SchemaState, args: &FlashbackClusterArgs) -> PdScheduleOwnership {
     match args.pd_schedule_state.as_str() {
         PD_SCHEDULE_CLOSED => PdScheduleOwnership::Closed,
@@ -161,9 +161,20 @@ fn pd_schedule_ownership(schema_state: SchemaState, args: &FlashbackClusterArgs)
 /// error log name the job and the value to restore by hand.
 fn hand_off_pd_schedule(job: &mut Job, args: &FlashbackClusterArgs) {
     let saved = serde_json::to_string(&args.pd_schedule_value).unwrap_or_default();
+    // A read only, for the report: the limits are not written.
+    let current = tidb_domain_infosync::schedule_manager::get_pd_schedule_config().map_or_else(
+        |error| format!("unknown ({error})"),
+        |config| {
+            let current: BTreeMap<_, _> = PD_SCHEDULE_KEY
+                .iter()
+                .map(|key| (*key, config.get(*key).cloned().unwrap_or(serde_json::Value::Null)))
+                .collect();
+            serde_json::to_string(&current).unwrap_or_default()
+        },
+    );
     let message = format!(
-        "FLASHBACK CLUSTER job {} may have closed PD's schedule limits and cannot tell; they are left as they are. \
-         If PD's {} still shows this job's 0, restore the value it saved: {saved}",
+        "FLASHBACK CLUSTER job {} may have closed PD's schedule limits and cannot tell; they are left as they are \
+         (now {current}). If PD's {} still shows this job's 0, restore the value it saved: {saved}",
         job.id,
         PD_SCHEDULE_KEY.join(", "),
     );
@@ -172,6 +183,7 @@ fn hand_off_pd_schedule(job: &mut Job, args: &FlashbackClusterArgs) {
         &[
             tidb_log::Field::new("jobID", tidb_log::Value::I64(job.id)),
             tidb_log::Field::new("savedPDSchedule", tidb_log::Value::Str(saved)),
+            tidb_log::Field::new("currentPDSchedule", tidb_log::Value::Str(current)),
         ],
     );
     job.warning = Some(tidb_model::GoShared::new(tidb_terror::TerrorError::synthesize(
@@ -667,19 +679,35 @@ pub(super) fn on_flashback_cluster(
         // Stage 2, check flashbackTS, close GC and PD schedule, get flashback key ranges.
         SchemaState::DELETE_ONLY => {
             let flashback_ts = args.read().flashback_ts;
-            // The intent to close PD's schedule limits is persisted, in a
-            // step of its own, before the close: a job that stops between
-            // the two is then known to be ambiguous rather than untouched
-            // (`pd_schedule_ownership`). A job with a saved value and no
-            // record (a Go node's, or from before the record) takes the same
-            // path, so it records its own close before it advances; one that
-            // advanced without it would later be taken for a job that closed
-            // the limits.
+            // A job with a saved value and no record (a Go node's, or from
+            // before the record) cannot tell whether PD's current limits
+            // are its saved baseline, its own close or an operator's
+            // setting since, and PD's schedule configuration has no
+            // compare-and-set to close them only while they still hold the
+            // saved value. Closing would take ownership of a value it does
+            // not own; advancing without closing would later be taken for a
+            // job that closed them. It is cancelled here instead, writing
+            // nothing to PD, and `finish_flashback_cluster` hands the saved
+            // and current values to the operator.
             let unrecorded = {
                 let args = args.read();
                 args.pd_schedule_state.is_empty() && args.pd_schedule_value.as_ref().is_some_and(|value| !value.is_empty())
             };
-            if args.read().pd_schedule_state == PD_SCHEDULE_SAVED || unrecorded {
+            if unrecorded {
+                return Err(cancel_ddl_job(
+                    active,
+                    unknown(
+                        "FLASHBACK CLUSTER job has no record of PD's schedule limits it saved; it is cancelled and \
+                         hands them off to the operator"
+                            .to_owned(),
+                    ),
+                ));
+            }
+            // The intent to close PD's schedule limits is persisted, in a
+            // step of its own, before the close: a job that stops between
+            // the two is then known to be ambiguous rather than untouched
+            // (`pd_schedule_ownership`).
+            if args.read().pd_schedule_state == PD_SCHEDULE_SAVED {
                 if !super::step_pd_write("FLASHBACK CLUSTER").map_err(|error| cancel_ddl_job(active, error))? {
                     // The saved limits cannot be closed here: the flashback
                     // would run with PD scheduling on.

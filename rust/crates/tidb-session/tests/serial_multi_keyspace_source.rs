@@ -1144,10 +1144,9 @@ impl tidb_domain_infosync::schedule_manager::ScheduleManager for CountingSchedul
 
 /// A FLASHBACK CLUSTER job saved PD's schedule limits in `DELETE_ONLY` and
 /// carries no record of its close (a Go node's job, or this port's before
-/// the record). Resumed on a node that cannot close the limits, it would
-/// run the flashback with PD scheduling on and then be taken for a job that
-/// closed them: it is cancelled in `DELETE_ONLY` instead, writes nothing to
-/// PD, and hands the saved value off to the operator.
+/// the record). Resumed on a multi-keyspace node, as on any node, it is
+/// cancelled in `DELETE_ONLY`, writes nothing to PD, and hands the saved
+/// value off to the operator.
 #[test]
 fn a_resumed_flashback_without_a_pd_schedule_record_is_cancelled_on_a_multi_keyspace_node() {
     if !tidb_config_kerneltype::is_next_gen() {
@@ -1199,7 +1198,8 @@ fn a_resumed_flashback_without_a_pd_schedule_record_is_cancelled_on_a_multi_keys
     tidb_keyspace::set_multi_keyspace_mode(false);
     tidb_domain_infosync::schedule_manager::init_schedule_manager(None);
     let (code, message) = refused.expect("the resumed job was cancelled");
-    assert!(code == 1235 || code == 8214, "{code}: {message}");
+    assert_eq!(code, 1105, "{message}");
+    assert!(message.contains("hands them off to the operator"), "{message}");
     let states = states.lock().unwrap().clone();
     assert!(
         !states.iter().any(|state| matches!(*state, tidb_model::SchemaState::WRITE_ONLY | tidb_model::SchemaState::WRITE_REORGANIZATION)),

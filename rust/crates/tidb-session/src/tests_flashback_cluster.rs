@@ -570,50 +570,72 @@ fn flashback_without_a_pd_schedule_record_restores_only_past_delete_only() {
     assert_eq!(schedule.writes(), [serde_json::json!(0), serde_json::json!(7)]);
 }
 
-/// A job with no record resumed in `DELETE_ONLY` (a Go node's, or this
-/// port's before the record) does not advance on the strength of its saved
-/// value: it records its intent, closes the limits and records the close
-/// before it leaves `DELETE_ONLY`, and only then restores at the end.
-#[test]
-fn flashback_resumed_without_a_pd_schedule_record_closes_before_it_advances() {
-    let mut session = mock_store_session();
-    let session = &mut session;
+/// Runs a flashback whose job is rewritten, once saved in `DELETE_ONLY`, as
+/// a job with no record (a Go node's, or this port's before the record);
+/// `operator` then changes PD's limit (`None`: leaves it). `later`, if set,
+/// is the operator's setting after the step that resumes the job. Returns
+/// the statement's error and the schema states the job's steps left.
+fn resume_without_a_record(
+    session: &mut Session,
+    schedule: &RecordedSchedule,
+    operator: Option<i64>,
+    later: Option<i64>,
+) -> ((u16, String), Vec<SchemaState>) {
     std::thread::sleep(std::time::Duration::from_millis(10));
     let ts = get_timestamp(session);
     let _mock = mock_flashback(session, ts);
-
-    let schedule = RecordedSchedule::install(8);
     let manager = schedule.0.clone();
-    let steps = Arc::new(Mutex::new(Vec::new()));
-    let seen = steps.clone();
+    let states = Arc::new(Mutex::new(Vec::new()));
+    let seen = states.clone();
     let forgotten = std::sync::atomic::AtomicBool::new(false);
     let after = enable_call("afterRunOneJobStep", move |job| {
-        if job.schema_state == SchemaState::DELETE_ONLY
+        let first = job.schema_state == SchemaState::DELETE_ONLY
             && pd_schedule_state(job) == tidb_model::PD_SCHEDULE_SAVED
-            && !forgotten.swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
+            && !forgotten.swap(true, std::sync::atomic::Ordering::SeqCst);
+        if first {
             forget_pd_schedule_state(job);
+            if let Some(limit) = operator {
+                manager.config.lock().unwrap().insert("merge-schedule-limit".to_owned(), serde_json::json!(limit));
+            }
+        } else if let Some(limit) = later {
+            // After the step that resumed the job, where a comparison of
+            // PD's current limits would have been made.
+            manager.config.lock().unwrap().insert("merge-schedule-limit".to_owned(), serde_json::json!(limit));
         }
-        let limit = manager.config.lock().unwrap()["merge-schedule-limit"].clone();
-        seen.lock().unwrap().push((job.schema_state, pd_schedule_state(job), limit));
+        seen.lock().unwrap().push(job.schema_state);
     });
-    exec(session, &flashback_to(ts));
+    let error = error_of(session, &flashback_to(ts));
     drop(after);
-    let steps = steps.lock().unwrap().clone();
-    let first_past = steps
-        .iter()
-        .find(|(state, ..)| *state == SchemaState::WRITE_ONLY)
-        .expect("the job reached WRITE_ONLY");
-    assert_eq!(
-        (first_past.1.as_str(), &first_past.2),
-        (tidb_model::PD_SCHEDULE_CLOSED, &serde_json::json!(0)),
-        "{steps:?}"
-    );
-    assert!(
-        steps.iter().any(|(state, record, _)| *state == SchemaState::DELETE_ONLY && record == tidb_model::PD_SCHEDULE_CLOSING),
-        "{steps:?}"
-    );
-    assert_eq!(schedule.writes(), [serde_json::json!(0), serde_json::json!(8)]);
-    assert_eq!(schedule.limit(), serde_json::json!(8));
-    assert_eq!(last_history_warning(session), None);
+    let states = states.lock().unwrap().clone();
+    (error, states)
+}
+
+/// A job with no record resumed in `DELETE_ONLY` cannot tell PD's current
+/// limits from its own close or an operator's setting, and PD has no
+/// compare-and-set to close them only while they hold its saved value: it
+/// is cancelled there, writes nothing to PD, and hands the saved and
+/// current values off to the operator. With an operator's 0 or 12 in place,
+/// and with its saved value still in place but an operator's later setting
+/// coming after the step that resumed it, that setting stays.
+#[test]
+fn flashback_resumed_without_a_pd_schedule_record_hands_off_without_writing() {
+    let mut session = mock_store_session();
+    let session = &mut session;
+    for (operator, later, left) in [(Some(0), None, 0), (Some(12), None, 12), (None, Some(13), 13)] {
+        let schedule = RecordedSchedule::install(8);
+        let ((code, message), states) = resume_without_a_record(session, &schedule, operator, later);
+        assert_eq!(code, 1105, "{message}");
+        assert!(message.contains("hands them off to the operator"), "{message}");
+        assert!(
+            !states.iter().any(|state| matches!(*state, SchemaState::WRITE_ONLY | SchemaState::WRITE_REORGANIZATION)),
+            "the job advanced: {states:?}"
+        );
+        assert!(schedule.writes().is_empty(), "{operator:?}/{later:?}: {:?}", schedule.writes());
+        assert_eq!(schedule.limit(), serde_json::json!(left));
+        let warning = last_history_warning(session).expect("the handoff warning");
+        assert!(warning.contains(r#"\"merge-schedule-limit\":8"#), "{warning}");
+        if operator.is_some() {
+            assert!(warning.contains(&format!(r#"now {{\"merge-schedule-limit\":{left}}}"#)), "{warning}");
+        }
+    }
 }
