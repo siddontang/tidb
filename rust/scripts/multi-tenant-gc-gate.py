@@ -151,17 +151,31 @@ class Judge:
 
 
 def replay(path):
-    """Feeds a saved run's output through `Judge`: the reader's TSO, the
+    """Feeds one saved run's output through `Judge`: the reader's TSO, the
     PD safe points at its start, every move the run printed (each a poll),
-    and A's point after the rollback. Raises GateFailed as a live run would."""
+    the reader's row check and A's point after the rollback. Raises
+    GateFailed as a live run would, and on a trace that is not one whole
+    passing run: a second reader, a FAIL line, a missing or failed row
+    check, or a release that is not this reader's."""
     with open(path) as source:
-        text = source.read()
-    start = int(re.search(r"reader start TSO (\d+)", text).group(1))
-    initial = re.search(r"PD safe points at the reader's start: A (\d+)[^,]*, B (\d+)", text)
-    judge = Judge(start, int(initial.group(1)), int(initial.group(2)))
+        lines = source.read().splitlines()
+    failed = [line for line in lines if line.startswith("FAIL")]
+    if failed:
+        raise GateFailed("the trace records a failure: " + failed[0])
+    starts = [re.search(r"reader start TSO (\d+)\D.*?reads (.*?)(?:; observed at .*)?$", line) for line in lines]
+    starts = [match for match in starts if match]
+    if len(starts) != 1:
+        raise GateFailed("the trace holds %d readers, not one run" % len(starts))
+    start, original = int(starts[0].group(1)), starts[0].group(2)
+    initials = [re.search(r"PD safe points at the reader's start: A (\d+)[^,]*, B (\d+)", line) for line in lines]
+    initials = [match for match in initials if match]
+    if len(initials) != 1:
+        raise GateFailed("the trace holds %d initial PD safe points, not one run" % len(initials))
+    judge = Judge(start, int(initials[0].group(1)), int(initials[0].group(2)))
     a, b = judge.a_prev, judge.initial_b
+    rest = iter(lines)
     done = False
-    for line in text.splitlines():
+    for line in rest:
         moved = re.search(r"A's PD safe point moved \d+ -> (\d+)", line)
         passed = re.search(r"^  B's PD safe point (\d+)", line)
         if moved:
@@ -175,9 +189,19 @@ def replay(path):
             break
     if not done:
         raise GateFailed("the trace ended before " + " and ".join(judge.hold_missing()))
-    after = re.search(r"after the reader rolled back, A's PD safe point (\d+)", text)
-    if not (after and judge.released(int(after.group(1)))):
-        raise GateFailed("the trace shows no A safe point past the released reader")
+    # After both holds, in order: the reader's rows, then its release.
+    rows = release = None
+    for line in rest:
+        kept = re.search(r"^PASS A's reader still reads (.*?) after both GCs", line)
+        released = re.search(r"after the reader rolled back, A's PD safe point (\d+).*> reader (\d+)", line)
+        if kept and rows is None:
+            rows = kept.group(1)
+        elif released and rows is not None:
+            release = (int(released.group(1)), int(released.group(2)))
+    if rows != original:
+        raise GateFailed("the trace shows no row check of the reader's %s after both GCs (found %s)" % (original, rows))
+    if not (release and release[1] == start and judge.released(release[0])):
+        raise GateFailed("the trace shows no A safe point past this reader %d after its release (found %s)" % (start, release))
     return judge
 
 
@@ -186,27 +210,66 @@ PD safe points at the reader's start: A 470703262919557125, B 470703263470059528
   A's PD safe point moved 470703262919557125 -> 470703937528791040 (15:50:23.410); life time passed the reader before this poll: False
   B's PD safe point 470704097214857216 (16:00:32.564) passed the reader
   A's PD safe point moved 470703937528791040 -> 470704065376157703 (15:58:31.109); life time passed the reader before this poll: True
+PASS B's PD safe point 470704097214857216 (16:00:32.564) > reader 470704065376157703
+PASS A's reader still reads ((1, 'original'), (2, 'original')) after both GCs
 PASS after the reader rolled back, A's PD safe point 470704252523642880 (16:10:25.020) > reader 470704065376157703
+PASS
 """
 
 
+class UsageError(Exception):
+    pass
+
+
+USAGE = "usage: multi-tenant-gc-gate.py [--self-test | --replay <saved output>]"
+
+
+def parse_mode(args):
+    """("live", None), ("self-test", None) or ("replay", path); raises
+    UsageError before anything connects."""
+    if not args:
+        return "live", None
+    if args == ["--self-test"]:
+        return "self-test", None
+    if len(args) == 2 and args[0] == "--replay" and not args[1].startswith("-"):
+        return "replay", args[1]
+    raise UsageError(USAGE)
+
+
 def self_test():
-    """The recorded live run (2026-11-25, the design's §6.5 record) passes;
-    a review's trace in which B started above the reader and never moved,
-    and A rose only to 20s below the reader, fails."""
+    """Replays the recorded live run (2026-11-25, the design's §6.5 record),
+    which passes, and traces that must fail: a review's in which B started
+    above the reader and never moved and A rose only to 20s below the
+    reader; a failed run concatenated with another reader's passing one;
+    a run without its row check. Checks the argument validation too."""
     import tempfile
     reader = 470704065376157703
     scale = 1 << 18
     false_pass = "\n".join([
-        "A's reader start TSO %d" % reader,
+        "A's reader start TSO %d, reads ((1, 'original'), (2, 'original'))" % reader,
         "PD safe points at the reader's start: A %d, B %d" % (reader - 90000 * scale, reader + 10 * scale),
         "  B's PD safe point %d passed the reader" % (reader + 10 * scale),
         "  A's PD safe point moved %d -> %d" % (reader - 90000 * scale, reader - 20000 * scale),
+        "PASS A's reader still reads ((1, 'original'), (2, 'original')) after both GCs",
         "PASS after the reader rolled back, A's PD safe point %d > reader %d" % (reader + 10000 * scale, reader),
     ]) + "\n"
+    other = reader + 1000 * scale
+    failed_run = "\n".join([
+        "A's reader start TSO %d, reads ((1, 'original'), (2, 'original'))" % other,
+        "PD safe points at the reader's start: A %d, B %d" % (other - 90000 * scale, other - 90000 * scale),
+        "FAIL A's reader lost its rows after both GCs: ((1, 'overwritten'),)",
+        "FAILED",
+    ]) + "\n"
+    no_row_check = "\n".join(line for line in RECORDED_RUN.splitlines() if "still reads" not in line) + "\n"
     with tempfile.TemporaryDirectory() as directory:
-        for name, text, passes in (("recorded", RECORDED_RUN, True), ("false-pass", false_pass, False)):
-            path = os.path.join(directory, name)
+        for name, text, passes in (
+            ("recorded", RECORDED_RUN, True),
+            ("false-pass", false_pass, False),
+            ("failed run concatenated with another reader's", failed_run + RECORDED_RUN, False),
+            ("without the row check", no_row_check, False),
+            ("two passing runs of different readers", RECORDED_RUN.replace(str(reader), str(other)) + RECORDED_RUN, False),
+        ):
+            path = os.path.join(directory, "trace")
             with open(path, "w") as out:
                 out.write(text)
             try:
@@ -216,6 +279,13 @@ def self_test():
                 outcome = False
                 print("  %s trace fails: %s" % (name, failure))
             assert outcome == passes, "%s trace: expected %s" % (name, "PASS" if passes else "FAIL")
+    for args in (["--replay"], ["--replay", "a", "b"], ["--replay", "--self-test"], ["--live"]):
+        try:
+            parse_mode(args)
+        except UsageError:
+            continue
+        raise AssertionError("%s was accepted" % args)
+    assert parse_mode([]) == ("live", None) and parse_mode(["--replay", "x"]) == ("replay", "x")
     print("self-test passed")
 
 
@@ -304,12 +374,17 @@ class Gate:
 
 
 def main():
-    if sys.argv[1:2] == ["--self-test"]:
+    try:
+        mode, path = parse_mode(sys.argv[1:])
+    except UsageError as usage:
+        print(usage, file=sys.stderr)
+        sys.exit(2)
+    if mode == "self-test":
         self_test()
         return
-    if sys.argv[1:2] == ["--replay"] and len(sys.argv) == 3:
+    if mode == "replay":
         try:
-            replay(sys.argv[2])
+            replay(path)
         except GateFailed as failure:
             print("FAIL " + str(failure))
             sys.exit(1)
