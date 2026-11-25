@@ -1298,15 +1298,27 @@ unknown ID), and `EXPLAIN FOR CONNECTION` answers `ER_NO_SUCH_THREAD`.
   holds the ID and this node. The registry logs it, caches `Failed` for 10s,
   and answers 1045.
 - A lost tenant lease kills the runtime's registered connections, and routing
-  refuses the keyspace with 1045 until its keeper reserves the ID again. A
-  connection still in its handshake is not killed; routing refuses it instead.
+  refuses the keyspace with 1045 until its keeper reserves the ID again.
   Routing also refuses a runtime that still holds an ID the process no longer
   greets with. A tenant keeper wakes every 10s (the retry interval) to follow
   its process's ID, and refreshes its lease every 5 minutes as Go does.
+- A connection is admitted against the ID it was greeted with. Routing takes
+  an `AdmissionTicket` (the tenant reservation's ID and its loss count), and
+  the connection's process registration (opening its session) runs under it:
+  a drain or a SYSTEM rotation since routing fails the login with 1045, and
+  nothing is registered. A loss waits for a registration in progress, then
+  retires it with the rest.
+- A fresh tenant claim counts as a successful refresh, so one transient
+  refresh error loses nothing. A keeper that lost admission while its lease
+  lived recognizes its own claim (the key's lease is its own) and keeps it.
+  Recovery reopens admission only once the server info is published; while
+  publication fails it keeps the claim, refreshed, with admission closed.
 - The mixed-fleet checks are unit tests over a mock etcd with forced
-  candidates: both opening orders, and tenant and SYSTEM lease loss. They have
-  not run against a real single-keyspace nextgen node with a failpoint,
-  because the server-ID candidate has no failpoint yet.
+  candidates: both opening orders, and tenant and SYSTEM lease loss. The
+  failpoint `github.com/pingcap/tidb/pkg/domain/forceServerIDCandidate`
+  (`return(<id>)`, set at startup through `GO_FAILPOINTS` in a `failpoints`
+  build) forces a real node's first candidate. The two-node run has not been
+  done: it needs a `failpoints` nextgen build beside the regular ones.
 
 **Mixed-fleet test.** One multi-keyspace node and one single-keyspace
 **nextgen** node serve the same tenant, with a failpoint that forces

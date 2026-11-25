@@ -102,6 +102,28 @@ pub fn enable(name: &str, terms: &str) -> Result<(), String> {
     fail::cfg(name, terms)
 }
 
+/// Go's `failpoint` package `init`: the failpoints `GO_FAILPOINTS` names
+/// (`name=terms;name=terms`), enabled before the process starts its work. A
+/// build without failpoints ignores the variable.
+///
+/// # Errors
+/// An entry does not parse.
+pub fn enable_from_env() -> Result<(), String> {
+    if !cfg!(feature = "failpoints") {
+        return Ok(());
+    }
+    let Ok(value) = std::env::var("GO_FAILPOINTS") else {
+        return Ok(());
+    };
+    for entry in value.split(';').filter(|entry| !entry.trim().is_empty()) {
+        let (name, terms) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("GO_FAILPOINTS entry {entry:?} has no `=`"))?;
+        enable(name.trim(), terms.trim())?;
+    }
+    Ok(())
+}
+
 /// The functions `enable_call` registers, by failpoint name.
 type CallFn = std::sync::Arc<dyn Fn(&mut dyn std::any::Any) + Send + Sync>;
 

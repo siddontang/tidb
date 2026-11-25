@@ -5955,6 +5955,7 @@ dependencies = [
  "tidb-dbterror",
  "tidb-domain-serverinfo",
  "tidb-errno",
+ "tidb-failpoint",
  "tidb-fixcontrol",
  "tidb-globalconn",
  "tidb-go-net",

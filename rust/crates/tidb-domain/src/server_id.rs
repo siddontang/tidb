@@ -25,7 +25,7 @@
 
 use tidb_domain_serverinfo::serverinfo_syncer::{EtcdOps, Syncer};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tidb_globalconn::{MAX_SERVER_ID32, MAX_SERVER_ID64};
 
@@ -63,6 +63,14 @@ type KillConnections = Arc<dyn Fn() + Send + Sync>;
 pub struct ServerIdAuthority {
     id: AtomicU64,
     lost: AtomicBool,
+    /// Counts the losses of the lease: an [`AdmissionTicket`] taken before
+    /// one admits nothing after it.
+    generation: AtomicU64,
+    /// Held shared while an admitted connection registers, and exclusively
+    /// while a loss retires the registered connections, so a registration
+    /// either precedes the retirement (which then retires it) or sees the
+    /// loss and does not happen.
+    admission: RwLock<()>,
     enable_32bits: bool,
     etcd: Option<Arc<dyn EtcdOps>>,
     kill_connections: Mutex<Option<KillConnections>>,
@@ -81,6 +89,8 @@ impl ServerIdAuthority {
         Arc::new(Self {
             id: AtomicU64::new(if clustered { 0 } else { 1 }),
             lost: AtomicBool::new(clustered),
+            generation: AtomicU64::new(0),
+            admission: RwLock::new(()),
             enable_32bits,
             etcd,
             kill_connections: Mutex::new(None),
@@ -97,6 +107,8 @@ impl ServerIdAuthority {
         Arc::new(Self {
             id: AtomicU64::new(0),
             lost: AtomicBool::new(true),
+            generation: AtomicU64::new(0),
+            admission: RwLock::new(()),
             enable_32bits: false,
             etcd: Some(etcd),
             kill_connections: Mutex::new(None),
@@ -113,6 +125,8 @@ impl ServerIdAuthority {
         Arc::new(Self {
             id: AtomicU64::new(0),
             lost: AtomicBool::new(true),
+            generation: AtomicU64::new(0),
+            admission: RwLock::new(()),
             enable_32bits: false,
             etcd: Some(etcd),
             kill_connections: Mutex::new(None),
@@ -125,6 +139,20 @@ impl ServerIdAuthority {
     #[must_use]
     pub fn admits(&self) -> bool {
         !self.is_lost() && self.process.as_ref().is_none_or(|process| process.id() == self.id())
+    }
+    /// A ticket for a connection greeted with server ID `greeted`, if this
+    /// identity admits it now: it holds its lease, on `greeted`, and (for a
+    /// tenant reservation) on the ID its process greets with. The ticket
+    /// admits the connection's registration only while all of that still
+    /// holds and no loss came in between ([`AdmissionTicket::register`]).
+    #[must_use]
+    pub fn admission_ticket(self: &Arc<Self>, greeted: u64) -> Option<AdmissionTicket> {
+        let generation = self.generation.load(Ordering::Acquire);
+        (self.admits() && self.id() == greeted).then(|| AdmissionTicket {
+            authority: Arc::clone(self),
+            greeted,
+            generation,
+        })
     }
     /// The identity whose loss stops new handshakes: a tenant reservation's
     /// process reservation, otherwise this one.
@@ -150,7 +178,12 @@ impl ServerIdAuthority {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = kill;
     }
     fn mark_lost(&self) {
-        if !self.lost.swap(true, Ordering::AcqRel) && self.retire_on_loss {
+        let _admission = self.admission.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.lost.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if self.retire_on_loss {
             let kill = self
                 .kill_connections
                 .lock()
@@ -163,11 +196,36 @@ impl ServerIdAuthority {
     }
 }
 
+/// A connection's admission under the identity it was greeted with
+/// ([`ServerIdAuthority::admission_ticket`]).
+pub struct AdmissionTicket {
+    authority: Arc<ServerIdAuthority>,
+    greeted: u64,
+    generation: u64,
+}
+impl AdmissionTicket {
+    /// Runs `register` (the connection's process registration) if the
+    /// identity still admits the greeted ID with no loss since the ticket
+    /// was taken; `None` otherwise, and nothing is registered. A loss waits
+    /// for a running `register`, then retires what it registered.
+    pub fn register<R>(&self, register: impl FnOnce() -> R) -> Option<R> {
+        let authority = &self.authority;
+        let _admission = authority.admission.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (authority.generation.load(Ordering::Acquire) == self.generation
+            && authority.admits()
+            && authority.id() == self.greeted)
+            .then(register)
+    }
+}
+
 struct LeaseState {
     authority: Arc<ServerIdAuthority>,
     lease: Option<i64>,
     last_success: Option<Instant>,
     policy: ServerIdIntervals,
+    /// The claim is held but its server info is not yet published: the
+    /// keeper publishes before it reopens admission.
+    unpublished: bool,
 }
 impl LeaseState {
     fn acquire(&mut self, syncer: &Syncer, stop: &mpsc::Receiver<()>) -> Result<(), String> {
@@ -207,7 +265,12 @@ impl LeaseState {
                 Some(process) => process.id(),
                 None => self.propose(syncer, conflicts)?,
             };
-            if etcd.create_if_absent_with_lease(&format!("{SERVER_ID_PATH}/{id}"), b"0", lease)? {
+            let key = format!("{SERVER_ID_PATH}/{id}");
+            // A key under this keeper's own live lease is its own claim,
+            // left from before a refresh failure that did not expire it.
+            if etcd.create_if_absent_with_lease(&key, b"0", lease)?
+                || matches!(etcd.get_key_lease(&key), Ok(Some(owner)) if owner == lease)
+            {
                 self.authority.id.store(id, Ordering::Release);
                 return Ok(());
             }
@@ -228,6 +291,17 @@ impl LeaseState {
         #[cfg(test)]
         if let Some(id) = tests::FORCED_CANDIDATES.with(|forced| forced.borrow_mut().pop()) {
             return Ok(id);
+        }
+        // A test hook for the mixed-fleet check (design §6.6): the first
+        // candidate is the failpoint's ID, so a real second node can be put
+        // on a multi-keyspace node's ID (and moves off it on a collision).
+        if conflicts == 0 {
+            if let Some(id) = tidb_failpoint::eval("github.com/pingcap/tidb/pkg/domain/forceServerIDCandidate")
+                .and_then(|value| value.as_int())
+                .and_then(|id| u64::try_from(id).ok())
+            {
+                return Ok(id);
+            }
         }
         if !self.authority.enable_32bits {
             return random_id(1, MAX_SERVER_ID64);
@@ -306,13 +380,32 @@ impl LeaseState {
             self.release();
         }
         if self.authority.is_lost() {
-            if self.acquire(syncer, stop).is_ok() {
-                // Publish the new identity before reopening admission.
-                if let Err(error) = syncer.store_server_info() {
-                    tracing::warn!(%error, "StoreServerInfo after server-ID recovery");
+            // A claim acquired on an earlier tick keeps its lease alive
+            // while its publication is retried.
+            let claimed = if self.unpublished {
+                let refreshed = self.refresh();
+                if let Err(error) = &refreshed {
+                    tracing::warn!(%error, "refreshServerIDTTL before republishing failed");
                 }
-                self.last_success = Some(now);
-                self.authority.lost.store(false, Ordering::Release);
+                self.unpublished = self.lease.is_some();
+                refreshed.is_ok()
+            } else {
+                self.acquire(syncer, stop).is_ok()
+            };
+            if claimed {
+                // Publish the new identity before reopening admission; a
+                // failed publication keeps the claim and admission closed.
+                match syncer.store_server_info() {
+                    Ok(()) => {
+                        self.unpublished = false;
+                        self.last_success = Some(now);
+                        self.authority.lost.store(false, Ordering::Release);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "StoreServerInfo after server-ID recovery; admission stays closed");
+                        self.unpublished = true;
+                    }
+                }
             }
         } else {
             match self.refresh() {
@@ -332,6 +425,7 @@ impl LeaseState {
         }
     }
     fn release(&mut self) {
+        self.unpublished = false;
         self.authority.mark_lost();
         self.authority.id.store(0, Ordering::Release);
         if let Some(lease) = self.lease.take() {
@@ -341,6 +435,24 @@ impl LeaseState {
                 }
             }
         }
+    }
+}
+impl LeaseState {
+    /// [`ServerIdKeeper::start_reserved`]'s reservation, admitting. The
+    /// claim is fresh, so it counts as the last successful refresh: a
+    /// transient refresh error right after it does not lose it.
+    fn reserved(
+        authority: Arc<ServerIdAuthority>,
+        syncer: &Syncer,
+        policy: ServerIdIntervals,
+        stop: &mpsc::Receiver<()>,
+    ) -> Result<Self, String> {
+        let mut state = LeaseState { authority, lease: None, last_success: None, policy, unpublished: false };
+        // A failure drops the state, which revokes the lease.
+        state.acquire(syncer, stop)?;
+        state.last_success = Some(Instant::now());
+        state.authority.lost.store(false, Ordering::Release);
+        Ok(state)
     }
 }
 impl Drop for LeaseState {
@@ -410,6 +522,7 @@ impl ServerIdKeeper {
             lease: None,
             last_success: None,
             policy,
+            unpublished: false,
         };
         match state.acquire(&syncer, &receive) {
             Ok(()) => {
@@ -435,15 +548,7 @@ impl ServerIdKeeper {
             return Err("a tenant reservation needs its process reservation and etcd".into());
         }
         let (send, receive) = mpsc::channel();
-        let mut state = LeaseState {
-            authority,
-            lease: None,
-            last_success: None,
-            policy,
-        };
-        // A failure drops the state, which revokes the lease.
-        state.acquire(&syncer, &receive)?;
-        state.authority.lost.store(false, Ordering::Release);
+        let state = LeaseState::reserved(authority, &syncer, policy, &receive)?;
         Self::run(state, syncer, send, receive)
     }
     fn run(
@@ -519,6 +624,9 @@ mod tests {
         fail: AtomicBool,
         expired: AtomicBool,
         conflicts: AtomicUsize,
+        /// Server-info publication (every leased put outside the
+        /// server-ID keys) fails.
+        fail_publish: AtomicBool,
     }
     impl EtcdOps for Etcd {
         fn lease_grant(&self, _: i64) -> Result<i64, String> {
@@ -547,6 +655,9 @@ mod tests {
             Ok(())
         }
         fn put_with_lease(&self, key: &str, value: &[u8], lease: i64) -> Result<(), String> {
+            if self.fail_publish.load(Ordering::SeqCst) && !key.starts_with(SERVER_ID_PATH) {
+                return Err("publication unavailable".into());
+            }
             self.keys
                 .lock()
                 .unwrap()
@@ -586,6 +697,9 @@ mod tests {
         fn delete(&self, key: &str) -> Result<(), String> {
             self.keys.lock().unwrap().remove(key);
             Ok(())
+        }
+        fn get_key_lease(&self, key: &str) -> Result<Option<i64>, String> {
+            Ok(self.keys.lock().unwrap().get(key).map(|(_, lease)| *lease))
         }
         fn put(&self, key: &str, value: &[u8]) -> Result<(), String> {
             self.put_with_lease(key, value, 0)
@@ -659,6 +773,7 @@ mod tests {
             lease: None,
             last_success: None,
             policy: policy(),
+            unpublished: false,
         };
         state.acquire(&syncer, &receive).unwrap();
         owner.lost.store(false, Ordering::Release);
@@ -699,6 +814,7 @@ mod tests {
             lease: None,
             last_success: Some(now),
             policy: policy(),
+            unpublished: false,
         };
         state.acquire(&syncer, &receive).unwrap();
         owner.lost.store(false, Ordering::Release);
@@ -739,6 +855,7 @@ mod tests {
             lease: None,
             last_success: None,
             policy: policy(),
+            unpublished: false,
         };
         let (_send, receive) = mpsc::channel();
         state.acquire(&syncer, &receive).unwrap();
@@ -877,6 +994,7 @@ mod tests {
                 lease: None,
                 last_success: None,
                 policy: policy(),
+                unpublished: false,
             };
             state.acquire(&syncer, &receive).unwrap();
             authority.lost.store(false, Ordering::Release);
@@ -929,5 +1047,189 @@ mod tests {
             assert_eq!(server_id_keys(etcd), [format!("{SERVER_ID_PATH}/{fresh}")]);
             assert_eq!(kills.load(Ordering::SeqCst), if Arc::ptr_eq(authority, &a) { 2 } else { 1 });
         }
+    }
+
+    /// A tenant reservation of `process`'s ID in a fresh namespace, as
+    /// [`ServerIdKeeper::start_reserved`] makes it, published.
+    fn reserved_tenant(
+        process: &Arc<ServerIdAuthority>,
+        name: &str,
+        receive: &mpsc::Receiver<()>,
+    ) -> (Arc<Etcd>, Arc<ServerIdAuthority>, Arc<Syncer>, LeaseState) {
+        let etcd = Arc::new(Etcd::default());
+        let authority = ServerIdAuthority::new_tenant_reservation(etcd.clone(), process.clone());
+        let syncer = unpublished(&etcd, name, &authority);
+        let state = LeaseState::reserved(authority.clone(), &syncer, policy(), receive).unwrap();
+        syncer.new_session_and_store_server_info().unwrap();
+        (etcd, authority, syncer, state)
+    }
+    /// Tick times a refresh interval apart, so every tick refreshes.
+    #[derive(Default)]
+    struct Clock(u32);
+    impl Clock {
+        fn next(&mut self) -> Instant {
+            self.0 += 1;
+            Instant::now() + (policy().refresh + Duration::from_secs(1)) * self.0
+        }
+    }
+    fn claim_lease(etcd: &Etcd, id: u64) -> Option<i64> {
+        etcd.keys.lock().unwrap().get(&format!("{SERVER_ID_PATH}/{id}")).map(|(_, lease)| *lease)
+    }
+
+    /// A transient refresh error right after a tenant reserves its ID keeps
+    /// the reservation (the fresh claim counts as a success), and three
+    /// healthy refreshes keep it admitting on its original claim. A keeper
+    /// that did lose admission while its lease lived recognizes its own
+    /// claim and keeps it; a lease that really expired is reserved anew.
+    #[test]
+    fn a_tenant_reservation_survives_a_transient_refresh_error() {
+        let system = Arc::new(Etcd::default());
+        let (process, _process_state, _) = process_reservation(&system);
+        let (_send, receive) = mpsc::channel();
+        let (etcd, tenant, syncer, mut state) = reserved_tenant(&process, "multi", &receive);
+        let id = tenant.id();
+        let lease = state.lease.unwrap();
+        let mut clock = Clock::default();
+
+        etcd.fail.store(true, Ordering::SeqCst);
+        state.tick(clock.next(), &syncer, &receive);
+        assert!(tenant.admits(), "one transient error loses nothing");
+        etcd.fail.store(false, Ordering::SeqCst);
+        for round in 1..=3 {
+            state.tick(clock.next(), &syncer, &receive);
+            assert!(tenant.admits(), "healthy refresh {round}");
+        }
+        assert_eq!((tenant.id(), claim_lease(&etcd, id)), (id, Some(lease)), "the original claim");
+
+        // Admission lost while the lease lives (no success on record): the
+        // keeper recovers onto its own claim rather than colliding with it.
+        state.last_success = None;
+        etcd.fail.store(true, Ordering::SeqCst);
+        state.tick(clock.next(), &syncer, &receive);
+        assert!(tenant.is_lost());
+        etcd.fail.store(false, Ordering::SeqCst);
+        state.tick(clock.next(), &syncer, &receive);
+        assert!(tenant.admits());
+        assert_eq!((tenant.id(), claim_lease(&etcd, id)), (id, Some(lease)));
+
+        // The lease expires: the claim goes, and the keeper reserves the ID
+        // under a new lease.
+        expire(&etcd);
+        state.tick(clock.next(), &syncer, &receive);
+        assert!(tenant.is_lost() && !tenant.admits());
+        etcd.expired.store(false, Ordering::SeqCst);
+        state.tick(clock.next(), &syncer, &receive);
+        assert!(tenant.admits());
+        let renewed = claim_lease(&etcd, id).expect("reserved again");
+        assert_ne!(renewed, lease);
+        assert_eq!(state.lease, Some(renewed));
+    }
+
+    /// Recovery publishes the server info before it admits: while the
+    /// publication fails, the keeper keeps its claim with admission closed,
+    /// and admits once the record is published.
+    #[test]
+    fn recovery_admits_only_after_publishing() {
+        let mut clock = Clock::default();
+        let system = Arc::new(Etcd::default());
+        let (process, _process_state, _) = process_reservation(&system);
+        let (_send, receive) = mpsc::channel();
+        let (etcd, tenant, syncer, mut state) = reserved_tenant(&process, "multi", &receive);
+        let id = tenant.id();
+        // The tenant's leases expire: its claim and its server info go.
+        expire(&etcd);
+        etcd.keys.lock().unwrap().remove(syncer.server_info_path());
+        state.tick(clock.next(), &syncer, &receive);
+        assert!(tenant.is_lost());
+        etcd.expired.store(false, Ordering::SeqCst);
+        etcd.fail_publish.store(true, Ordering::SeqCst);
+        state.tick(clock.next(), &syncer, &receive);
+        assert!(!tenant.admits(), "admitted while the publication failed");
+        assert_eq!(published(&etcd, &syncer), None);
+        let claim = claim_lease(&etcd, id).expect("the claim is kept");
+        state.tick(clock.next(), &syncer, &receive);
+        assert!(!tenant.admits());
+        assert_eq!(claim_lease(&etcd, id), Some(claim), "the same claim, refreshed");
+        etcd.fail_publish.store(false, Ordering::SeqCst);
+        state.tick(clock.next(), &syncer, &receive);
+        assert!(tenant.admits());
+        assert_eq!(published(&etcd, &syncer), Some(id));
+        assert_eq!(claim_lease(&etcd, id), Some(claim));
+    }
+
+    /// A connection's registration, as a keyspace's process list: the
+    /// tenant's loss retires everything registered.
+    fn registry(authority: &Arc<ServerIdAuthority>) -> Arc<Mutex<Vec<u64>>> {
+        let registered = Arc::new(Mutex::new(Vec::new()));
+        let retired = registered.clone();
+        authority.set_connection_killer(Some(Arc::new(move || retired.lock().unwrap().clear())));
+        registered
+    }
+
+    /// A tenant drains (its lease expires) between a connection's routing
+    /// and its registration: the ticket refuses the registration, even once
+    /// the tenant holds the same ID again, and nothing stays registered.
+    #[test]
+    fn a_drain_between_routing_and_registration_refuses_the_login() {
+        let mut clock = Clock::default();
+        let system = Arc::new(Etcd::default());
+        let (process, _process_state, _) = process_reservation(&system);
+        let (_send, receive) = mpsc::channel();
+        let (etcd, tenant, syncer, mut state) = reserved_tenant(&process, "multi", &receive);
+        let registered = registry(&tenant);
+        let id = tenant.id();
+        let routed = tenant.admission_ticket(id).expect("routing admits");
+        expire(&etcd);
+        state.tick(clock.next(), &syncer, &receive);
+        assert!(routed.register(|| registered.lock().unwrap().push(1)).is_none());
+        etcd.expired.store(false, Ordering::SeqCst);
+        state.tick(clock.next(), &syncer, &receive);
+        assert_eq!(tenant.id(), id);
+        assert!(routed.register(|| registered.lock().unwrap().push(1)).is_none(), "a drain came in between");
+        assert!(registered.lock().unwrap().is_empty());
+        // A connection routed now registers.
+        let fresh = tenant.admission_ticket(id).expect("routing admits again");
+        assert!(fresh.register(|| registered.lock().unwrap().push(2)).is_some());
+        assert_eq!(*registered.lock().unwrap(), [2]);
+
+        // A loss that starts while a registration runs waits for it, then
+        // retires what it registered.
+        let ticket = tenant.admission_ticket(id).unwrap();
+        let loser = tenant.clone();
+        let seen = registered.clone();
+        let mut drain = None;
+        ticket
+            .register(|| {
+                drain = Some(std::thread::spawn(move || loser.mark_lost()));
+                std::thread::sleep(Duration::from_millis(50));
+                seen.lock().unwrap().push(3);
+            })
+            .expect("admitted before the loss");
+        drain.unwrap().join().unwrap();
+        assert!(registered.lock().unwrap().is_empty(), "the drain retired the late registration");
+    }
+
+    /// The SYSTEM reservation rotates between a connection's greeting and
+    /// its routing, and the tenant has already drained onto the fresh ID:
+    /// a connection greeted with the old ID is refused.
+    #[test]
+    fn a_rotation_between_greeting_and_routing_refuses_the_login() {
+        let mut clock = Clock::default();
+        let system = Arc::new(Etcd::default());
+        let (process, mut process_state, process_syncer) = process_reservation(&system);
+        let (_send, receive) = mpsc::channel();
+        let (_etcd, tenant, syncer, mut state) = reserved_tenant(&process, "multi", &receive);
+        let greeted = process.id();
+        expire(&system);
+        process_state.tick(clock.next(), &process_syncer, &receive);
+        system.expired.store(false, Ordering::SeqCst);
+        let fresh = greeted + 1;
+        force_candidates(&[fresh]);
+        process_state.tick(clock.next(), &process_syncer, &receive);
+        state.tick(clock.next(), &syncer, &receive);
+        assert!(tenant.admits());
+        assert_eq!(tenant.id(), fresh);
+        assert!(tenant.admission_ticket(greeted).is_none(), "greeted with the old ID");
+        assert!(tenant.admission_ticket(fresh).is_some());
     }
 }

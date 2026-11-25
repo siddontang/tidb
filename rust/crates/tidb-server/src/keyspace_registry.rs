@@ -42,6 +42,7 @@ use tidb_session::domain::real_tikv_node::RunConfiguredNodeError;
 use tidb_store_driver::real_tikv_read::ProductionReadProcessAuthority;
 
 use crate::keyspace_runtime::{KeyspaceRuntime, ProcessServerId};
+use tidb_domain::server_id::AdmissionTicket;
 use crate::process_shutdown::ProcessReadAuthority as _;
 
 /// The environment variable naming the extra keyspaces a node may serve.
@@ -115,9 +116,11 @@ type RoutedKeyspace = Routed<Domain>;
 /// Chooses the keyspace a connection is served by from its user name, before
 /// any authentication decision (design §4).
 pub(crate) trait ConnectionRouter<F>: Send + Sync {
-    /// The keyspace's session factory and accounts; `None` refuses the
-    /// connection with the same error as a failed login.
-    fn route(&self, user: &str) -> Option<Routed<F>>;
+    /// The keyspace's session factory and accounts for connection
+    /// `connection_id`, with the ticket its process registration must pass
+    /// (design §6.6; `None` for a keyspace with no server-ID reservation);
+    /// `None` refuses the connection with the same error as a failed login.
+    fn route(&self, user: &str, connection_id: u64) -> Option<(Routed<F>, Option<AdmissionTicket>)>;
 }
 
 enum EntryState {
@@ -369,10 +372,17 @@ fn retire_connections_on_lost_reservation(factory: &Domain) {
     })));
 }
 
-/// Whether `factory`'s keyspace may admit a connection: its server-ID
-/// reservation is held, for the ID the process greets with (design §6.6).
-fn reservation_held(factory: &Domain) -> bool {
-    factory.server_identity().is_none_or(|identity| identity.admits())
+/// Whether `factory`'s keyspace may admit connection `connection_id`: its
+/// server-ID reservation is held, on the ID the connection was greeted with,
+/// which is the ID the process greets with (design §6.6). The ticket then
+/// guards the connection's registration against a drain or a rotation
+/// since (`Err` refuses the connection).
+fn admission(factory: &Domain, connection_id: u64) -> Result<Option<AdmissionTicket>, ()> {
+    let Some(identity) = factory.server_identity() else {
+        return Ok(None);
+    };
+    let greeted = tidb_globalconn::parse_conn_id(connection_id).map_err(drop)?.0.server_id;
+    identity.admission_ticket(greeted).map(Some).ok_or(())
 }
 
 /// Go `go dom.ExpensiveQueryHandle().SetSessionManager(svr).Run()` for an
@@ -434,7 +444,7 @@ fn provision(keyspace: &str, factory: &Arc<Domain>, password: Option<&str>) {
 }
 
 impl ConnectionRouter<Domain> for KeyspaceRegistry {
-    fn route(&self, user: &str) -> Option<RoutedKeyspace> {
+    fn route(&self, user: &str, connection_id: u64) -> Option<(RoutedKeyspace, Option<AdmissionTicket>)> {
         // A user without a prefix is served by the node's configured
         // keyspace: the design's `default-keyspace` (§4), which keeps plain
         // `root` and TiUP's readiness probe working in development mode.
@@ -447,7 +457,8 @@ impl ConnectionRouter<Domain> for KeyspaceRegistry {
             }
             _ => (Arc::clone(&self.primary.0), Arc::clone(&self.primary.1)),
         };
-        reservation_held(&routed.0).then_some(routed)
+        let ticket = admission(&routed.0, connection_id).ok()?;
+        Some((routed, ticket))
     }
 }
 

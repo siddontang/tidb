@@ -1524,11 +1524,13 @@ fn serve_connection_inner<F: QuerySessionFactory>(
     // accounts and factory. A keyspace that cannot be served answers like a
     // failed login, so its existence is not revealed.
     let routed;
+    let mut admission = None;
     let (factory, users) = match router {
         None => (factory, users),
-        Some(router) => match router.route(&response_user) {
-            Some(keyspace) => {
+        Some(router) => match router.route(&response_user, connection_id) {
+            Some((keyspace, ticket)) => {
                 routed = keyspace;
+                admission = ticket;
                 (routed.0.as_ref(), routed.1.as_ref())
             }
             None => {
@@ -1974,7 +1976,29 @@ fn serve_connection_inner<F: QuerySessionFactory>(
         close: close.clone(),
     };
     events.info.connection_info.auth_method = session_context.identity.auth_plugin().to_owned();
-    let mut engine = match factory.open_session(session_context.clone()) {
+    // Opening the session registers the connection in its keyspace's
+    // process list. A multi-keyspace keyspace registers it only while its
+    // server-ID reservation still holds the ID the connection was greeted
+    // with, with no drain since routing (design §6.6); otherwise the login
+    // fails as routing would have, and nothing is registered.
+    let opened = match &admission {
+        None => Some(factory.open_session(session_context.clone())),
+        Some(ticket) => ticket.register(|| factory.open_session(session_context.clone())),
+    };
+    let Some(opened) = opened else {
+        return rejected_login(
+            events,
+            &mut output,
+            response_sequence,
+            ER_ACCESS_DENIED_ERROR,
+            *b"28000",
+            access_denied_message(&response_user, &peer_addr.host(), &response.auth),
+            protocol_41,
+            connection_id,
+            *commands,
+        );
+    };
+    let mut engine = match opened {
         Ok(session) => {
             // Go `server.go:1329`-adjacent TLS accounting: every TLS
             // handshake counts its negotiated version and cipher.

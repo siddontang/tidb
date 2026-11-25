@@ -22,6 +22,7 @@ tidb-config-kerneltype = { path = "../tidb-config-kerneltype" }
 tidb-domain-serverinfo = { path = "../tidb-domain-serverinfo" }
 tidb-replayer = { path = "../tidb-replayer" }
 tidb-globalconn = { path = "../tidb-globalconn" }
+tidb-failpoint = { path = "../tidb-failpoint" }
 tidb-logutil = { path = "../tidb-logutil" }
 tidb-memory = { path = "../tidb-memory" }
 tidb-printer = { path = "../tidb-printer" }

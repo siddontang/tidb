@@ -43,6 +43,10 @@ fn main() -> ExitCode {
     tidb_monotime::mark_process_start();
     // Go's package `init`s, which run before `main`.
     tidb_planner::init();
+    if let Err(error) = tidb_failpoint::enable_from_env() {
+        eprintln!("GO_FAILPOINTS: {error}");
+        return ExitCode::from(2);
+    }
     let arguments = std::env::args().collect::<Vec<_>>();
     // Go `initFlagSet`: `fset.Parse`, then `-help` prints the usage and exits.
     let flags = match tidb_server::parse_main_flags(arguments.clone()) {
