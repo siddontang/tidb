@@ -1372,9 +1372,12 @@ impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for Pd
     ) -> Result<Option<tidb_proto::resource_manager::ResourceGroup>, String> {
         let pd = self.store.store().pd_client();
         let name = name.to_owned();
-        self.store
-            .block_on(async move { pd.get_resource_group(&name, false).await })
-            .map_err(|error| error.to_string())
+        match self.store.block_on(async move { pd.get_resource_group(&name, false).await }) {
+            Ok(group) => Ok(group),
+            // PD answers a missing group with an error, not an empty answer.
+            Err(error) if is_group_not_exists(&error.to_string()) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
     }
 }
 
@@ -1395,6 +1398,12 @@ fn warn_of_a_legacy_global_bundle(info_syncer: &Arc<tidb_domain_infosync::info_s
             &[tidb_log::Field::new("error", tidb_log::Value::Str(error))],
         ),
     }
+}
+
+/// Whether PD's resource manager answered that the group does not exist
+/// (`ErrGroupNotExists`).
+fn is_group_not_exists(message: &str) -> bool {
+    message.contains("ErrGroupNotExists") || message.contains("resource group does not exist")
 }
 
 /// Go `copr.MPPClient` over the node's `KVStore`.
@@ -1418,3 +1427,17 @@ impl tidb_domain_infosync::min_start_ts::InfoschemaMinTs for InfoCacheMinTs {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    /// PD's resource manager answers a missing group with
+    /// `ErrGroupNotExists`; the step's lookup reads it as no group, so a
+    /// CREATE RESOURCE GROUP proceeds (it retried forever on the error).
+    #[test]
+    fn a_missing_resource_group_is_none() {
+        assert!(super::is_group_not_exists(
+            "get resource group rg1 failed, rpc error: code = Unknown desc = [PD:resourcemanager:ErrGroupNotExists]the rg1 resource group does not exist"
+        ));
+        assert!(!super::is_group_not_exists("rpc error: code = Unavailable desc = connection refused"));
+    }
+}
