@@ -762,14 +762,14 @@ operator listener exists, Op means node config.
 | AutoID allocators (default caching) | RT | — | Isolated per domain. | `cluster_stack.rs:793` | — |
 | AutoID service (`AUTO_ID_CACHE=1`) | P | — | Shared: only the configured runtime serves it, bound to one keyspace. Refused in multi-keyspace mode. | `keyspace_registry.rs`; `tidb-autoid-service/src/lib.rs:354` | 3f |
 | Sequences | TS + RT | SQL | Isolated. | — | — |
-| Resource groups | PD (per keyspace) | SQL | Shared: the resource-manager client static belongs to the last-opened runtime. Resource-group DDL is refused in multi-keyspace mode. `DEFAULT_RESOURCE_GROUP` is an immutable default, the same in every keyspace (§6.5). | `cluster_stack.rs:126`; `tidb-domain-infosync/src/resource_manager_client.rs:147`; `tidb-meta/src/transaction.rs:59` | 3b |
-| Placement, label rules, TiFlash replicas, PD HTTP | PD | SQL | Shared: the last-opened runtime's clients win. Refused in multi-keyspace mode: the statements that ask for it, and any DDL job step whose resolved metadata would put placement bundles (a TRUNCATE or partition change of a table created with placement before); a step past its cancel point finishes without the PD write. The same holds for the TiFlash rules a step configures itself (an inherited TiFlash replica on a partition change or TRUNCATE). The TiFlash poller and GC's rule cleanup are off. Label rule operations are suppressed: DDL builds their IDs with the keyspace-less codec (`schema/<db>/<table>`), so same-named tables in two keyspaces would share rules. For the same reason `INFORMATION_SCHEMA.ATTRIBUTES` lists no rules (deferred to 3b, which selects the session keyspace's rules). Effects named by bare table, partition or index IDs are skipped or refused too: the PD affinity group and TiFlash progress entries a materialized view's out-of-place cutover deletes after its job is done (its own refresh alert is still deleted); the replication check and progress-cache write of a resumed ADD PARTITION, and the build-progress poll of a resumed columnar index job, both refused while the job can be cancelled; and the progress-cache delete of `SET TIFLASH REPLICA 0`. FLASHBACK CLUSTER is refused: it closes and restores PD's schedule limits for the whole cluster. On any node a finishing FLASHBACK CLUSTER job restores the limits only if it closed them: the job persists its intent before it asks PD to close them, and the close after PD answers (`pd_schedule_state`). A job that stopped between the two, or a job with no record still in `DELETE_ONLY`, may or may not have closed them; it leaves them as they are and hands off to the operator, with the saved value in its job warning and an error log. A job with no record resumed in `DELETE_ONLY` is cancelled there with the same handoff (the saved and the current values), writing nothing: it cannot tell PD's current limits from its own close or an operator's, and PD's schedule configuration has no compare-and-set to close them only while they still hold the saved value. So a later state without a record is still a Go node's real close. Placement group IDs (`TiDB_DDL_<id>`) carry no keyspace either, so table IDs collide in PD. All of this is 3b's to make per keyspace. | `cluster_stack.rs:1043`; `tidb-ddl-label/src/lib.rs:289`; `tidb-placement/src/bundle.rs:49`; `tidb-ddl/src/cluster_ddl/materialized_view.rs` (cutover cleanup); `tidb-executor/src/infoschema_reader.rs` (`set_data_for_attributes`) | 3b, including the group ID namespace |
+| Resource groups | PD (per keyspace) | SQL | Isolated: each runtime's info syncer holds its own store's resource-manager client, whose requests name the store's keyspace, and PD keeps groups per keyspace; resource-group DDL runs per tenant (and a keyspace bootstraps on a multi-keyspace node, whose bootstrap alters `default`). `DEFAULT_RESOURCE_GROUP` is an immutable default, the same in every keyspace (§6.5). | `tidb-domain-infosync/src/info_syncer.rs`; `cluster_stack.rs` (`PdResourceManagerClient`); serial test `two_keyspaces_keep_their_own_resource_groups` | — |
+| Placement, label rules, TiFlash replicas, PD HTTP | PD | SQL | Each runtime keeps its own PD managers (Go's `InfoSyncer`, §6.2). **Isolated:** label rules, whose IDs and ranges carry the job's keyspace (Go `UseKeyspaceAwareRules`, `keyspace/<id>/schema/<db>/<table>`) in DDL job steps, their delivery and compensation, `ATTRIBUTES` (the session keyspace's rules) and GC (its own keyspace's rules only); placement, whose bundles are keyed `keyspace-<id>-<group>` and ranged by the keyspace's codec where they meet PD (DDL, `ALTER RANGE`, `SHOW PLACEMENT`, the policy-in-use check, GC). Both hold on single-keyspace next-generation nodes too. A Go or older node writes keyspace-less IDs and ranges: its label rules are not listed by a keyspace-aware node, its bundles not read back, and a keyspace's GC leaves them alone (they cover no keyspace's keys; nothing can tell which keyspace wrote them, so there is no migration; the operator removes them). **Refused (1235), named by bare IDs:** TiFlash replicas -- the statements, a DDL step whose resolved metadata would configure TiFlash rules (an inherited replica on a partition change or TRUNCATE), the replication check of a resumed ADD PARTITION and the build-progress poll of a resumed columnar index job; the TiFlash poller and GC's TiFlash rule cleanup are off; the progress-cache delete of `SET TIFLASH REPLICA 0` and a materialized view cutover's TiFlash progress and PD affinity cleanup are skipped. Next-generation TiDB has TiFlash (Go's TiFlash manager keys its rules `keyspace-<id>-table-<id>-r`), but this port's manager serves the null keyspace (keyspace-less rule IDs, ranges and status URLs) and the poller and progress cache are per table ID: making them per keyspace is later work. Affinity groups (`_tidb_t_<id>`; next-generation PD requires `_tidb_ks<id>_...`), `SHOW AFFINITY`, DISTRIBUTE TABLE and its job statements (PD's cluster-wide schedulers over keyspace-less ranges) and `SHOW TABLE DISTRIBUTIONS` (keyspace-less ranges, as in Go) are refused too. FLASHBACK CLUSTER is refused: it closes and restores PD's schedule limits for the whole cluster. On any node a finishing FLASHBACK CLUSTER job restores the limits only if it closed them: the job persists its intent before it asks PD to close them, and the close after PD answers (`pd_schedule_state`). A job that stopped between the two, or a job with no record still in `DELETE_ONLY`, may or may not have closed them; it leaves them as they are and hands off to the operator, with the saved value in its job warning and an error log. A job with no record resumed in `DELETE_ONLY` is cancelled there with the same handoff (the saved and the current values), writing nothing: it cannot tell PD's current limits from its own close or an operator's, and PD's schedule configuration has no compare-and-set to close them only while they still hold the saved value. So a later state without a record is still a Go node's real close. | `tidb-domain-infosync/src/info_syncer.rs`, `placement_manager.rs` (`encode_bundle`); `tidb-ddl-build/src/label_rules.rs`; `tidb-executor/src/multi_keyspace.rs`; `tidb-ddl/src/cluster_ddl.rs` (`pd_backed_write_feature`); serial tests `two_keyspaces_keep_their_own_label_rules`, `two_keyspaces_keep_their_own_placement` | TiFlash and affinity: later |
 | DXF tables and task managers | SYSTEM storage (nextgen) | — | User runtimes skip the DXF loop, but `TASK_MANAGER_INSTANCE` and `DXF_SVC_TASK_MGR` belong to the last-opened runtime. | `tidb-domain-core/src/domain/dist_task.rs:145`; `tidb-dxf-storage/src/lib.rs:300,304` | 3f (§6.10) |
 | TTL jobs and timers | TS + RT | SQL | Isolated: job manager per domain; delete rate per keyspace. | `tidb-ttl-ttlworker/src/del.rs:118` | — |
 | MV service, workload repository, runaway, RU writer, telemetry | RT | — | Isolated per domain. | `keyspace_runtime.rs` | — |
 | IMPORT INTO, BR, PLAN REPLAYER, external storage | P | — | Shared; refused in multi-keyspace mode. Each runtime open overwrites the import store, BRIE node and cluster ID. | `keyspace_runtime.rs:100`; `tidb-executor/src/builder.rs`; `tidb-executor/src/admin.rs` | 3f |
-| INFORMATION_SCHEMA, PERFORMANCE_SCHEMA, SYS | RT + P | — | Isolated (§6.8): table definitions, catalog rows, processlist, `TIDB_TRX` and index usage are per runtime; the process-wide diagnostics are keyed by keyspace or filtered to the session's; `CLUSTER_*` tables read this node only. Refused (1235): `CLUSTER_LOG`, `TIDB_HOT_REGIONS(_HISTORY)` (3b), the profile tables. Empty: `CLIENT_ERRORS_SUMMARY_*`, `MEMORY_USAGE_OPS_HISTORY`. | `tidb-executor/src/memtable_reader.rs` (`ViewerState::keyspace`) | Rest: §6.8 |
-| METRICS_SCHEMA | P | — | Refused (1235) in multi-keyspace mode, and with it the metric-backed summaries and inspections: `PROMETHEUS_STATE` belongs to the last-opened runtime, and metrics carry no keyspace label. | `tidb-executor/src/driver/physical_builder.rs` (metric scan) | 3b, metrics labels (§5.5) |
+| INFORMATION_SCHEMA, PERFORMANCE_SCHEMA, SYS | RT + P | — | Isolated (§6.8): table definitions, catalog rows, processlist, `TIDB_TRX` and index usage are per runtime; the process-wide diagnostics are keyed by keyspace or filtered to the session's; `CLUSTER_*` tables read this node only; `ATTRIBUTES` lists the session keyspace's label rules. Refused (1235): `CLUSTER_LOG`, `TIDB_HOT_REGIONS(_HISTORY)` (not done in 3b), the profile tables. Empty: `CLIENT_ERRORS_SUMMARY_*`, `MEMORY_USAGE_OPS_HISTORY`. | `tidb-executor/src/memtable_reader.rs` (`ViewerState::keyspace`) | Rest: §6.8 |
+| METRICS_SCHEMA | P | — | Refused (1235) in multi-keyspace mode, and with it the metric-backed summaries and inspections: `PROMETHEUS_STATE` belongs to the last-opened runtime, and metrics carry no keyspace label. | `tidb-executor/src/driver/physical_builder.rs` (metric scan) | Metrics labels (§5.5); not done in 3b |
 | Instance plan cache, stats, binding and schema caches | RT | Cfg (limits) | Isolated, but each runtime gets the full process quota, so memory grows with the number of tenants. | `tidb-session/src/domain/cluster_session_node/node_services.rs:37` | Phase 5 |
 | Statement summary v1 and v2 | P | — | v1 isolated: one process map keyed by keyspace, read for the session's keyspace; the evicted rollup (every keyspace's) reads as empty. Capacity is shared (noisy neighbour). v2 (persistent) is refused (1235): its records and files have no keyspace key. | `tidb-stmtsummary/src/statement_summary.rs` (`append_keyspace`); `tidb-executor/src/memtable_reader.rs` (`statement_summary_rows`) | v2: later |
 | Slow log, `slow_query`, top-N slow | P | — | Isolated: one slow log; `slow_query` reads the entries whose `Keyspace_name` is the session's. `ADMIN SHOW SLOW` keeps one memory per keyspace. | `tidb-executor/src/slow_query.rs` (`SlowLogChecker::keyspace`); `tidb-domain/src/topn_slow_query.rs` | — |
@@ -799,8 +799,11 @@ operator listener exists, Op means node config.
 - Exhaustion: one tenant's prepared statements count against another tenant's
   limit; one process connection cap; the memory top-1 kill can pick a tenant
   that is not the cause (Phases 4 and 5).
-- PD writes (resource groups, placement, label rules, TiFlash replicas,
-  `AUTO_ID_CACHE=1`): refused in multi-keyspace mode until 3b and 3f.
+- PD state keyed by bare object IDs or keyspace-less ranges (TiFlash
+  replicas, affinity groups, PD's schedulers) and `AUTO_ID_CACHE=1`:
+  refused in multi-keyspace mode (3f for the AutoID service). Label rules
+  and placement bundles that a Go or older node wrote are keyspace-less and
+  stay until an operator removes them (§6.2).
 
 ## 6. Removing single-keyspace globals
 
@@ -818,8 +821,9 @@ replacement. Line numbers are on `73a0893eff`.
 
 ### 6.2 PD/infosync singletons
 
-The following are `Mutex<Option<Arc<..>>>` statics set from one store in
-`new_cluster_domain`:
+The following were `Mutex<Option<Arc<..>>>` statics set from one store in
+`new_cluster_domain`, so the last-opened runtime's clients served every
+tenant:
 
 - `resource_manager_client.rs:147`
 - `label_manager.rs:114`
@@ -831,17 +835,63 @@ The following are `Mutex<Option<Arc<..>>>` statics set from one store in
 - `tidb-domain-affinity/src/lib.rs:427`
 - `tidb-variable/src/domain_slots.rs:31,32,75`
 
-They move into `RuntimeServices` on the runtime, and the global accessors take
-`&Domain`. Some of them are cluster-level HTTP clients that carry no keyspace,
-for example region and Prometheus. Those may stay shared once each call site has
-been checked for keyspace-scoped requests. Resource groups, placement and label
-rules are keyspace-scoped and must be per runtime.
+**Done (3b, development mode).** The first six are the fields of an
+`InfoSyncer` (Go's struct, `tidb-domain-infosync/src/info_syncer.rs`), one
+per runtime, which also holds the codec of the runtime's store (Go
+`InfoSyncer.tikvCodec`). Each runtime's domains keep its own; the
+configured keyspace's is also the process's (Go `globalInfoSyncer`), which
+a thread that entered none reads (the status port, BR). A session enters
+its domain's while it runs a statement, a DDL job its DDL's, as they enter
+the vardef snapshot (§6.3); the package-level accessors answer from the
+entered one, so their call sites are unchanged. What runs on a thread of
+its own holds its domain's explicitly: the `ATTRIBUTES` reader (executor
+workers pull it), the unistore resource-group provider and the GC worker's
+rule client. A tenant's PD effects then go through its own clients:
 
-Placement needs more than a per-runtime client: its rule group IDs are
-`TiDB_DDL_<object id>` (`tidb-placement/src/bundle.rs:49`), one namespace in
-PD for the whole cluster, and table IDs overlap across keyspaces. 3b adds the
-keyspace to the group ID (as label rule IDs already do), with a migration for
-existing single-keyspace bundles.
+- **Resource groups:** the resource-manager client is the store's PD
+  client, whose requests name its keyspace; PD keeps groups per keyspace.
+- **Label rules:** a DDL step builds rule IDs and ranges with its job's
+  keyspace codec (Go `jobCtx.store.GetCodec()`), so on a next-generation
+  kernel they are `keyspace/<id>/schema/<db>/<table>` over the keyspace's
+  keys (Go `UseKeyspaceAwareRules`), on single-keyspace nodes too.
+  `ATTRIBUTES` lists the session keyspace's rules (Go
+  `filterRulesByKeyspace`), and a keyspace's GC reads only its own.
+- **Placement:** rule group IDs are `TiDB_DDL_<object id>`
+  (`tidb-placement/src/bundle.rs:49`), one namespace in PD for the whole
+  cluster, and the bundles' ranges are keyspace-less. Go has no keyspace in
+  either, so its bundles never covered a keyspace's keys on a
+  next-generation kernel. Where a bundle meets PD, a keyspace's bundle is
+  keyed `keyspace-<keyspace id>-<group id>` -- the prefix Go's TiFlash
+  manager gives its placement rule IDs (`encodeRuleID`) -- and each rule's
+  range is encoded by the keyspace's codec (`EncodeRegionRange`), as label
+  and TiFlash rules are; reads decode them back
+  (`placement_manager::encode_bundle`, `decode_bundle`). The rest of TiDB
+  keeps keyspace-less bundles. There is no migration for bundles that a Go
+  or older node wrote: they cover no keyspace's keys, and nothing records
+  which keyspace wrote them, so they are left for the operator.
+
+Still shared, and every multi-keyspace use is refused (1235) or off:
+
+- `schedule_manager`: FLASHBACK CLUSTER, whose schedule limits are the
+  whole cluster's.
+- The TiFlash replica manager is per runtime, but it is a port of the null
+  keyspace's (keyspace-less rule IDs `table-<id>-r`, ranges and status
+  URLs), and its poller, progress cache and GC cleanup work by bare table
+  ID. Next-generation TiDB has TiFlash (Go keys its rules
+  `keyspace-<id>-table-<id>-r`), so TiFlash replicas are refused until
+  that port lands, not by design.
+- The PD HTTP client's scheduler calls (DISTRIBUTE TABLE and its jobs:
+  cluster-wide schedulers over keyspace-less ranges) and region
+  distributions (`SHOW TABLE DISTRIBUTIONS`, keyspace-less ranges as in
+  Go).
+- `prometheus_addr`: METRICS_SCHEMA (metrics carry no keyspace label, §5.5).
+- `tidb-domain-affinity`: affinity groups are named by bare table IDs
+  (`_tidb_t_<id>`; next-generation PD requires keyspace-aware
+  `_tidb_ks<id>_...` IDs): the job steps that write them, `SHOW AFFINITY`
+  and a materialized view cutover's cleanup.
+- `domain_slots` holds process variables (§6.3): the configured keyspace's
+  domain fills them, and a tenant's `SET GLOBAL` of a process variable is
+  refused.
 
 ### 6.3 `SET GLOBAL` and process atomics
 
@@ -1504,7 +1554,7 @@ single-keyspace node.
 - **Deferred:** Top SQL (not SQL-readable; its reports name one keyspace),
   metrics keyspace labels (§5.5), the v2 statement summary, peer requests
   that name their keyspace (3f), and the TiFlash system tables (not checked
-  yet; 3b).
+  yet; with TiFlash, §6.2).
 
 ### 6.9 Status port and AutoID service
 
@@ -1640,7 +1690,7 @@ in parallel once Phase 1 lands.
 | **1b. Username-policy parity** | Port Go's Starter username handling into the Rust handshake and user DDL (§4.1): the prerequisite compatibility release for migrating existing keyspaces | Go-parity tests for variants, prefix mismatch and `CREATE USER` prefix; plain `app` login after migration on a single-keyspace node |
 | **2. Controlled demo** (behind `multi-keyspace.enable` **and** `dev-mode`) | Handshake split and registry lookup; TLS rule and operator listener (§5.4, §5.5); provisioning (§4.1); server-ID reservation (§6.6); pin-count lifecycle without idle close (§5.3); greeting plugin from config; allow-list, preload, max-keyspaces. **Pulled forward from 3d:** per-keyspace min-start-ts / GC tracking (§6.5), because GC is a data-loss risk even in a demo. **Unsupported operations are rejected** with `ER_NOT_SUPPORTED_YET` until their phase lands: placement, resource-group, label-rule and TiFlash-replica DDL (3b), `AUTO_ID_CACHE=1` tables (3f), IMPORT INTO / BR / PLAN REPLAYER / external storage (3f), tenant HTTP status APIs. **Also in Phase 2:** prefix-less users rejected by default (Q2); `require_secure_transport` read per tenant (§6.7) | Two tenants on one node: data, auth, GC-safety and AutoID tests (§9) pass; every rejected operation has a test asserting the rejection. **Not for shared deployment.** |
 | **3a** | Keyspace identity reads + resource tags + username policy (§6.1) | Unit and integration tests; no empty-keyspace assertions firing |
-| **3b** | PD/infosync singletons into `RuntimeServices` (§6.2), including a keyspace-qualified placement group ID | Resource-group, placement and label-rule SQL per tenant |
+| **3b** | PD/infosync singletons into `RuntimeServices` (§6.2), including a keyspace-qualified placement group ID. **Done in development mode:** one `InfoSyncer` per runtime; resource groups, label rules (`keyspace/<id>/...`) and placement bundles (`keyspace-<id>-<group>`, keyspace-encoded ranges) per tenant. The serial tests `two_keyspaces_keep_their_own_label_rules`, `_placement` and `_resource_groups` pass with colliding table IDs. Live (`rust/scripts/multi-tenant-sql-client.py`, the `test_*_are_tenant_local` cases): PD holds each tenant's resource groups and label rules under its keyspace, its table bundles as `keyspace-<id>-TiDB_DDL_<table id>`, and each tenant's `ALTER RANGE global` bundle as `keyspace-<id>-TiDB_GLOBAL`. The playground's older multi-keyspace node owns `keyspace1`'s DDL and refuses its PD steps, so the PD cases run their DDL in the tenants this node owns (`keyspace2`); `ALTER RANGE` runs in both. Open: right after PD splits a tenant's regions at a new rule's bounds, the playground's TiKV answers a stale read with region bounds in raw form, which the client cannot decode (`invalid marker byte`, from `decode_region_error`); the statement fails with 1105 and, when the node's own schema reload hits it, the job's schema sync waits a lease. The live cases wait out the 1105; the reload stall still fails some runs. Still refused: TiFlash replicas, affinity, PD's schedulers, FLASHBACK CLUSTER, METRICS_SCHEMA, `TIDB_HOT_REGIONS` (§6.2) | Resource-group, placement and label-rule SQL per tenant |
 | **3c** | `SET GLOBAL` / vardef split (§6.3), with the generated classification appendix | `SET GLOBAL` isolation tests for every global-scoped atomic |
 | **3d** | ID-keyed caches and DDL version state into the runtime (§6.4) and transaction/GC maps (§6.5). **Done in development mode:** the min-start-ts inputs are per keyspace (§6.5); the table row-count cache, the sync-load flights and the async-load demand are per domain; DDL job contexts are keyed by keyspace and job; the job version state is no tenant's (only the classic kernel writes it). Both gates passed: the live GC gate (`rust/scripts/multi-tenant-gc-gate.py`) and DDL concurrency with colliding job and table IDs (serial test `two_keyspaces_run_ddl_with_colliding_ids_at_once`, live case `test_concurrent_ddl_keeps_each_tenants_schema`, concurrent ADD COLUMN and asynchronous statistics loads: the playground's older node, owner of both tenants' DDL, runs neither this node's ADD INDEX reorganization nor its ANALYZE broadcast) | Stats and DDL concurrency in two tenants; GC safe point per tenant |
 | **3e** | Observability isolation (§6.8), including the `SHOW STATUS` providers. **Done in development mode**; the deferred items are listed in §6.8 | Processlist, KILL, statement summary and slow-query filtering tests |

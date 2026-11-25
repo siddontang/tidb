@@ -4,12 +4,16 @@
 Run directly with PyMySQL installed. Set TIDB_MULTI_KEYSPACE_DEV_ROOT_PASSWORD
 to the test password for both accounts. TIDB_TEST_HOST / TIDB_TEST_PORT select
 the listener. TIDB_TEST_TENANT_A / TIDB_TEST_TENANT_B select the keyspaces.
+TIDB_TEST_PD selects the PD whose keyspace-qualified objects the PD cases read.
 Each case creates and removes its own databases. Use dedicated development
 tenants with similar DDL histories for the physical table-ID collision case.
 """
 
+import json
 import os
 import time
+import urllib.parse
+import urllib.request
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -418,6 +422,151 @@ class TenantSQLTests(unittest.TestCase):
                 self.assertEqual(raised.exception.args[0], 1235, sql)
             for table in ("client_errors_summary_global", "memory_usage_ops_history"):
                 self.assertEqual(self.scalar(cursor, f"SELECT COUNT(*) FROM information_schema.{table}"), 0)
+
+
+    def pd_get(self, path):
+        url = os.getenv("TIDB_TEST_PD", "http://127.0.0.1:2379") + path
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return json.load(response)
+
+    def keyspace_id(self, tenant):
+        return self.pd_get("/pd/api/v2/keyspaces/" + urllib.parse.quote(tenant))["id"]
+
+    def execute_through_split(self, cursor, sql, done):
+        """Runs DDL that puts a PD rule over a tenant's table. PD then splits
+        the tenant's regions at the rule's bounds, and a read that meets the
+        split can fail to decode the new region's bounds ("invalid marker
+        byte"; the client and the playground's TiKV, not the rule): the
+        statement fails while its job finishes, which `done` observes."""
+        try:
+            cursor.execute(sql)
+        except pymysql.err.OperationalError as error:
+            if error.args[0] != 1105 or "invalid marker byte" not in error.args[1]:
+                raise
+            for _ in range(50):
+                if done():
+                    return
+                time.sleep(0.2)
+            raise
+
+    def ddl_owned_here(self):
+        """The tenants whose DDL owner is this node. A tenant's job steps
+        write PD on its DDL owner, which may be another node of the fleet
+        (the playground's older multi-keyspace node refuses them)."""
+        here = "%s:%s" % (os.getenv("TIDB_TEST_HOST", "127.0.0.1"), os.getenv("TIDB_TEST_PORT", "4000"))
+        owned = []
+        for index, cursor in enumerate(self.clients):
+            cursor.execute("ADMIN SHOW DDL")
+            if cursor.fetchone()[2] == here:
+                owned.append(index)
+        if not owned:
+            self.skipTest("this node owns neither tenant's DDL")
+        return owned
+
+    def test_resource_groups_are_tenant_local(self):
+        """Phase 3b: the tenants whose DDL this node owns create a group of
+        the same name; PD keeps it under each one's keyspace, and no other
+        tenant reads it."""
+        owned = self.ddl_owned_here()
+        name = "rg_" + uuid.uuid4().hex[:12]
+        for index in owned:
+            self.clients[index].execute("CREATE RESOURCE GROUP %s RU_PER_SEC = %d" % (name, 100 * (index + 1)))
+            self.addCleanup(self.clients[index].execute, "DROP RESOURCE GROUP IF EXISTS " + name)
+        for index, (tenant, cursor) in enumerate(zip(self.tenants, self.clients)):
+            want = [100 * (index + 1)] if index in owned else []
+            cursor.execute("SELECT ru_per_sec FROM information_schema.resource_groups WHERE name = %s", (name,))
+            self.assertEqual([int(row[0]) for row in cursor.fetchall()], want, tenant)
+            groups = self.pd_get("/resource-manager/api/v1/config/groups?keyspace_name="
+                                 + urllib.parse.quote(tenant))
+            pd_ru = [group["r_u_settings"]["r_u"]["settings"]["fill_rate"]
+                     for group in groups if group["name"] == name]
+            self.assertEqual(pd_ru, want, tenant)
+
+    def test_attributes_are_tenant_local(self):
+        """Phase 3b: the same table gets a label rule in PD per tenant, named
+        and ranged by its keyspace, and each tenant's ATTRIBUTES lists only
+        its own."""
+        owned = self.ddl_owned_here()
+        options = ("deny", "allow")
+        for index in owned:
+            cursor = self.clients[index]
+            self.execute_through_split(
+                cursor, "ALTER TABLE t ATTRIBUTES = 'merge_option=%s'" % options[index],
+                lambda: self.scalar(cursor, "SELECT COUNT(*) FROM information_schema.attributes WHERE id LIKE %s",
+                                    ("%" + self.schema + "%",)))
+        rule_ids = ["keyspace/%d/schema/%s/t" % (self.keyspace_id(tenant), self.schema) for tenant in self.tenants]
+        try:
+            for index, cursor in enumerate(self.clients):
+                cursor.execute("SELECT id, attributes FROM information_schema.attributes WHERE id LIKE %s",
+                               ("%" + self.schema + "%",))
+                want = (("schema/%s/t" % self.schema, '"merge_option=%s"' % options[index]),) if index in owned else ()
+                self.assertEqual(cursor.fetchall(), want, self.tenants[index])
+            rules = {rule["id"]: rule for rule in self.pd_get("/pd/api/v1/config/region-label/rules")
+                     if self.schema in rule["id"]}
+            self.assertEqual(sorted(rules), sorted(rule_ids[index] for index in owned))
+            for index in owned:
+                labels = rules[rule_ids[index]]["labels"]
+                self.assertIn({"key": "merge_option", "value": options[index]}, labels)
+        finally:
+            for index in owned:
+                self.clients[index].execute("ALTER TABLE t ATTRIBUTES = DEFAULT")
+        remaining = [rule["id"] for rule in self.pd_get("/pd/api/v1/config/region-label/rules")
+                     if self.schema in rule["id"]]
+        self.assertEqual(remaining, [])
+
+    def test_placement_policies_are_tenant_local(self):
+        """Phase 3b: both tenants create a policy of the same name and read
+        only their own; ALTER RANGE runs on this node and puts each tenant's
+        range bundle under its keyspace, keyspace-<id>-TiDB_GLOBAL. The
+        tenants whose DDL this node owns attach the policy to a table, whose
+        bundle PD keeps as keyspace-<id>-TiDB_DDL_<table id>."""
+        name = "pp_" + uuid.uuid4().hex[:12]
+        owned = self.ddl_owned_here()
+        bundle = lambda group: self.pd_get("/pd/api/v1/config/placement-rule/" + group)
+        ids = [self.keyspace_id(tenant) for tenant in self.tenants]
+        for index, cursor in enumerate(self.clients):
+            cursor.execute("CREATE PLACEMENT POLICY %s FOLLOWERS = %d" % (name, index + 1))
+            self.addCleanup(cursor.execute, "DROP PLACEMENT POLICY IF EXISTS " + name)
+        for index in owned:
+            cursor = self.clients[index]
+            self.addCleanup(cursor.execute, "DROP TABLE IF EXISTS tp")
+            table_id = lambda: self.scalar(cursor, "SELECT tidb_table_id FROM information_schema.tables "
+                                                   "WHERE table_schema = %s AND table_name = 'tp'", (self.schema,))
+            self.execute_through_split(cursor, "CREATE TABLE tp (id INT) PLACEMENT POLICY = " + name, table_id)
+            table_id = table_id()
+            group = "keyspace-%d-TiDB_DDL_%d" % (ids[index], table_id)
+            rules = bundle(group)["rules"]
+            self.assertEqual({rule["group_id"] for rule in rules}, {group})
+            self.assertEqual(sum(rule["count"] for rule in rules), index + 2)
+        for index, cursor in enumerate(self.clients):
+            self.assertEqual(self.scalar(cursor, "SELECT followers FROM information_schema.placement_policies "
+                                                 "WHERE policy_name = %s", (name,)), index + 1)
+            cursor.execute("ALTER RANGE global PLACEMENT POLICY " + name)
+        try:
+            for index, cursor in enumerate(self.clients):
+                rules = bundle("keyspace-%d-TiDB_GLOBAL" % ids[index])["rules"]
+                self.assertEqual(sum(rule["count"] for rule in rules), index + 2)
+                cursor.execute("SHOW PLACEMENT")
+                self.assertIn(("RANGE TiDB_GLOBAL", "FOLLOWERS=%d" % (index + 1)),
+                              [row[:2] for row in cursor.fetchall()])
+        finally:
+            for cursor in self.clients:
+                cursor.execute("ALTER RANGE global PLACEMENT POLICY default")
+        for keyspace_id in ids:
+            self.assertFalse(bundle("keyspace-%d-TiDB_GLOBAL" % keyspace_id).get("rules"))
+
+    def test_pd_objects_without_a_keyspace_are_refused(self):
+        """TiFlash rules and PD's schedulers and affinity groups are keyed by
+        bare table IDs or keyspace-less ranges: refused per tenant."""
+        for cursor in self.clients:
+            for sql in ("ALTER TABLE t SET TIFLASH REPLICA 1",
+                        "DISTRIBUTE TABLE t RULE = 'leader-scatter' ENGINE = 'tikv'",
+                        "SHOW DISTRIBUTION JOBS",
+                        "SHOW TABLE t DISTRIBUTIONS",
+                        "SHOW AFFINITY"):
+                with self.assertRaises(pymysql.err.MySQLError) as raised:
+                    cursor.execute(sql)
+                self.assertEqual(raised.exception.args[0], 1235, sql)
 
 
 if __name__ == "__main__":
