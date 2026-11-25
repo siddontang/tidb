@@ -28567,8 +28567,8 @@ fn the_async_load_drains_the_demand_on_the_domains_sessions_as_go() {
         is_index: false,
         is_sync_load_failed: false,
     };
-    let needed = &tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS;
-    needed.insert(item, true);
+    let needed = stack.factory.load_workers();
+    needed.queue_async_load(item, true);
 
     let catalog = stack.factory.catalog.get_latest();
     let table = catalog
@@ -28582,9 +28582,10 @@ fn the_async_load_drains_the_demand_on_the_domains_sessions_as_go() {
         },
         &targets,
         stats,
+        &needed,
     )
     .expect("the demand drains on the domain's sessions");
-    assert!(needed.all_items().iter().all(|requested| requested.table_item_id != item));
+    assert!(needed.async_load_items().iter().all(|requested| requested.table_item_id != item));
     let table = stats.get(table_id).unwrap();
     let column = table.hist_coll.get_column(v_column).unwrap();
     let column = column.read().unwrap();

@@ -887,6 +887,7 @@ pub fn unistore_cluster_session_stack_from_for_keyspace(
         Arc::clone(&factory.catalog),
         config.stats_lease,
         factory.advanced_sys_session_pool(),
+        factory.load_workers(),
     )
     .map_err(|error| engine(SqlQueryError::unknown(error.to_string())))?;
     // Go `UpdateTableStatsLoop`: the statistics owner, whose listener is the

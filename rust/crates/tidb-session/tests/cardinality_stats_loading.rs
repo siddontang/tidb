@@ -69,8 +69,11 @@ fn subset_index_cardinality_after_async_statistics_load() {
         (table.table_id(), column_ids, index_id)
     };
     let queued = || {
-        tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS
-            .all_items()
+        shared
+            .stats_handle()
+            .sync_load_service()
+            .expect("the session's domain loaders")
+            .async_load_items()
             .into_iter()
             .any(|item| item.table_item_id.table_id == table_id)
     };
@@ -143,8 +146,11 @@ fn datetime_range_overflow_survives_async_statistics_load() {
     let sql = "SELECT * FROM t WHERE col BETWEEN '8499-1-23 2:14:38' AND '9961-7-23 18:35:26'";
     assert!(rows(&mut session, sql).is_empty());
     let queued = || {
-        tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS
-            .all_items()
+        shared
+            .stats_handle()
+            .sync_load_service()
+            .expect("the session's domain loaders")
+            .async_load_items()
             .into_iter()
             .any(|item| item.table_item_id.table_id == table_id)
     };

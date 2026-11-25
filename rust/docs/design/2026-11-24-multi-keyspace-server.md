@@ -755,7 +755,7 @@ operator listener exists, Op means node config.
 | `tidb_external_ts` | PD (whole cluster) | Op | Shared by design: PD keeps one external timestamp per cluster. A process variable; tenants read it. | commit `a18dec47b5` | — |
 | Bindings (`mysql.bind_info`, cache) | TS + RT | SQL | Isolated: binding handle per domain. | `cluster_stack.rs:256` | — |
 | Statistics (`mysql.stats_*`, cache, owner, auto-analyze queue) | TS + RT | SQL (ANALYZE) | Isolated per domain; auto-analyze reads its keyspace's settings. | `cluster_stack.rs:810,944` | — |
-| Stats globals keyed by table ID (the table row-count cache, async and sync load queues, `GLOBAL_AUTO_ANALYZE_PROCESS_LIST`) | P + RT | — | The row-count cache behind `INFORMATION_SCHEMA.TABLES` sizes is one per domain (`Domain::table_row_stats`). Shared: the async-load demand map, which one keyspace's loader drains for every keyspace (its colliding IDs load its own tables, and the other keyspace's demand is dropped until it asks again; no wrong data). Process IDs do not collide: they come from the one process allocator (§6.6). | `tidb-domain-core/src/domain/mod.rs` (`table_row_stats`); `tidb-stats-asyncload/src/lib.rs:26`; `tidb-stats-handle-util/src/auto_analyze_proc_id_generator.rs:101` | 3d (async-load map) |
+| Stats globals keyed by table ID (the table row-count cache, async and sync load queues, `GLOBAL_AUTO_ANALYZE_PROCESS_LIST`) | RT + P | — | Isolated: the row-count cache behind `INFORMATION_SCHEMA.TABLES` sizes is one per domain (`Domain::table_row_stats`); the sync-load flights and the async-load demand are the domain pool's (`StatisticsLoadWorkers`). Process IDs do not collide: they come from the one process allocator (§6.6). | `tidb-domain-core/src/domain/mod.rs` (`table_row_stats`, `load_workers`); `tidb-stats-handle-syncload/src/sync_load.rs`; `tidb-stats-handle-util/src/auto_analyze_proc_id_generator.rs:101` | — |
 | GC worker, delete ranges, GC settings, safe points | TS + PD (per keyspace) | SQL (GC settings) | Isolated: one GC worker per runtime. | `keyspace_runtime.rs` | — |
 | min-start-ts report | Tenant etcd | — | Isolated: `ACTIVE_START_TS` and `GLOBAL_INNER_TXN_START_TS` keep one set per keyspace ID of the store a transaction reads, and each runtime's report reads its own set, its own process list and internal sessions. Statement results and cursors kept past their transaction cannot name their keyspace: they hold a shared set every report reads (conservative: another tenant's GC waits for them). The auto-analyze list only names process IDs, unique in the process (§6.6). | `cluster_stack.rs` (`start_min_start_ts_reporter`); `tidb-txnkv/src/inner_txn.rs` (`PerKeyspace`) | — |
 | TSO, PD client, region cache, TiKV channels | RT | — | Isolated: one store per keyspace. The tokio pool is shared by design. | `tikv_store.rs:93,127,158` | — |
@@ -796,8 +796,6 @@ operator listener exists, Op means node config.
   every tenant's reported min-start-ts (conservative, §6.5).
 - DDL: a peer on an old version in one tenant's fleet sets the job version
   for every tenant on the node (3d).
-- Statistics: with overlapping table IDs, one tenant's async statistics
-  loader drains another tenant's load demand (3d).
 - Diagnostics (§6.8): what has no keyspace-correct source is refused or
   empty; Top SQL reports still name one keyspace (not SQL-readable).
 - Exhaustion: one tenant's prepared statements count against another tenant's
@@ -1208,12 +1206,13 @@ Table and job IDs are per keyspace, so these caches collide across tenants:
 - the stats async-load and sync-load queues (`tidb-stats-asyncload/src/lib.rs:26`,
   `sync_load.rs:75`). **Done for sync load:** its single-flight map is the
   domain pool's (`StatisticsLoadWorkers`), so one keyspace's request never
-  joins another's load of the same ID. **Open:** the async-load demand map
-  is still process-wide. Its producers (the planner's statistics
-  collection, the sync-load fallback) and its consumer (each domain's async
-  loader) have no shared per-domain owner yet; until they do, a keyspace's
-  loader may drain another's demand (no wrong data: it loads its own
-  tables for those IDs).
+  joins another's load of the same ID. **Done for async load:** the demand map is
+  the domain pool's too (`StatisticsLoadWorkers::queue_async_load`,
+  `async_load_items`, `finish_async_load`): the planner's statistics
+  collection and the sync-load fallback reach it through their statistics
+  handle's loaders (`StatsHandle::sync_load_service`), and the domain's
+  asynchronous loader drains its own (`Domain::load_workers`). The process
+  static is gone.
 - the auto-analyze process ID generator (`auto_analyze_proc_id_generator.rs:101`).
   **Done in Phase 2** (§6.6, step 6): IDs come from the one process
   allocator, so they are unique in the process.

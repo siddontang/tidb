@@ -166,6 +166,7 @@ pub fn spawn_node_stats(
     catalog: Arc<InfoCache>,
     stats_lease: tidb_domain_core::node_config::StatsLease,
     session_pool: Arc<tidb_domain_core::sys_session::DomainSysSessionPool>,
+    load_workers: Arc<tidb_stats_handle_syncload::sync_load::StatisticsLoadWorkers>,
 ) -> Result<(StatsReloader, AsyncStatsLoader), StatsReloadError> {
     let Some(reload_interval) = stats_lease.reload_interval() else {
         return Ok((StatsReloader::disabled(), AsyncStatsLoader::disabled()));
@@ -204,6 +205,7 @@ pub fn spawn_node_stats(
                     },
                     &targets,
                     &async_shared,
+                    &load_workers,
                 ) {
                     // Go `Domain.asyncLoadHistogram`.
                     tidb_stats_handle_logutil::stats_err_verbose_sample_logger()

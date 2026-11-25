@@ -53,12 +53,15 @@ impl CatalogStatistics for SessionExtendedInfoSchema {
     /// whose cache state no longer requires a load and return the number that
     /// remain genuinely needed.
     fn clean_needed_statistics_items(&self, handle: &StatsHandle) -> i64 {
-        let needed = &tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS;
+        // The domain's demand, through the handle's loaders.
+        let Some(needed) = handle.sync_load_service() else {
+            return 0;
+        };
         let mut really_needed = 0_i64;
-        for requested in needed.all_items() {
+        for requested in needed.async_load_items() {
             let item = requested.table_item_id;
             let Some(statistics) = handle.table_statistics(item.table_id, || self.statistics_schema(item.table_id)) else {
-                needed.delete(item);
+                needed.finish_async_load(item);
                 continue;
             };
             let load_needed = if item.is_index {
@@ -71,13 +74,13 @@ impl CatalogStatistics for SessionExtendedInfoSchema {
             if load_needed {
                 really_needed = really_needed.saturating_add(1);
             } else {
-                needed.delete(item);
+                needed.finish_async_load(item);
             }
         }
         really_needed
     }
 
-    /// Go `storage.LoadNeededHistograms`: drains the process-wide asynchronous
+    /// Go `storage.LoadNeededHistograms`: drains the domain's asynchronous
     /// demand on the domain tick. Each item is attempted at most once and is
     /// removed even when storage returns an error; a later item remains queued
     /// when an earlier load fails.
@@ -87,11 +90,10 @@ impl CatalogStatistics for SessionExtendedInfoSchema {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let Some(loader) = loader else {
+        let (Some(loader), Some(needed)) = (loader, handle.sync_load_service()) else {
             return Ok(());
         };
-        let needed = &tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS;
-        for requested in needed.all_items() {
+        for requested in needed.async_load_items() {
             let item = requested.table_item_id;
             let valid_metadata = if item.is_index {
                 self.kv_table_by_id(item.table_id)
@@ -114,7 +116,7 @@ impl CatalogStatistics for SessionExtendedInfoSchema {
                     }
                 });
             if !valid_metadata || !load_needed {
-                needed.delete(item);
+                needed.finish_async_load(item);
                 continue;
             }
             let requested = tidb_model::StatsLoadItem {
@@ -122,7 +124,7 @@ impl CatalogStatistics for SessionExtendedInfoSchema {
                 full_load: item.is_index || requested.full_load,
             };
             let loaded = loader.load_items(std::slice::from_ref(&requested));
-            needed.delete(item);
+            needed.finish_async_load(item);
             let tables = loaded?;
             let mut values = handle
                 .values

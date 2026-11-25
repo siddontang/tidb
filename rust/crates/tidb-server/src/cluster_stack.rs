@@ -283,6 +283,7 @@ pub fn cluster_session_stack(
         Arc::clone(&factory.catalog),
         config.stats_lease,
         factory.advanced_sys_session_pool(),
+        factory.load_workers(),
     )
     .map_err(|error| RunConfiguredNodeError::Engine(SqlQueryError::unknown(error.to_string())))?;
     factory.attach_login_storage(&users);

@@ -110,8 +110,12 @@ pub fn load_needed_items(
     if sync_wait > 0 {
         return request_load_stats(catalog, ctx, usage, sync_wait);
     }
+    // The domain's demand, which its asynchronous loader drains.
+    let Some(loads) = ctx.stats_handle().sync_load_service() else {
+        return Ok(());
+    };
     for (item, full_load) in catalog.statistics_demand(ctx.stats_handle(), usage) {
-        tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.insert(item, full_load);
+        loads.queue_async_load(item, full_load);
     }
     Ok(())
 }
@@ -178,6 +182,7 @@ pub fn sync_wait_stats_load(ctx: &tidb_sessionctx::StmtContext) -> Result<(), Pl
         &stats_load.items,
         stats_load.timeout,
         stats_load.started,
+        ctx.stats_handle().sync_load_service().as_deref(),
     ) else {
         return Ok(());
     };

@@ -12,27 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Go `pkg/statistics/asyncload`: the process-wide set of column and index
-//! statistics whose histogram payload is still needed.
+//! Go `pkg/statistics/asyncload`: the set of column and index statistics
+//! whose histogram payload is still needed. Go keeps one per process; here
+//! each domain owns one (`StatisticsLoadWorkers::needed_items`): its items
+//! are table and column IDs, which collide across the keyspaces of a node
+//! serving several (`rust/docs/design/2026-11-24-multi-keyspace-server.md`,
+//! §6.4).
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, RwLock};
+use std::sync::RwLock;
 
 use tidb_model::{StatsLoadItem, TableItemID};
 
 const SHARD_COUNT: usize = 128;
 
-/// The process-wide needed-item set used by asynchronous statistics loading.
-pub static ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS: LazyLock<NeededStatsMap> =
-    LazyLock::new(NeededStatsMap::new);
-
-/// Go's `neededStatsMap`, sharded by the absolute column-or-index ID.
 pub struct NeededStatsMap {
     shards: [RwLock<HashMap<TableItemID, bool>>; SHARD_COUNT],
 }
 
+impl Default for NeededStatsMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NeededStatsMap {
-    fn new() -> Self {
+    /// An empty set.
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             shards: std::array::from_fn(|_| RwLock::new(HashMap::new())),
         }

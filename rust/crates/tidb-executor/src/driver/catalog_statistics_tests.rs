@@ -185,15 +185,14 @@
         (catalog, handle, table_id, partition_ids, indexes)
     }
 
-    fn clear_async_statistics_items() {
-        for item in tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.all_items() {
-            tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.delete(item.table_item_id);
-        }
+    /// The domain loaders `handle` uses, which keep its asynchronous demand.
+    fn needed(handle: &StatsHandle) -> Arc<tidb_stats_handle_syncload::sync_load::SyncLoadService> {
+        handle.sync_load_service().expect("the handle has its domain's loaders")
     }
 
-    fn requested_index_ids(table_id: i64) -> std::collections::HashSet<i64> {
-        tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS
-            .all_items()
+    fn requested_index_ids(handle: &StatsHandle, table_id: i64) -> std::collections::HashSet<i64> {
+        needed(handle)
+            .async_load_items()
             .into_iter()
             .filter_map(|item| {
                 (item.table_item_id.table_id == table_id && item.table_item_id.is_index)
@@ -256,6 +255,8 @@
     #[test]
     fn a_singleflight_transport_timeout_activates_statement_failure_before_wait_timer() {
         let handle = Arc::new(StatsHandle::default());
+        // The domain loaders whose demand a failed item is left in.
+        handle.set_item_loader(Arc::new(RecordingLoader::default()), StatisticsLoadWorkers::new());
         let _guard = STATS_LOAD_TEST_LOCK.lock().unwrap();
         // Go master TestSyncWaitStatsLoadWithFailedResultBeforeTimer: prepare
         // the result before waiting instead of relying on two racing timers.
@@ -304,11 +305,11 @@
             }
             let mut failed = requested.table_item_id;
             failed.is_sync_load_failed = true;
-            assert!(tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS
-                .all_items()
+            assert!(needed(&handle)
+                .async_load_items()
                 .iter()
                 .any(|item| item.table_item_id == failed));
-            tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.delete(failed);
+            needed(&handle).finish_async_load(failed);
             assert!(context.take_pending_statistics_load().is_none());
         }
     }
@@ -316,6 +317,8 @@
     #[test]
     fn delivered_worker_errors_complete_the_wait_and_record_latency() {
         let handle = Arc::new(StatsHandle::default());
+        // The domain loaders whose demand a failed item is left in.
+        handle.set_item_loader(Arc::new(RecordingLoader::default()), StatisticsLoadWorkers::new());
         let _guard = STATS_LOAD_TEST_LOCK.lock().unwrap();
         use tidb_stats_handle_metrics::{SYNC_LOAD_HISTOGRAM, SYNC_LOAD_TOTAL};
         let catalog = tidb_infoschema_perfschema::mock_catalog();
@@ -350,8 +353,8 @@
         assert!(!context.sync_stats_failed());
         let mut failed = requested.table_item_id;
         failed.is_sync_load_failed = true;
-        assert!(!tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS
-            .all_items()
+        assert!(!needed(&handle)
+            .async_load_items()
             .iter()
             .any(|item| item.table_item_id == failed));
         assert!(SYNC_LOAD_TOTAL.get() >= count + 1.0);
@@ -365,6 +368,8 @@
     #[test]
     fn statistics_wait_timeout_and_closed_channel_record_consumption() {
         let handle = Arc::new(StatsHandle::default());
+        // The domain loaders whose demand a failed item is left in.
+        handle.set_item_loader(Arc::new(RecordingLoader::default()), StatisticsLoadWorkers::new());
         let _guard = STATS_LOAD_TEST_LOCK.lock().unwrap();
         use tidb_stats_handle_metrics::{SYNC_LOAD_TIMEOUT_TOTAL, SYNC_LOAD_TOTAL};
         for closed in [false, true] {
@@ -406,7 +411,7 @@
             }
             let mut failed = requested.table_item_id;
             failed.is_sync_load_failed = true;
-            tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.delete(failed);
+            needed(&handle).finish_async_load(failed);
             drop(sender);
         }
     }
@@ -447,10 +452,43 @@
         assert_eq!(catalog.clean_needed_statistics_items(&handle), 0);
     }
 
+    /// Design §6.4: two domains (two keyspaces of one node). Planning in A
+    /// leaves its demand with A's domain only, and B's asynchronous loader
+    /// neither loads nor drains it (a process-wide demand was drained by
+    /// every domain's loader, whatever keyspace asked).
+    #[test]
+    fn asynchronous_demand_stays_with_the_domain_that_planned() {
+        let _guard = STATS_LOAD_TEST_LOCK.lock().unwrap();
+        let (mut a_catalog, a, table_id, column_id) = analyzed_lite_catalog();
+        let (mut b_catalog, b, _, _) = analyzed_lite_catalog();
+        let (a_loader, b_loader) = (Arc::new(RecordingLoader::default()), Arc::new(RecordingLoader::default()));
+        a.set_item_loader(a_loader.clone(), StatisticsLoadWorkers::new());
+        b.set_item_loader(b_loader.clone(), StatisticsLoadWorkers::new());
+        let usage = tidb_stats::table_statistics::ColumnStatsUsage {
+            visited_logical_table_ids: [table_id].into_iter().collect(),
+            ..Default::default()
+        };
+        let context = crate::StmtContext::for_query().with_stats_handle(Arc::clone(&a)).with_stats_load_policy(0, true, 0);
+        load_needed_items(&a_catalog, &context, &usage).expect("queue the asynchronous load");
+        let queued = |handle: &StatsHandle| {
+            needed(handle)
+                .async_load_items()
+                .iter()
+                .any(|item| item.table_item_id.table_id == table_id && item.table_item_id.id == column_id)
+        };
+        assert!(queued(&a), "A's demand");
+        assert!(!queued(&b), "B's demand holds A's item");
+        b_catalog.load_needed_histograms(&b).expect("B's loader runs");
+        assert!(b_loader.requests.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
+        assert!(queued(&a), "B's loader drained A's demand");
+        a_catalog.load_needed_histograms(&a).expect("A's loader runs");
+        assert!(!a_loader.requests.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
+        assert!(!queued(&a));
+    }
+
     #[test]
     fn asynchronous_column_metadata_request_uses_full_load_eligibility() {
         let _guard = STATS_LOAD_TEST_LOCK.lock().unwrap();
-        clear_async_statistics_items();
         let (mut catalog, handle, table_id, column_id) = analyzed_lite_catalog();
         let loader = Arc::new(RecordingLoader::default());
         handle.set_item_loader(loader.clone(), StatisticsLoadWorkers::new());
@@ -460,7 +498,7 @@
             is_index: false,
             is_sync_load_failed: false,
         };
-        tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.insert(requested, false);
+        needed(&handle).queue_async_load(requested, false);
 
         catalog
             .load_needed_histograms(&handle)
@@ -481,7 +519,6 @@
     #[test]
     fn asynchronous_index_request_is_always_full_load() {
         let _guard = STATS_LOAD_TEST_LOCK.lock().unwrap();
-        clear_async_statistics_items();
         let (mut catalog, handle, table_id, _) = analyzed_lite_catalog();
         let index_id = catalog
             .kv_table_by_id(table_id)
@@ -499,7 +536,7 @@
             is_index: true,
             is_sync_load_failed: false,
         };
-        tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.insert(requested, false);
+        needed(&handle).queue_async_load(requested, false);
 
         catalog
             .load_needed_histograms(&handle)
@@ -541,8 +578,8 @@
         load_needed_items(&catalog, &context, &usage)
             .expect("start asynchronous load");
         assert!(catalog.load_needed_histograms(&handle).is_err());
-        assert!(!tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS
-            .all_items()
+        assert!(!needed(&handle)
+            .async_load_items()
             .iter()
             .any(|item| item.table_item_id == requested));
         assert_eq!(
@@ -560,9 +597,7 @@
 
     #[test]
     fn load_column_statistics_after_table_drop() {
-        let handle = Arc::new(StatsHandle::default());
         let _guard = STATS_LOAD_TEST_LOCK.lock().unwrap();
-        clear_async_statistics_items();
         let (_, handle, table_id, column_id) = analyzed_lite_catalog();
         let dropped = tidb_model::TableItemID {
             table_id,
@@ -570,18 +605,18 @@
             is_index: false,
             is_sync_load_failed: false,
         };
-        tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.insert(dropped, true);
+        let loader = Arc::new(RecordingLoader::default());
+        handle.set_item_loader(loader, StatisticsLoadWorkers::new());
+        needed(&handle).queue_async_load(dropped, true);
         // The table is dropped after queueing the column: the next schema
         // image no longer has it.
         let mut catalog = tidb_infoschema_perfschema::mock_catalog();
-        let loader = Arc::new(RecordingLoader::default());
-        handle.set_item_loader(loader, StatisticsLoadWorkers::new());
 
         catalog
             .load_needed_histograms(&handle)
             .expect("a dropped table is a successful skip");
-        assert!(!tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS
-            .all_items()
+        assert!(!needed(&handle)
+            .async_load_items()
             .iter()
             .any(|item| item.table_item_id == dropped));
     }
@@ -591,7 +626,6 @@
     #[test]
     fn load_statistics_for_a_column_the_table_does_not_have() {
         let _guard = STATS_LOAD_TEST_LOCK.lock().unwrap();
-        clear_async_statistics_items();
         let (mut catalog, handle, table_id, _) = analyzed_lite_catalog();
         let column_id = catalog
             .kv_table_by_id(table_id)
@@ -606,12 +640,12 @@
             is_index: false,
             is_sync_load_failed: false,
         };
-        tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.insert(dropped, true);
+        needed(&handle).queue_async_load(dropped, true);
         catalog
             .load_needed_histograms(&handle)
             .expect("a dropped column is a successful skip");
-        assert!(!tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS
-            .all_items()
+        assert!(!needed(&handle)
+            .async_load_items()
             .iter()
             .any(|item| item.table_item_id == dropped));
     }
@@ -619,7 +653,6 @@
     #[test]
     fn load_index_statistics_after_table_drop() {
         let _guard = STATS_LOAD_TEST_LOCK.lock().unwrap();
-        clear_async_statistics_items();
         let (catalog, handle, table_id, _) = analyzed_lite_catalog();
         let index_id = catalog
             .kv_table_by_id(table_id)
@@ -632,18 +665,18 @@
             is_index: true,
             is_sync_load_failed: false,
         };
-        tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.insert(dropped, true);
+        let loader = Arc::new(RecordingLoader::default());
+        handle.set_item_loader(loader, StatisticsLoadWorkers::new());
+        needed(&handle).queue_async_load(dropped, true);
         // The table is dropped after queueing the index: the next schema
         // image no longer has it.
         let mut catalog = tidb_infoschema_perfschema::mock_catalog();
-        let loader = Arc::new(RecordingLoader::default());
-        handle.set_item_loader(loader, StatisticsLoadWorkers::new());
 
         catalog
             .load_needed_histograms(&handle)
             .expect("a dropped table is a successful skip");
-        assert!(!tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS
-            .all_items()
+        assert!(!needed(&handle)
+            .async_load_items()
             .iter()
             .any(|item| item.table_item_id == dropped));
     }
@@ -653,7 +686,6 @@
     #[test]
     fn load_statistics_for_an_index_the_table_does_not_have() {
         let _guard = STATS_LOAD_TEST_LOCK.lock().unwrap();
-        clear_async_statistics_items();
         let (mut catalog, handle, table_id, _) = analyzed_lite_catalog();
         let index_id = catalog
             .kv_table_by_id(table_id)
@@ -668,12 +700,12 @@
             is_index: true,
             is_sync_load_failed: false,
         };
-        tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.insert(dropped, true);
+        needed(&handle).queue_async_load(dropped, true);
         catalog
             .load_needed_histograms(&handle)
             .expect("a dropped index is a successful skip");
-        assert!(!tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS
-            .all_items()
+        assert!(!needed(&handle)
+            .async_load_items()
             .iter()
             .any(|item| item.table_item_id == dropped));
     }
@@ -853,10 +885,10 @@
     #[test]
     fn pruned_indexes_do_not_enter_async_statistics_demand() {
         let _guard = STATS_LOAD_TEST_LOCK.lock().unwrap();
-        clear_async_statistics_items();
 
         for (partitioned, static_prune) in [(false, false), (true, false), (true, true)] {
             let (catalog, handle, table_id, partition_ids, indexes) = index_pruning_catalog(partitioned);
+            handle.set_item_loader(Arc::new(RecordingLoader::default()), StatisticsLoadWorkers::new());
             let context = crate::StmtContext::for_query().with_stats_handle(Arc::clone(&handle))
                 .with_stats_load_policy(0, true, 0)
                 .with_opt_index_prune_threshold(1)
@@ -868,20 +900,19 @@
                 assert!(!partition_ids.is_empty());
                 for partition_id in partition_ids {
                     assert_only_indexes_starting_with_a_are_requested(
-                        &requested_index_ids(partition_id),
+                        &requested_index_ids(&handle, partition_id),
                         &indexes,
                         false,
                     );
                 }
             } else {
                 assert_only_indexes_starting_with_a_are_requested(
-                    &requested_index_ids(table_id),
+                    &requested_index_ids(&handle, table_id),
                     &indexes,
                     true,
                 );
             }
-            clear_async_statistics_items();
-        }
+            }
     }
 
     #[test]

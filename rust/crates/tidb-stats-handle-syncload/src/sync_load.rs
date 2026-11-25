@@ -79,6 +79,10 @@ pub struct StatisticsLoadWorkers {
     /// across the keyspaces of a node serving several (design §6.4), so one
     /// keyspace's request must not join another's load.
     flights: Mutex<HashMap<String, Vec<Listener>>>,
+    /// Go's process-wide `AsyncLoadHistogramNeededItems`, kept with the
+    /// domain's pool for the same reason: what the domain's sessions leave
+    /// for its asynchronous loader, which drains it.
+    needed: Arc<tidb_stats_asyncload::NeededStatsMap>,
     needed_items: crossbeam_channel::Sender<NeededItemTask>,
     _needed_items_receiver: crossbeam_channel::Receiver<NeededItemTask>,
     _timeout_items_receiver: crossbeam_channel::Receiver<NeededItemTask>,
@@ -130,6 +134,7 @@ impl StatisticsLoadWorkers {
         }
         Arc::new(Self {
             flights: Mutex::default(),
+            needed: Arc::default(),
             needed_items: needed_tx,
             _needed_items_receiver: needed_rx,
             _timeout_items_receiver: timeout_rx,
@@ -140,6 +145,26 @@ impl StatisticsLoadWorkers {
 }
 
 impl StatisticsLoadWorkers {
+    /// Go `AsyncLoadHistogramNeededItems.Insert`: queues `item` for the
+    /// domain's asynchronous loader (only an upgrade to a full load replaces
+    /// a queued item).
+    pub fn queue_async_load(&self, item: tidb_model::TableItemID, full_load: bool) {
+        self.needed.insert(item, full_load);
+    }
+
+    /// Go `AsyncLoadHistogramNeededItems.AllItems`: the domain's queued
+    /// asynchronous loads.
+    #[must_use]
+    pub fn async_load_items(&self) -> Vec<tidb_model::StatsLoadItem> {
+        self.needed.all_items()
+    }
+
+    /// Go `AsyncLoadHistogramNeededItems.Delete`: `item` no longer needs an
+    /// asynchronous load.
+    pub fn finish_async_load(&self, item: tidb_model::TableItemID) {
+        self.needed.delete(item);
+    }
+
     /// Go `singleflight.Group.DoChan`'s join: `listener` waits for the load
     /// of `key` in flight on this pool (`true`), or starts the flight, which
     /// the caller then runs (`false`).
@@ -188,6 +213,22 @@ impl SyncLoadService {
     #[must_use]
     pub fn pool(&self) -> &Arc<StatisticsLoadWorkers> {
         &self.pool
+    }
+
+    /// [`StatisticsLoadWorkers::queue_async_load`] on the domain's pool.
+    pub fn queue_async_load(&self, item: tidb_model::TableItemID, full_load: bool) {
+        self.pool.queue_async_load(item, full_load);
+    }
+
+    /// [`StatisticsLoadWorkers::async_load_items`] of the domain's pool.
+    #[must_use]
+    pub fn async_load_items(&self) -> Vec<tidb_model::StatsLoadItem> {
+        self.pool.async_load_items()
+    }
+
+    /// [`StatisticsLoadWorkers::finish_async_load`] on the domain's pool.
+    pub fn finish_async_load(&self, item: tidb_model::TableItemID) {
+        self.pool.finish_async_load(item);
     }
 
     #[cfg(test)]
@@ -240,11 +281,15 @@ impl SyncLoadService {
     /// # Errors
     /// Go's messages: the timer fired, a channel closed, or an item was not
     /// delivered in time.
+    ///
+    /// An item that failed is queued on `needed` (the statement's domain
+    /// loaders) for their asynchronous loader.
     pub fn sync_wait_stats_load(
         result_ch: Vec<mpsc::Receiver<SyncLoadOutcome>>,
         needed_items: &[tidb_model::StatsLoadItem],
         timeout: Duration,
         load_start_time: Instant,
+        needed: Option<&SyncLoadService>,
     ) -> Result<(), &'static str> {
         use tidb_stats_handle_metrics::{SYNC_LOAD_HISTOGRAM, SYNC_LOAD_TIMEOUT_TOTAL, SYNC_LOAD_TOTAL};
 
@@ -304,11 +349,13 @@ impl SyncLoadService {
             SYNC_LOAD_TIMEOUT_TOTAL.inc();
             result = Err("sync load stats failed: some requested items are not loaded in time");
         }
-        for needed in needed_items {
-            if result_check_map.contains(&needed.table_item_id) {
-                let mut item = needed.table_item_id;
+        for needed_item in needed_items {
+            if result_check_map.contains(&needed_item.table_item_id) {
+                let mut item = needed_item.table_item_id;
                 item.is_sync_load_failed = true;
-                tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.insert(item, needed.full_load);
+                if let Some(service) = needed {
+                    service.pool.queue_async_load(item, needed_item.full_load);
+                }
             }
         }
         result

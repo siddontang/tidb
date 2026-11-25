@@ -77,18 +77,20 @@ impl StatsTarget {
 }
 
 
-/// Go `storage.LoadNeededHistograms`: drain the process-wide asynchronous
-/// statistics demand against the latest schema and shared statistics cache.
+/// Go `storage.LoadNeededHistograms`: drain the domain's asynchronous
+/// statistics demand (`needed`) against the latest schema and shared
+/// statistics cache.
 /// Every item is removed after its one attempt, including storage failures.
 pub fn load_needed_histograms(
     pool: &dyn tidb_stats_handle_storage::stats_read_writer::StatsSessionPool,
     tables: &[StatsTarget],
     shared: &SharedStats,
+    needed: &crate::sync_load::StatisticsLoadWorkers,
 ) -> Result<(), SystemTableError> {
     // Go `statsReadWriter.LoadNeededHistograms`: one session, one wrapped
     // transaction, for the whole pass.
     pool.call_with_sctx(
-        &mut |sctx| load_needed_histograms_on(sctx, tables, shared),
+        &mut |sctx| load_needed_histograms_on(sctx, tables, shared, needed),
         &[tidb_stats_handle_util::FLAG_WRAP_TXN],
     )
     .map_err(|error| SystemTableError::Snapshot(error.message))
@@ -98,9 +100,9 @@ fn load_needed_histograms_on(
     sctx: &dyn tidb_stats_handle_util::StatsSessionContext,
     tables: &[StatsTarget],
     shared: &SharedStats,
+    needed: &crate::sync_load::StatisticsLoadWorkers,
 ) -> Result<(), tidb_sqlexec::SqlExecError> {
-    let needed = &tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS;
-    for requested in needed.all_items() {
+    for requested in needed.async_load_items() {
         let item = requested.table_item_id;
         let result: Result<(), tidb_sqlexec::SqlExecError> = (|| {
             if skips_internal_column(&item) {
@@ -176,7 +178,7 @@ fn load_needed_histograms_on(
             Ok(())
         })();
         // Go: the item leaves the queue whether or not its load succeeded.
-        needed.delete(item);
+        needed.finish_async_load(item);
         result?;
     }
     Ok(())

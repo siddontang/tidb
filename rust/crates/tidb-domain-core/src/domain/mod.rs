@@ -253,6 +253,16 @@ impl Domain {
         }
     }
 
+    /// The domain's statistics-load pool, which keeps its sessions'
+    /// asynchronous-load demand for its asynchronous loader (design §6.4).
+    #[must_use]
+    pub fn load_workers(&self) -> Arc<tidb_stats_handle_syncload::sync_load::StatisticsLoadWorkers> {
+        Arc::clone(
+            self.stats_load_workers
+                .get_or_init(tidb_stats_handle_syncload::sync_load::StatisticsLoadWorkers::new),
+        )
+    }
+
     /// Go `Domain.Store().GetCodec().GetKeyspaceID()` (`u32::MAX` for an
     /// API-V1 store): what the domain's process-wide state is keyed by
     /// beside its own IDs (design §6.4).
