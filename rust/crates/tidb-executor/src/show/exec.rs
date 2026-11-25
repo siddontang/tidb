@@ -1818,6 +1818,27 @@ pub trait ShowExec: crate::simple::account_password::AccountPasswordExec {
                 Datum::Bytes(crate::show::placement::PENDING.as_bytes().to_vec()),
             ]);
         }
+        // The unqualified global bundle a Go or older node left in PD, which
+        // on a next-generation kernel still places every keyspace's keys
+        // until the operator removes it (multi-keyspace design §6.2). Its
+        // policy may be another keyspace's: then the row names it.
+        let legacy_policy = tidb_ddl::cluster_ddl::placement_policy::get_legacy_global_placement_policy_name()
+            .map_err(|error| DriverError::Mysql(crate::MysqlError::unknown(error)))?;
+        if !legacy_policy.is_empty() {
+            let settings = self.with_catalog_mut(|catalog| {
+                Ok(catalog.policy(&legacy_policy).and_then(|policy| {
+                    policy.placement_settings.as_ref().map(|settings| settings.read().to_string())
+                }))
+            })?;
+            rows.push(vec![
+                Datum::Bytes(
+                    format!("RANGE {} (legacy, every keyspace)", tidb_placement::TIDB_BUNDLE_RANGE_PREFIX_FOR_GLOBAL)
+                        .into_bytes(),
+                ),
+                Datum::Bytes(settings.unwrap_or_else(|| format!("POLICY={legacy_policy}")).into_bytes()),
+                Datum::Bytes(crate::show::placement::PENDING.as_bytes().to_vec()),
+            ]);
+        }
         Ok(rows)
     }
 

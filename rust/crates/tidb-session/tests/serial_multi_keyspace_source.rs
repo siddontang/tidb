@@ -1633,3 +1633,66 @@ fn a_multi_keyspace_node_refuses_cluster_wide_pd_statements() {
     }
     tidb_keyspace::set_multi_keyspace_mode(false);
 }
+
+/// An unqualified `TiDB_GLOBAL` bundle a Go or older node left in PD (Go
+/// keys range bundles without a keyspace; its empty bounds cover every
+/// keyspace's keys) through the upgrade to keyspace-qualified placement, on a
+/// single-keyspace and on a multi-keyspace node (design §6.2): SHOW
+/// PLACEMENT lists it as the legacy global range, its policy cannot be
+/// dropped, and a keyspace's `ALTER RANGE global` (to a policy or back to
+/// default) writes only its own qualified bundle and leaves it. Once the
+/// operator removes it from PD, the policy is free. Before, the qualified
+/// lookups missed it: SHOW listed nothing and the policy could be dropped
+/// while PD still placed every keyspace by it.
+#[test]
+fn an_unqualified_global_bundle_stays_visible_and_in_use_until_the_operator_removes_it() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Keyspace-qualified placement is next-generation only.
+        return;
+    }
+    for multi_keyspace in [false, true] {
+        let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), multi_keyspace);
+        let store = MockStoreDomain::create_for_keyspace("ks_a").unwrap();
+        let pd = std::sync::Arc::new(tidb_domain_infosync::placement_manager::MockPlacementManager::default());
+        store.info_syncer().init_placement_manager(Some(pd.clone()));
+        let mut session = store.new_session().unwrap();
+        session.run("create placement policy p1 followers = 1").unwrap();
+        session.run("create placement policy p2 followers = 2").unwrap();
+        // What the node before the upgrade put for `ALTER RANGE global
+        // PLACEMENT POLICY p1`.
+        let settings = tidb_model::placement::PlacementSettings { followers: 1, ..Default::default() };
+        let mut legacy = tidb_placement::new_bundle_from_options(Some(&settings)).unwrap();
+        legacy.rebuild_for_range(tidb_placement::KEY_RANGE_GLOBAL, "p1");
+        assert!(legacy.rules.iter().all(|rule| rule.start_key_hex.is_empty() && rule.end_key_hex.is_empty()));
+        tidb_domain_infosync::placement_manager::PlacementManager::put_rule_bundles(&*pd, &[legacy]).unwrap();
+
+        let legacy_row = || ["RANGE TiDB_GLOBAL (legacy, every keyspace)".to_owned(), "FOLLOWERS=1".to_owned()];
+        let ranges = |session: &mut tidb_session::Session| {
+            row_text(session.run("show placement"))
+                .into_iter()
+                .filter(|row| row[0].starts_with("RANGE"))
+                .map(|row| [row[0].clone(), row[1].clone()])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ranges(&mut session), [legacy_row()], "multi_keyspace={multi_keyspace}");
+        let (code, message) = refusal(&mut session, "drop placement policy p1").expect("the legacy bundle uses p1");
+        assert_eq!(code, 8241, "{message}");
+        // The keyspace's own global placement, and its reset, leave it.
+        for sql in ["alter range global placement policy p2", "alter range global placement policy default"] {
+            assert_eq!(refusal(&mut session, sql), None, "{sql}");
+        }
+        assert_eq!(ranges(&mut session), [legacy_row()]);
+        assert!(refusal(&mut session, "drop placement policy p1").is_some());
+
+        // The operator's cutover: PD drops the unqualified group.
+        tidb_domain_infosync::placement_manager::PlacementManager::put_rule_bundles(
+            &*pd,
+            &[tidb_placement::Bundle { id: tidb_placement::TIDB_BUNDLE_RANGE_PREFIX_FOR_GLOBAL.to_owned(), ..Default::default() }],
+        )
+        .unwrap();
+        assert!(ranges(&mut session).is_empty());
+        for sql in ["drop placement policy p1", "drop placement policy p2"] {
+            assert_eq!(refusal(&mut session, sql), None, "{sql}");
+        }
+    }
+}

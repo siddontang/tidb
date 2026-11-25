@@ -113,6 +113,20 @@ impl InfoSyncer {
         placement_manager::decode_bundle(self.codec.as_ref(), name, bundle)
     }
 
+    /// The range bundle `range_bundle_id` (`TiDB_GLOBAL`) as Go and the
+    /// nodes before keyspace-qualified bundles keep it, unqualified, when
+    /// this store serves a keyspace on a next-generation kernel and PD holds
+    /// it with rules (multi-keyspace design §6.2). Its rules range over
+    /// keyspace-less keys: the global range's empty bounds cover every
+    /// keyspace's keys.
+    fn legacy_range_bundle(&self, range_bundle_id: &str) -> Result<Option<Bundle>, String> {
+        if placement_manager::keyspace_bundle_id(self.codec.as_ref(), range_bundle_id) == range_bundle_id {
+            return Ok(None);
+        }
+        let bundle = self.placement_manager().get_rule_bundle(range_bundle_id)?;
+        Ok((!bundle.rules.is_empty()).then_some(bundle))
+    }
+
     /// Puts `bundles` through this keyspace's placement manager, keyed and
     /// ranged by its keyspace ([`placement_manager::encode_bundle`]).
     fn put_rule_bundles(&self, bundles: &[Bundle]) -> Result<(), String> {
@@ -299,6 +313,16 @@ pub fn placement_manager() -> Arc<dyn PlacementManager> {
 /// The placement manager's.
 pub fn get_rule_bundle(name: &str) -> Result<Bundle, String> {
     get().get_rule_bundle(name)
+}
+
+/// The unqualified range bundle `range_bundle_id` a Go or older node left
+/// in PD, which covers every keyspace on a next-generation kernel; `None`
+/// where bundles are not keyspace-qualified or PD holds no such bundle.
+///
+/// # Errors
+/// The placement manager's.
+pub fn get_legacy_range_bundle(range_bundle_id: &str) -> Result<Option<Bundle>, String> {
+    get().legacy_range_bundle(range_bundle_id)
 }
 
 /// Go `RequestPDMaxRetry`.

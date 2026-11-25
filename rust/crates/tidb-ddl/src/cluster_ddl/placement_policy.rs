@@ -46,25 +46,52 @@ fn check_policy_validation(settings: &tidb_model::PlacementSettings) -> Result<(
 /// # Errors
 /// The placement manager's.
 pub fn get_range_placement_policy_name(range_bundle_id: &str) -> Result<String, String> {
-    let bundle = tidb_domain_infosync::info_syncer::get_rule_bundle(range_bundle_id)?;
+    Ok(bundle_policy_name(&tidb_domain_infosync::info_syncer::get_rule_bundle(range_bundle_id)?))
+}
+
+/// The policy a range bundle's first rule names, or empty.
+fn bundle_policy_name(bundle: &tidb_placement::Bundle) -> String {
     let Some(rule) = bundle.rules.first() else {
-        return Ok(String::new());
+        return String::new();
     };
-    Ok(match rule.id.rfind("_rule_") {
+    match rule.id.rfind("_rule_") {
         Some(pos) if pos > 0 => rule.id[..pos].to_owned(),
         _ => String::new(),
-    })
+    }
+}
+
+/// The policy of the unqualified global range bundle a Go or older node
+/// left in PD, which on a next-generation kernel still places every
+/// keyspace's keys ([`tidb_domain_infosync::info_syncer::get_legacy_range_bundle`]);
+/// empty without one. A keyspace's `ALTER RANGE global` writes its own,
+/// keyspace-qualified bundle and leaves this one: the operator removes it
+/// from PD once each keyspace that wants global placement set its own
+/// (multi-keyspace design §6.2).
+///
+/// # Errors
+/// The placement manager's.
+pub fn get_legacy_global_placement_policy_name() -> Result<String, String> {
+    Ok(tidb_domain_infosync::info_syncer::get_legacy_range_bundle(tidb_placement::TIDB_BUNDLE_RANGE_PREFIX_FOR_GLOBAL)?
+        .map(|bundle| bundle_policy_name(&bundle))
+        .unwrap_or_default())
 }
 
 /// Go `checkPlacementPolicyNotInUseFromRange`: neither special range uses
 /// the policy.
+/// The legacy unqualified global bundle counts too: its policy still places
+/// every keyspace's keys.
 fn check_placement_policy_not_in_use_from_range(policy: &CiString) -> Result<(), DdlPlanError> {
-    for range_bundle_id in [
+    let admission = |error| DdlPlanError::Admission(DdlAdmissionError::plain(error));
+    let mut policy_names = [
         tidb_placement::TIDB_BUNDLE_RANGE_PREFIX_FOR_GLOBAL,
         tidb_placement::TIDB_BUNDLE_RANGE_PREFIX_FOR_META,
-    ] {
-        let policy_name = get_range_placement_policy_name(range_bundle_id)
-            .map_err(|error| DdlPlanError::Admission(DdlAdmissionError::plain(error)))?;
+    ]
+    .into_iter()
+    .map(get_range_placement_policy_name)
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(admission)?;
+    policy_names.push(get_legacy_global_placement_policy_name().map_err(admission)?);
+    for policy_name in policy_names {
         if policy_name == policy.lowercase() {
             return Err(coded_refusal(
                 &tidb_dbterror::ERR_PLACEMENT_POLICY_IN_USE,

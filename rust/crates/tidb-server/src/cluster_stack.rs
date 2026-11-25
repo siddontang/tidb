@@ -1097,6 +1097,10 @@ fn new_cluster_domain(
         Arc::new(tidb_domain_infosync::placement_manager::PdPlacementManager::new(client))
             as Arc<dyn tidb_domain_infosync::placement_manager::PlacementManager>
     }));
+    // The upgrade check of keyspace-qualified placement (design §6.2): an
+    // unqualified `TiDB_GLOBAL` bundle a Go or older node left still places
+    // every keyspace's keys until the operator removes it.
+    warn_of_a_legacy_global_bundle(info_syncer);
     // Go `GlobalInfoSyncerInit`'s `etcdCli`, which `GetPrometheusAddr` finds
     // the `metrics_schema` tables' Prometheus through.
     tidb_domain_infosync::prometheus_addr::init_prometheus_addr(
@@ -1371,6 +1375,25 @@ impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for Pd
         self.store
             .block_on(async move { pd.get_resource_group(&name, false).await })
             .map_err(|error| error.to_string())
+    }
+}
+
+/// Logs the unqualified `TiDB_GLOBAL` bundle of `info_syncer`'s PD, if any:
+/// its policy places every keyspace's keys, `SHOW PLACEMENT` lists it, and a
+/// policy of its name cannot be dropped until the operator removes it from
+/// PD (`pd-ctl config placement-rules rule-bundle delete TiDB_GLOBAL`).
+fn warn_of_a_legacy_global_bundle(info_syncer: &Arc<tidb_domain_infosync::info_syncer::InfoSyncer>) {
+    let _entered = tidb_domain_infosync::info_syncer::enter(Arc::clone(info_syncer));
+    match tidb_ddl::cluster_ddl::placement_policy::get_legacy_global_placement_policy_name() {
+        Ok(policy) if !policy.is_empty() => tidb_logutil::bg_logger().warn(
+            "an unqualified TiDB_GLOBAL placement bundle places every keyspace; remove it from PD once each keyspace set its own ALTER RANGE global",
+            &[tidb_log::Field::new("policy", tidb_log::Value::Str(policy))],
+        ),
+        Ok(_) => {}
+        Err(error) => tidb_logutil::bg_logger().warn(
+            "cannot check PD for an unqualified TiDB_GLOBAL placement bundle",
+            &[tidb_log::Field::new("error", tidb_log::Value::Str(error))],
+        ),
     }
 }
 
