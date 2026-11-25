@@ -58,6 +58,14 @@ impl EmbeddedResourceGroupProvider {
         }
     }
 
+    /// Keeps the sender of a group-settings watch, so the watch stays open.
+    fn keep_watch(&self, sender: mpsc::Sender<WatchResponse>) {
+        self.watches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(sender);
+    }
+
     fn client(&self) -> Arc<dyn ResourceManagerClient> {
         self.info_syncer
             .clone()
@@ -88,10 +96,7 @@ impl MetaStorageClient for EmbeddedResourceGroupProvider {
         _opts: &[MetaStorageOption],
     ) -> tikv_client::Result<mpsc::Receiver<WatchResponse>> {
         let (sender, receiver) = mpsc::channel(1);
-        self.watches
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(sender);
+        self.keep_watch(sender);
         Ok(receiver)
     }
 
