@@ -762,7 +762,7 @@ operator listener exists, Op means node config.
 | AutoID allocators (default caching) | RT | — | Isolated per domain. | `cluster_stack.rs:793` | — |
 | AutoID service (`AUTO_ID_CACHE=1`) | P | — | Shared: only the configured runtime serves it, bound to one keyspace. Refused in multi-keyspace mode. | `keyspace_registry.rs`; `tidb-autoid-service/src/lib.rs:354` | 3f |
 | Sequences | TS + RT | SQL | Isolated. | — | — |
-| Resource groups | PD (per keyspace) | SQL | Shared: the resource-manager client static belongs to the last-opened runtime. Resource-group DDL is refused in multi-keyspace mode. `DEFAULT_RESOURCE_GROUP` is a process static. | `cluster_stack.rs:126`; `tidb-domain-infosync/src/resource_manager_client.rs:147`; `tidb-meta/src/transaction.rs:59` | 3b, 3d |
+| Resource groups | PD (per keyspace) | SQL | Shared: the resource-manager client static belongs to the last-opened runtime. Resource-group DDL is refused in multi-keyspace mode. `DEFAULT_RESOURCE_GROUP` is an immutable default, the same in every keyspace (§6.5). | `cluster_stack.rs:126`; `tidb-domain-infosync/src/resource_manager_client.rs:147`; `tidb-meta/src/transaction.rs:59` | 3b |
 | Placement, label rules, TiFlash replicas, PD HTTP | PD | SQL | Shared: the last-opened runtime's clients win. Refused in multi-keyspace mode: the statements that ask for it, and any DDL job step whose resolved metadata would put placement bundles (a TRUNCATE or partition change of a table created with placement before); a step past its cancel point finishes without the PD write. The same holds for the TiFlash rules a step configures itself (an inherited TiFlash replica on a partition change or TRUNCATE). The TiFlash poller and GC's rule cleanup are off. Label rule operations are suppressed: DDL builds their IDs with the keyspace-less codec (`schema/<db>/<table>`), so same-named tables in two keyspaces would share rules. For the same reason `INFORMATION_SCHEMA.ATTRIBUTES` lists no rules (deferred to 3b, which selects the session keyspace's rules). Effects named by bare table, partition or index IDs are skipped or refused too: the PD affinity group and TiFlash progress entries a materialized view's out-of-place cutover deletes after its job is done (its own refresh alert is still deleted); the replication check and progress-cache write of a resumed ADD PARTITION, and the build-progress poll of a resumed columnar index job, both refused while the job can be cancelled; and the progress-cache delete of `SET TIFLASH REPLICA 0`. FLASHBACK CLUSTER is refused: it closes and restores PD's schedule limits for the whole cluster. On any node a finishing FLASHBACK CLUSTER job restores the limits only if it closed them: the job persists its intent before it asks PD to close them, and the close after PD answers (`pd_schedule_state`). A job that stopped between the two, or a job with no record still in `DELETE_ONLY`, may or may not have closed them; it leaves them as they are and hands off to the operator, with the saved value in its job warning and an error log. A job with no record resumed in `DELETE_ONLY` records its own intent and close before it advances, and is cancelled (with the same handoff) on a node that cannot close the limits, so a later state without a record is still a node's real close. Placement group IDs (`TiDB_DDL_<id>`) carry no keyspace either, so table IDs collide in PD. All of this is 3b's to make per keyspace. | `cluster_stack.rs:1043`; `tidb-ddl-label/src/lib.rs:289`; `tidb-placement/src/bundle.rs:49`; `tidb-ddl/src/cluster_ddl/materialized_view.rs` (cutover cleanup); `tidb-executor/src/infoschema_reader.rs` (`set_data_for_attributes`) | 3b, including the group ID namespace |
 | DXF tables and task managers | SYSTEM storage (nextgen) | — | User runtimes skip the DXF loop, but `TASK_MANAGER_INSTANCE` and `DXF_SVC_TASK_MGR` belong to the last-opened runtime. | `tidb-domain-core/src/domain/dist_task.rs:145`; `tidb-dxf-storage/src/lib.rs:300,304` | 3f (§6.10) |
 | TTL jobs and timers | TS + RT | SQL | Isolated: job manager per domain; delete rate per keyspace. | `tidb-ttl-ttlworker/src/del.rs:118` | — |
@@ -1218,10 +1218,15 @@ Table and job IDs are per keyspace, so these caches collide across tenants:
 - the auto-analyze process ID generator (`auto_analyze_proc_id_generator.rs:101`).
   **Done in Phase 2** (§6.6, step 6): IDs come from the one process
   allocator, so they are unique in the process.
-- `JOB_CTX_MAP` (`tidb-ddl/src/job_ctx.rs:129`)
+- `JOB_CTX_MAP` (`tidb-ddl/src/job_ctx.rs:129`). **Open:** its twenty-odd
+  callers name only the job ID; each needs its runtime's DDL (or the
+  keyspace) passed down to key it by `(keyspace_id, job_id)`.
 - `JOB_VER_IN_USE` and `GLOBAL_INDEX_V1_SUPPORTED` (`tidb-model/src/job_enums.rs:210`,
   `tidb-model/src/index.rs:84`): derived from each tenant's server-info
-  versions, so they belong to the tenant's DDL, not the process
+  versions, so they belong to the tenant's DDL, not the process. **Open:**
+  the job builders read them without their DDL; until they move, the safe
+  interim is the conservative vote (version 2 only while every running
+  DDL's detection allows it).
 
 Each moves into the runtime's `Domain`, or is re-keyed by `(keyspace_id, id)`.
 Moving it into the `Domain` is preferred, because it closes with the tenant.
@@ -1237,6 +1242,9 @@ Moving it into the `Domain` is preferred, because it closes with the tenant.
   cursor kept past its transaction does not know its store, so it holds a
   shared entry that every report reads (as a single-keyspace node does).
 - `DEFAULT_RESOURCE_GROUP` (`tidb-meta/src/transaction.rs:59`) moves per runtime.
+  **Not needed:** it only memoizes Go's `DefaultGroupMeta4Test`, an
+  immutable value that is the same in every keyspace; each keyspace's own
+  `default` group is read from its meta.
 - The GC worker already takes the domain and store (`tidb-gcworker/src/node.rs:49`),
   so it runs once per runtime.
 
@@ -1593,7 +1601,7 @@ in parallel once Phase 1 lands.
 | **3a** | Keyspace identity reads + resource tags + username policy (§6.1) | Unit and integration tests; no empty-keyspace assertions firing |
 | **3b** | PD/infosync singletons into `RuntimeServices` (§6.2), including a keyspace-qualified placement group ID | Resource-group, placement and label-rule SQL per tenant |
 | **3c** | `SET GLOBAL` / vardef split (§6.3), with the generated classification appendix | `SET GLOBAL` isolation tests for every global-scoped atomic |
-| **3d** | ID-keyed caches and DDL version state into the runtime (§6.4) and transaction/GC maps (§6.5) | Stats and DDL concurrency in two tenants; GC safe point per tenant |
+| **3d** | ID-keyed caches and DDL version state into the runtime (§6.4) and transaction/GC maps (§6.5). **In progress (development mode):** the min-start-ts inputs are per keyspace (§6.5), the table row-count cache and the sync-load flights per domain; open: the async-load demand map, `JOB_CTX_MAP`, the job version state | Stats and DDL concurrency in two tenants; GC safe point per tenant |
 | **3e** | Observability isolation (§6.8), including the `SHOW STATUS` providers. **Done in development mode**; the deferred items are listed in §6.8 | Processlist, KILL, statement summary and slow-query filtering tests |
 | **3f** | Status port multiplexing + AutoID service map + per-store globals, including the DXF task managers (§6.9, §6.10) | AUTO_ID_CACHE=1 tables in two tenants; IMPORT INTO per tenant |
 | **3g** | Session migration (§5.6): keyspace-bound session tokens, token logins through routing, tenant-scoped `SET SESSION_STATES`, parity check of the ported session-states code in multi-keyspace mode | §5.6 migration tests, including cross-tenant token replay rejection |
