@@ -31,6 +31,84 @@ use tidb_store_driver_error::sql_query_error::SqlQueryError;
 
 use crate::cluster_stack::{cluster_session_stack, ClusterStack};
 
+/// A multi-keyspace process's connection identity (design §6.6): the server
+/// ID it reserved in SYSTEM's namespace, which every runtime reserves again
+/// in its tenant's namespace before publishing it, and the one connection-ID
+/// allocator every runtime's connections and internal processes (auto-analyze
+/// among them) draw from, so a connection ID names one process on the node.
+pub(crate) struct ProcessServerId {
+    /// `None` with global kill off, where connection IDs carry no server ID.
+    pub(crate) authority: Option<Arc<tidb_domain::server_id::ServerIdAuthority>>,
+    pub(crate) connection_ids: Arc<dyn tidb_globalconn::Allocator + Send + Sync>,
+    /// Renews the SYSTEM lease; dropped (released) after every runtime.
+    _keeper: Option<tidb_domain::server_id::ServerIdKeeper>,
+}
+
+impl ProcessServerId {
+    /// Reserves a candidate server ID in SYSTEM's namespace, with the lease
+    /// and CAS a single-keyspace node uses in its own.
+    ///
+    /// # Errors
+    ///
+    /// The node enables 32-bit connection IDs, or the reservation failed.
+    pub(crate) fn reserve(config: &NodeConfig) -> Result<Self, RunConfiguredNodeError> {
+        let engine = |message: String| RunConfiguredNodeError::Engine(SqlQueryError::unknown(message));
+        let global = &config.global_config;
+        // An 11-bit server ID gives 2,047 IDs to reserve across every served
+        // keyspace.
+        if global.enable_32bits_connection_id {
+            return Err(engine(
+                "a multi-keyspace node requires 64-bit connection IDs: set enable-32bits-connection-id = false".to_owned(),
+            ));
+        }
+        if !global.enable_global_kill {
+            return Ok(Self {
+                authority: None,
+                connection_ids: tidb_domain_core::connection_ids::new_connection_id_allocator(global, None),
+                _keeper: None,
+            });
+        }
+        let store = tidb_txnkv::driver::tikv_store::TikvStore::connect(
+            config.pd_endpoints.clone(),
+            tidb_txnkv::driver::tikv_store::cluster_security(&config.cluster_security)
+                .with_keyspace(tidb_keyspace::SYSTEM),
+        )
+        .map_err(|error| engine(format!("open the SYSTEM keyspace for the server ID: {error}")))?;
+        let etcd_addrs = store.etcd_addrs().map_err(engine)?;
+        let client = tidb_session::domain::real_tikv_node::connect_etcd_client(config, &etcd_addrs)
+            .ok_or_else(|| engine("connect to SYSTEM's etcd for the server ID failed".to_owned()))?;
+        let mut client = client.as_ref().clone();
+        client.set_etcd_cli_by_namespace(&tidb_keyspace::make_keyspace_etcd_namespace(&store));
+        let etcd = Arc::new(tidb_ddl::etcd_ops::EtcdClientOps::new(Arc::new(client)))
+            as Arc<dyn tidb_domain_serverinfo::serverinfo_syncer::EtcdOps>;
+        let authority = tidb_domain::server_id::ServerIdAuthority::new_process_reservation(etcd);
+        // The process publishes no server info in SYSTEM.
+        let unpublished = Arc::new(tidb_domain_serverinfo::serverinfo_syncer::Syncer::new_with_status_endpoint_claim(
+            tidb_domain_serverinfo::serverinfo::ServerInfo::default(),
+            None,
+            false,
+        ));
+        let keeper =
+            tidb_domain::server_id::ServerIdKeeper::start(Arc::clone(&authority), unpublished, Default::default())
+                .map_err(engine)?;
+        if authority.is_lost() {
+            return Err(engine("reserve the process server ID in SYSTEM failed".to_owned()));
+        }
+        tidb_logutil::bg_logger().info(
+            "multi-keyspace process server ID reserved in SYSTEM",
+            &[tidb_log::Field::new("serverID", tidb_log::Value::U64(authority.id()))],
+        );
+        Ok(Self {
+            connection_ids: tidb_domain_core::connection_ids::new_connection_id_allocator(
+                global,
+                Some(Arc::clone(&authority)),
+            ),
+            authority: Some(authority),
+            _keeper: Some(keeper),
+        })
+    }
+}
+
 /// A keyspace's opened stack and the services started over it.
 pub(crate) struct KeyspaceRuntime {
     /// The keyspace's domain, accounts and reload loops.
@@ -58,11 +136,16 @@ impl KeyspaceRuntime {
     /// configured one) the runtime keeps its own values of the vardef global
     /// statics (design §6.3); otherwise it reads and writes the process
     /// statics, as a single-keyspace node does.
+    ///
+    /// With `process_id` (a multi-keyspace node) the runtime reserves the
+    /// process's server ID in its keyspace before publishing it, and its
+    /// connections draw from the process's allocator (design §6.6).
     pub(crate) fn open(
         config: &NodeConfig,
         spill_storage: Arc<tidb_spill_storage::SpillStorage>,
         memory_arbitrator: Option<Arc<tidb_memory::MemArbitrator>>,
         own_vardef: bool,
+        process_id: Option<&ProcessServerId>,
     ) -> Result<(Self, ProductionReadProcessAuthority), RunConfiguredNodeError> {
         // Go `setGlobalVars`, before the store and the domain are created.
         let mut global_vars = tidb_domain::global_sysvars::GlobalSysvars::before_domain();
@@ -76,7 +159,7 @@ impl KeyspaceRuntime {
             crate::set_global_vars::set_global_vars(config, &global_vars);
         }
         let (mut stack, authority) =
-            cluster_session_stack(config, global_vars, spill_storage, memory_arbitrator)?;
+            cluster_session_stack(config, global_vars, spill_storage, memory_arbitrator, process_id)?;
         // Go `store/driver` -> `gcworker.NewGCWorker` + `Start`: the GC leader
         // lease, safe points, lock resolution and delete ranges on TiKV. It
         // retires with the stack's workers, right after the replica-read checker.

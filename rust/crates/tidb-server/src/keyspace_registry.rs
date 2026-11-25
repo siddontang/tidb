@@ -21,8 +21,13 @@
 //! of the extra keyspaces this node may serve beside its configured one. Not
 //! every process-wide service is per keyspace yet (design §6): the infosync
 //! PD clients, IMPORT INTO / BRIE, the AutoID service, process-wide `SET
-//! GLOBAL` atomics, connection IDs and observability still belong to the
-//! node's configured keyspace. Do not serve real tenants with it.
+//! GLOBAL` atomics and observability still belong to the node's configured
+//! keyspace. Do not serve real tenants with it.
+//!
+//! Connection IDs are the process's (design §6.6): every keyspace serves
+//! under the server ID the process reserved in SYSTEM, which each keyspace's
+//! open reserves again in that keyspace before publishing it. A keyspace
+//! whose reservation fails or is lost is refused like a failed login.
 
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -36,7 +41,7 @@ use tidb_session::domain::configured_user_store::ConfiguredUserStore;
 use tidb_session::domain::real_tikv_node::RunConfiguredNodeError;
 use tidb_store_driver::real_tikv_read::ProductionReadProcessAuthority;
 
-use crate::keyspace_runtime::KeyspaceRuntime;
+use crate::keyspace_runtime::{KeyspaceRuntime, ProcessServerId};
 use crate::process_shutdown::ProcessReadAuthority as _;
 
 /// The environment variable naming the extra keyspaces a node may serve.
@@ -142,6 +147,7 @@ struct Opener {
     base_config: NodeConfig,
     spill_storage: Arc<tidb_spill_storage::SpillStorage>,
     memory_arbitrator: Option<Arc<tidb_memory::MemArbitrator>>,
+    process_id: Option<Arc<ProcessServerId>>,
     root_password: Option<String>,
     tls: Arc<Mutex<Option<TlsInstall>>>,
 }
@@ -164,15 +170,18 @@ impl KeyspaceRegistry {
         primary: RoutedKeyspace,
         spill_storage: Arc<tidb_spill_storage::SpillStorage>,
         memory_arbitrator: Option<Arc<tidb_memory::MemArbitrator>>,
+        process_id: Option<Arc<ProcessServerId>>,
         dev: MultiKeyspaceDev,
     ) -> Self {
         let primary_keyspace = base_config.global_config.keyspace_name.clone();
         provision(&primary_keyspace, &primary.0, dev.root_password.as_deref());
+        retire_connections_on_lost_reservation(&primary.0);
         let tls = Arc::new(Mutex::new(None));
         let opener = Opener {
             base_config,
             spill_storage,
             memory_arbitrator,
+            process_id,
             root_password: dev.root_password,
             tls: Arc::clone(&tls),
         };
@@ -324,8 +333,14 @@ impl Opener {
         // The node's status port serves its configured keyspace's AutoID
         // service only, so extra keyspaces do not campaign for it.
         config.report_status = false;
-        let (runtime, authority) =
-            KeyspaceRuntime::open(&config, Arc::clone(&self.spill_storage), self.memory_arbitrator.clone(), true)?;
+        let (runtime, authority) = KeyspaceRuntime::open(
+            &config,
+            Arc::clone(&self.spill_storage),
+            self.memory_arbitrator.clone(),
+            true,
+            self.process_id.as_deref(),
+        )?;
+        retire_connections_on_lost_reservation(&runtime.stack.factory);
         if let Some((manager, variables)) = self.tls.lock().expect("registry tls").clone() {
             runtime.stack.factory.install_tls_manager(manager, variables);
         }
@@ -337,6 +352,27 @@ impl Opener {
         );
         Ok((runtime, authority))
     }
+}
+
+/// Design §6.6: losing a keyspace's server-ID reservation retires that
+/// keyspace's connections only, as Go retires its node's, and the keyspace
+/// is refused until its keeper reserves the ID again.
+fn retire_connections_on_lost_reservation(factory: &Domain) {
+    let Some(identity) = factory.server_identity() else {
+        return;
+    };
+    let processes = factory.processes();
+    identity.set_connection_killer(Some(Arc::new(move || {
+        for process in processes.snapshot() {
+            processes.kill_with_normal_close_msg(process.id, false, false, false, "");
+        }
+    })));
+}
+
+/// Whether `factory`'s keyspace may admit a connection: its server-ID
+/// reservation is held, for the ID the process greets with (design §6.6).
+fn reservation_held(factory: &Domain) -> bool {
+    factory.server_identity().is_none_or(|identity| identity.admits())
 }
 
 /// Go `go dom.ExpensiveQueryHandle().SetSessionManager(svr).Run()` for an
@@ -402,16 +438,16 @@ impl ConnectionRouter<Domain> for KeyspaceRegistry {
         // A user without a prefix is served by the node's configured
         // keyspace: the design's `default-keyspace` (§4), which keeps plain
         // `root` and TiUP's readiness probe working in development mode.
-        let Some(keyspace) = keyspace_of_user(user) else {
-            return Some((Arc::clone(&self.primary.0), Arc::clone(&self.primary.1)));
+        let routed = match keyspace_of_user(user) {
+            Some(keyspace) if keyspace != self.primary_keyspace => {
+                if !self.allowed(keyspace) {
+                    return None;
+                }
+                self.get_or_open(keyspace)?
+            }
+            _ => (Arc::clone(&self.primary.0), Arc::clone(&self.primary.1)),
         };
-        if keyspace == self.primary_keyspace {
-            return Some((Arc::clone(&self.primary.0), Arc::clone(&self.primary.1)));
-        }
-        if !self.allowed(keyspace) {
-            return None;
-        }
-        self.get_or_open(keyspace)
+        reservation_held(&routed.0).then_some(routed)
     }
 }
 
@@ -502,6 +538,97 @@ mod tests {
         assert_eq!(configured_target.0.load(SeqCst), 0, "the configured keyspace's limit is its own");
         configured.factory().close();
         tenant.factory().close();
+    }
+
+    /// The text cells of a statement's rows.
+    fn cells(result: Result<tidb_session::StmtResult, tidb_driver_error::DriverError>) -> Vec<Vec<String>> {
+        match result.unwrap() {
+            tidb_session::StmtResult::Rows(rows) => rows
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| String::from_utf8_lossy(&cell.to_bytes().unwrap_or_default()).into_owned())
+                        .collect()
+                })
+                .collect(),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    /// Design §6.6: on a multi-keyspace node every keyspace serves under the
+    /// process's one server ID, so `KILL` takes another keyspace's connection
+    /// ID as a local one and looks it up in the caller's keyspace only. It
+    /// behaves exactly like an ID no connection holds: `KILL` (Go's) answers
+    /// OK and kills nothing, `EXPLAIN FOR CONNECTION` answers
+    /// ER_NO_SUCH_THREAD, and neither processlist shows it. The keyspace's
+    /// own connection is killed.
+    #[test]
+    fn kill_and_processlist_resolve_only_the_callers_keyspace() {
+        use tidb_session::domain::mock_store::MockStoreDomain;
+
+        let configured = MockStoreDomain::create().unwrap();
+        let tenant = MockStoreDomain::create().unwrap();
+        let mut session = tenant.new_session().unwrap();
+        // The process's one allocator (here the tenant domain's, whose
+        // standalone server ID both mock domains share).
+        let allocator = tenant.factory().next_conn_id();
+        let (foreign, missing, sibling) = (allocator.next_id(), allocator.next_id(), allocator.next_id());
+        let server_id = |id: u64| tidb_globalconn::parse_conn_id(id).unwrap().0.server_id;
+        assert_eq!(server_id(foreign), server_id(sibling));
+        let register = |store: &MockStoreDomain, id: u64| {
+            let target = Arc::new(RecordingKill::default());
+            let guard = store.factory().processes().register(
+                id,
+                "root".to_owned(),
+                "localhost".to_owned(),
+                "test".to_owned(),
+                Some(target.clone()),
+            );
+            (guard, target)
+        };
+        let (_foreign_guard, foreign_target) = register(&configured, foreign);
+        let (_sibling_guard, sibling_target) = register(&tenant, sibling);
+
+        let outcome = |session: &mut tidb_session::Session, sql: String| {
+            session.run(&sql).map(|_| ()).map_err(|error| {
+                let error = error.to_mysql_error();
+                (error.code, error.message.replace(&foreign.to_string(), "<id>").replace(&missing.to_string(), "<id>"))
+            })
+        };
+        for statement in ["kill {}", "kill query {}", "kill connection {}", "kill tidb {}"] {
+            let kill = |id: u64| statement.replace("{}", &id.to_string());
+            assert_eq!(outcome(&mut session, kill(foreign)), outcome(&mut session, kill(missing)), "{statement}");
+            assert_eq!(outcome(&mut session, kill(foreign)), Ok(()), "{statement}");
+        }
+        assert_eq!(foreign_target.0.load(std::sync::atomic::Ordering::SeqCst), 0, "another keyspace's connection lives");
+        let explain = |id: u64| format!("explain for connection {id}");
+        let refused = outcome(&mut session, explain(foreign));
+        assert_eq!(refused, outcome(&mut session, explain(missing)));
+        assert_eq!(refused.unwrap_err().0, 1094);
+        for list in ["show processlist", "select id from information_schema.processlist"] {
+            let ids: Vec<String> = cells(session.run(list)).into_iter().map(|row| row[0].clone()).collect();
+            assert!(ids.contains(&sibling.to_string()), "{list}: {ids:?}");
+            assert!(!ids.contains(&foreign.to_string()), "{list}: {ids:?}");
+        }
+        // The keyspace's own connection.
+        session.run(&format!("kill {sibling}")).unwrap();
+        assert_eq!(cells(session.run("show warnings")), Vec::<Vec<String>>::new());
+        assert_eq!(sibling_target.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        configured.factory().close();
+        tenant.factory().close();
+    }
+
+    /// Design §6.6: one ID reserved in every served keyspace needs the
+    /// 64-bit layout's 22-bit server IDs; the 32-bit layout is refused at
+    /// startup, before anything is reserved.
+    #[test]
+    fn a_multi_keyspace_node_requires_64_bit_connection_ids() {
+        let mut config = crate::node_flags::parse_node_config(std::iter::empty::<&str>()).unwrap();
+        config.global_config.enable_32bits_connection_id = true;
+        let Err(error) = crate::keyspace_runtime::ProcessServerId::reserve(&config) else {
+            panic!("a 32-bit node reserved a process server ID");
+        };
+        assert!(error.to_string().contains("set enable-32bits-connection-id = false"), "{error}");
     }
 
     #[test]

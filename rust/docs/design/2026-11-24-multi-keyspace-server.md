@@ -755,7 +755,7 @@ operator listener exists, Op means node config.
 | `tidb_external_ts` | PD (whole cluster) | Op | Shared by design: PD keeps one external timestamp per cluster. A process variable; tenants read it. | commit `a18dec47b5` | — |
 | Bindings (`mysql.bind_info`, cache) | TS + RT | SQL | Isolated: binding handle per domain. | `cluster_stack.rs:256` | — |
 | Statistics (`mysql.stats_*`, cache, owner, auto-analyze queue) | TS + RT | SQL (ANALYZE) | Isolated per domain; auto-analyze reads its keyspace's settings. | `cluster_stack.rs:810,944` | — |
-| Stats globals keyed by table ID (`TABLE_ROW_STATS_CACHE`, async and sync load queues, `GLOBAL_AUTO_ANALYZE_PROCESS_LIST`) | P | — | Shared: table and process IDs collide. | `tidb-stats-handle-cache/src/stats_table_row_cache.rs:61`; `tidb-stats-asyncload/src/lib.rs:26`; `tidb-stats-handle-syncload/src/sync_load.rs:75`; `tidb-stats-handle-util/src/auto_analyze_proc_id_generator.rs:101` | 3d |
+| Stats globals keyed by table ID (`TABLE_ROW_STATS_CACHE`, async and sync load queues, `GLOBAL_AUTO_ANALYZE_PROCESS_LIST`) | P | — | Shared: table IDs collide. Process IDs do not: they come from the one process allocator (§6.6). | `tidb-stats-handle-cache/src/stats_table_row_cache.rs:61`; `tidb-stats-asyncload/src/lib.rs:26`; `tidb-stats-handle-syncload/src/sync_load.rs:75`; `tidb-stats-handle-util/src/auto_analyze_proc_id_generator.rs:101` | 3d |
 | GC worker, delete ranges, GC settings, safe points | TS + PD (per keyspace) | SQL (GC settings) | Isolated: one GC worker per runtime. | `keyspace_runtime.rs` | — |
 | min-start-ts report | Tenant etcd | — | Shared: every tenant's report reads the process-wide `ACTIVE_START_TS`, `GLOBAL_INNER_TXN_START_TS` and auto-analyze list. | `cluster_stack.rs:293`; `tidb-txnkv/src/inner_txn.rs:28,153` | Phase 2 (§6.5) |
 | TSO, PD client, region cache, TiKV channels | RT | — | Isolated: one store per keyspace. The tokio pool is shared by design. | `tikv_store.rs:93,127,158` | — |
@@ -768,7 +768,7 @@ operator listener exists, Op means node config.
 | TTL jobs and timers | TS + RT | SQL | Isolated: job manager per domain; delete rate per keyspace. | `tidb-ttl-ttlworker/src/del.rs:118` | — |
 | MV service, workload repository, runaway, RU writer, telemetry | RT | — | Isolated per domain. | `keyspace_runtime.rs` | — |
 | IMPORT INTO, BR, PLAN REPLAYER, external storage | P | — | Shared; refused in multi-keyspace mode. Each runtime open overwrites the import store, BRIE node and cluster ID. | `keyspace_runtime.rs:100`; `tidb-executor/src/builder.rs`; `tidb-executor/src/admin.rs` | 3f |
-| INFORMATION_SCHEMA, PERFORMANCE_SCHEMA, SYS | RT + P | — | Table definitions and catalog rows are per runtime. Diagnostic rows still come from process-wide providers: the processlist's connection IDs (§6.6) and the statement summary, `slow_query`, deadlock, transaction-summary and `CLUSTER_*` tables (§6.8). | `tidb-infoschema/src/lib.rs:2266` | 3e, Phase 2 (§6.6) |
+| INFORMATION_SCHEMA, PERFORMANCE_SCHEMA, SYS | RT + P | — | Table definitions and catalog rows are per runtime. Diagnostic rows still come from process-wide providers: the statement summary, `slow_query`, deadlock, transaction-summary and `CLUSTER_*` tables (§6.8). The processlist is per runtime (§6.6). | `tidb-infoschema/src/lib.rs:2266` | 3e |
 | METRICS_SCHEMA | P | — | Shared: `PROMETHEUS_STATE` belongs to the last-opened runtime, and metrics carry no keyspace label. | `tidb-domain-infosync/src/prometheus_addr.rs:86` | 3b, 3e |
 | Instance plan cache, stats, binding and schema caches | RT | Cfg (limits) | Isolated, but each runtime gets the full process quota, so memory grows with the number of tenants. | `tidb-session/src/domain/cluster_session_node/node_services.rs:37` | Phase 5 |
 | Statement summary v1 and v2 | P | — | Shared. | `tidb-stmtsummary/src/statement_summary.rs:46`; `v2/stmtsummary.rs:138` | 3e |
@@ -776,8 +776,8 @@ operator listener exists, Op means node config.
 | Deadlock history, transaction summary | P | — | Shared. | `tidb-deadlockhistory/src/lib.rs:214`; `tidb-txninfo/src/lib.rs:237` | 3e |
 | Top SQL | P | — | Shared: the reporter binds one keyspace. | `tidb-topsql/src/lib.rs:45` | 3e |
 | `SHOW STATUS` providers | P | — | Shared: one process list (`STATISTICS_LIST`); each domain and GC worker registers into it, and a later provider wins on name. | `tidb-variable/src/statusvar.rs:50`; `tidb-gcworker/src/gc_worker.rs:314` | 3e (§6.8) |
-| Processlist, `KILL`, connection IDs | RT + P | — | Processlist per domain. Connection IDs come from the configured runtime's allocator, while each runtime leases its own server ID. | `tidb-server/src/sql_node.rs:747`; `cluster_stack.rs:851` | Phase 2 (§6.6) |
-| Expensive-query watchdog | RT + P | — | Each runtime runs its own over its own processes and settings, but it recognizes auto-analyze sessions through the process-wide `GLOBAL_AUTO_ANALYZE_PROCESS_LIST`, keyed by connection IDs that can collide across runtimes (§6.6), so a tenant's session can be taken for another tenant's auto-analyze. | `keyspace_registry.rs` (`start_expensive_query_watchdog`); `tidb-stats-handle-util/src/auto_analyze_proc_id_generator.rs:101` | 3d, Phase 2 (§6.6) |
+| Processlist, `KILL`, connection IDs | RT + P | — | Isolated: processlist per domain; one process server ID, reserved in SYSTEM and in each tenant before it is published, and one process connection-ID allocator; `KILL` of another tenant's ID finds nothing. | `tidb-server/src/keyspace_runtime.rs` (`ProcessServerId`); `tidb-domain/src/server_id.rs` | — |
+| Expensive-query watchdog | RT + P | — | Isolated: each runtime runs its own over its own processes and settings. It recognizes auto-analyze sessions through the process-wide `GLOBAL_AUTO_ANALYZE_PROCESS_LIST`, whose connection IDs are unique in the process (§6.6). | `keyspace_registry.rs` (`start_expensive_query_watchdog`); `tidb-stats-handle-util/src/auto_analyze_proc_id_generator.rs:101` | — |
 | `max_prepared_stmt_count` counter | P | — | Shared: one process counter checked against each tenant's own limit. | `tidb-variable/src/vars.rs:1024` | Phase 4 |
 | Server info, topology | Tenant etcd | — | Isolated per runtime; the process record for TiProxy is missing. | `cluster_stack.rs:840` | 3h |
 | Keyspace identity, resource tags | RT | — | Mostly isolated. A few readers still use the configured keyspace name. | `tidb-ddl-ingest/src/util.rs:45`; `tidb-planner/src/plan_builder/stmt_build.rs:51`; `tidb-planner-extstore/src/lib.rs:56`; `tidb-server/src/http_status.rs` | 3a |
@@ -1261,14 +1261,52 @@ that tenant's own namespace.**
    drains only that runtime, mirroring Go's lost-server-ID handling for that
    tenant. Losing the SYSTEM lease stops new handshakes on the whole process
    until it re-acquires a fresh candidate ID. Runtimes whose tenant leases are
-   still held keep serving their existing connections.
+   still held keep serving their existing connections while the process has
+   no ID. Once it holds the fresh one, each runtime drains its connections,
+   which carry the old ID, and reserves the new ID in its tenant's namespace.
+   A runtime's connections and its published ID therefore always agree.
 5. **ID space.** With `enable-32bits-connection-id`, the server ID has 11 bits,
    so at most 2,047 IDs. Multi-keyspace mode requires 64-bit connection IDs, so
-   that reserving one ID across many namespaces stays easy.
+   that reserving one ID across many namespaces stays easy. A node with
+   `enable-32bits-connection-id = true` (the default) does not start in
+   multi-keyspace mode.
+6. **One allocator.** Every runtime's connections and internal processes
+   (auto-analyze among them) draw their connection IDs from one process
+   allocator. With the same server ID, one allocator per runtime would hand
+   out the same IDs in different runtimes. The shared allocator keeps a
+   connection ID unique in the process, so the process-wide
+   `GLOBAL_AUTO_ANALYZE_PROCESS_LIST` cannot take one tenant's session for
+   another tenant's auto-analyze, in the expensive-query watchdog or in the
+   auto-analyze window check.
 
 `KILL <id>` and `SHOW PROCESSLIST` resolve only connections of the caller's
-keyspace. A connection ID from another tenant behaves exactly like a
-nonexistent one (`ER_NO_SUCH_THREAD`).
+keyspace. A connection ID from another tenant has this node's server ID, so
+`KILL` looks it up locally, in the caller's runtime only. It behaves exactly
+like a nonexistent one: `KILL` answers OK and does nothing (Go ignores an
+unknown ID), and `EXPLAIN FOR CONNECTION` answers `ER_NO_SUCH_THREAD`.
+
+**Status (development mode).** Steps 1 to 6 are implemented:
+
+- The process reservation is `ProcessServerId` (`tidb-server/src/keyspace_runtime.rs`).
+  It reserves a candidate under SYSTEM's `/keyspaces/tidb/<id>/tidb/server_id/`
+  before the configured keyspace opens.
+- Each runtime open, in its bootstrap domain and in its serving domain,
+  reserves the ID with `ServerIdAuthority::new_tenant_reservation` and
+  `ServerIdKeeper::start_reserved` (`tidb-domain/src/server_id.rs`). This runs
+  before the server-info syncer starts, so a collision fails the open before
+  anything is published. The error names the node whose server-info record
+  holds the ID and this node. The registry logs it, caches `Failed` for 10s,
+  and answers 1045.
+- A lost tenant lease kills the runtime's registered connections, and routing
+  refuses the keyspace with 1045 until its keeper reserves the ID again. A
+  connection still in its handshake is not killed; routing refuses it instead.
+  Routing also refuses a runtime that still holds an ID the process no longer
+  greets with. A tenant keeper wakes every 10s (the retry interval) to follow
+  its process's ID, and refreshes its lease every 5 minutes as Go does.
+- The mixed-fleet checks are unit tests over a mock etcd with forced
+  candidates: both opening orders, and tenant and SYSTEM lease loss. They have
+  not run against a real single-keyspace nextgen node with a failpoint,
+  because the server-ID candidate has no failpoint yet.
 
 **Mixed-fleet test.** One multi-keyspace node and one single-keyspace
 **nextgen** node serve the same tenant, with a failpoint that forces

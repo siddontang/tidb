@@ -224,7 +224,11 @@ impl ConnectionTracker {
         identity: Option<Arc<tidb_domain::server_id::ServerIdAuthority>>,
         connection_ids: Option<Arc<dyn Allocator + Send + Sync>>,
     ) -> Self {
-        let identity = identity.filter(|_| config.enable_global_kill);
+        // A multi-keyspace node's handshakes stop on its process
+        // reservation's loss, not on one keyspace's (design §6.6).
+        let identity = identity
+            .filter(|_| config.enable_global_kill)
+            .map(|identity| identity.admission());
         let connection_ids =
             connection_ids.unwrap_or_else(|| new_connection_id_allocator(config, identity.clone()));
         Self {

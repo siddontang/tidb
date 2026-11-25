@@ -53,7 +53,7 @@ pub fn realtikv_test_stack(
     let spill_storage = crate::open_spill_storage(config)?;
     let global_vars = tidb_domain::global_sysvars::GlobalSysvars::before_domain();
     crate::set_global_vars::set_global_vars(config, &global_vars);
-    let (mut stack, authority) = cluster_session_stack(config, global_vars, spill_storage, None)?;
+    let (mut stack, authority) = cluster_session_stack(config, global_vars, spill_storage, None, None)?;
     install_brie_node(&stack, &authority);
     let dist_task_loop = stack
         .factory
@@ -137,8 +137,15 @@ pub(crate) fn run_cluster_session_node_with_spill(
     let tenant = multi_keyspace
         .is_some()
         .then(|| tidb_logutil::enter_tenant(&config.global_config.keyspace_name));
+    // One server ID and connection-ID allocator for every runtime of a
+    // multi-keyspace node, reserved in SYSTEM first (design §6.6).
+    let process_id = multi_keyspace
+        .is_some()
+        .then(|| crate::keyspace_runtime::ProcessServerId::reserve(&config).map(Arc::new))
+        .transpose()?;
     // The configured keyspace reads the process statics (design §6.3).
-    let (runtime, authority) = KeyspaceRuntime::open(&config, spill_storage, memory_arbitrator, false)?;
+    let (runtime, authority) =
+        KeyspaceRuntime::open(&config, spill_storage, memory_arbitrator, false, process_id.as_deref())?;
     drop(tenant);
     // Go `main`: `if deploymode.IsStarter() { externalWorkloadManager :=
     // initExternalWorkloadManager(ctx, storage); defer close... }`.
@@ -184,6 +191,7 @@ pub(crate) fn run_cluster_session_node_with_spill(
                 (Arc::clone(&factory), Arc::clone(&users)),
                 spill_storage,
                 memory_arbitrator,
+                process_id.clone(),
                 dev,
             ))
         });
@@ -256,6 +264,8 @@ pub(crate) fn run_cluster_session_node_with_spill(
         drop(_status_server);
         drop(registry);
         runtime.release();
+        // The SYSTEM reservation outlives every runtime's.
+        drop(process_id);
         outcome
     })
 }

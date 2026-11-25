@@ -105,6 +105,7 @@ pub fn cluster_session_stack(
     global_vars: tidb_domain::global_sysvars::GlobalSysvars,
     spill_storage: Arc<tidb_spill_storage::SpillStorage>,
     memory_arbitrator: Option<Arc<tidb_memory::MemArbitrator>>,
+    process_id: Option<&crate::keyspace_runtime::ProcessServerId>,
 ) -> Result<(ClusterStack, ProductionReadProcessAuthority), RunConfiguredNodeError> {
     // Go `tikv.NewKVStore` in `driver.TiKVDriver.Open`: the node's one
     // client-rust store, which loads the txn safe point before serving.
@@ -193,6 +194,7 @@ pub fn cluster_session_stack(
         ddl_id: ddl_owner.id().to_owned(),
         spill_storage,
         memory_arbitrator,
+        process_id,
     };
     // Go `bootstrapSessionImpl`: the DDL tables, then the bootstrap or the
     // upgrade in a bootstrap domain that is closed again, then the persisted
@@ -454,6 +456,8 @@ struct NodeProcess<'a> {
     ddl_id: String,
     spill_storage: Arc<tidb_spill_storage::SpillStorage>,
     memory_arbitrator: Option<Arc<tidb_memory::MemArbitrator>>,
+    /// A multi-keyspace process's server ID and connection-ID allocator.
+    process_id: Option<&'a crate::keyspace_runtime::ProcessServerId>,
 }
 
 /// Go `domain.Domain` after `NewDomain`, `Init` and `Start(startMode)`, as
@@ -768,6 +772,7 @@ fn new_cluster_domain(
         ddl_id,
         spill_storage,
         memory_arbitrator,
+        process_id,
     } = process;
     let (startup, startup_lease_grant_ts) =
         load_catalog_from_cluster_at(&authority.transaction_opener(), COPROCESSOR_QUERY_TIMEOUT)
@@ -850,11 +855,17 @@ fn new_cluster_domain(
             "cluster server identity requires its configured etcd client",
         )));
     }
-    let server_identity = config.global_config.enable_global_kill.then(|| {
-        tidb_domain::server_id::ServerIdAuthority::new(
+    // A multi-keyspace runtime reserves the process's server ID in its
+    // keyspace instead of proposing one (design §6.6).
+    let process_identity = process_id.and_then(|process| process.authority.clone());
+    let server_identity = config.global_config.enable_global_kill.then(|| match (&process_identity, &server_etcd) {
+        (Some(process), Some(etcd)) => {
+            tidb_domain::server_id::ServerIdAuthority::new_tenant_reservation(Arc::clone(etcd), Arc::clone(process))
+        }
+        _ => tidb_domain::server_id::ServerIdAuthority::new(
             server_etcd.clone(),
             config.global_config.enable_32bits_connection_id,
-        )
+        ),
     });
     // Go `Domain.ServerID`: the acquired global server ID, 0 without one.
     let server_id: Arc<dyn Fn() -> u64 + Send + Sync> = match &server_identity {
@@ -883,6 +894,19 @@ fn new_cluster_domain(
             unprefixed_etcd.clone().map(|client| Arc::new(tidb_ddl::etcd_ops::EtcdClientOps::new(client)) as _)
         }),
     );
+    // Only once the reservation holds does the server info publish the ID:
+    // a collision fails the open before anything is published.
+    let reserved_keeper = match (&process_identity, &server_identity) {
+        (Some(_), Some(identity)) => Some(
+            tidb_domain::server_id::ServerIdKeeper::start_reserved(
+                Arc::clone(identity),
+                Arc::clone(&server_info),
+                Default::default(),
+            )
+            .map_err(|error| RunConfiguredNodeError::Engine(SqlQueryError::unknown(error)))?,
+        ),
+        _ => None,
+    };
     let mut server_info_runner = match tidb_domain_serverinfo::serverinfo_syncer::SyncerRunner::start(
         Arc::clone(&server_info),
         tidb_domain_serverinfo::serverinfo_syncer::SyncIntervals::default(),
@@ -896,7 +920,9 @@ fn new_cluster_domain(
             )));
         }
     };
-    let server_id_keeper = server_identity
+    let server_id_keeper = match reserved_keeper {
+        Some(keeper) => Some(keeper),
+        None => server_identity
         .as_ref()
         .map(|identity| {
             tidb_domain::server_id::ServerIdKeeper::start(
@@ -906,7 +932,8 @@ fn new_cluster_domain(
             )
         })
         .transpose()
-        .map_err(|error| RunConfiguredNodeError::Engine(SqlQueryError::unknown(error)))?;
+        .map_err(|error| RunConfiguredNodeError::Engine(SqlQueryError::unknown(error)))?,
+    };
     // Go `initResourceGroupsController`, after the server ID is fetched.
     let resource_groups_controller = tidb_session::domain::resource_groups_controller::init_resource_groups_controller(
         authority.tikv_store(),
@@ -1139,10 +1166,13 @@ fn new_cluster_domain(
     )))
     .with_region_store(Arc::clone(region_store))
     .with_server_info(Arc::clone(&server_info))
-    .with_connection_ids(tidb_domain_core::connection_ids::new_connection_id_allocator(
-        &config.global_config,
-        server_identity.clone(),
-    ))
+    .with_connection_ids(match process_id {
+        Some(process) => Arc::clone(&process.connection_ids),
+        None => tidb_domain_core::connection_ids::new_connection_id_allocator(
+            &config.global_config,
+            server_identity.clone(),
+        ),
+    })
     .with_server_identity(server_identity)
     .with_cluster_topology(cluster_topology)
     .with_stats_owner(stats_owner)
