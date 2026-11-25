@@ -370,10 +370,12 @@ fn rename_one(
     }
     tables.drop_table(info.old_schema_id, table.id);
     let old_table_name = table.name.clone();
+    let label_table = LabelRuleTable::from_table_info(&table);
     let old_rules = label_rules::get_old_label_rules(
         label_rules.manager(),
         label_rules.codec(),
-        &LabelRuleTable::from_table_info(&table),
+        &label_table,
+        &label_table.ids(),
         info.old_schema_name.lowercase(),
         old_table_name.lowercase(),
     )
@@ -409,7 +411,7 @@ fn rename_one(
                 new_database.read().name.lowercase(),
                 &LabelRuleTable::from_table_info(&table),
                 &old_rules,
-                old_rules.old_rule_ids(),
+                &old_rules.old_rule_ids(),
                 table.id,
             ),
             Some("failed to update the label rule to PD"),

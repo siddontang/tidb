@@ -273,6 +273,24 @@ pub fn use_keyspace_aware_rules(codec: &dyn LabelCodec) -> bool {
     tidb_config_kerneltype::is_next_gen() && codec.has_keyspace_meta()
 }
 
+/// The hex key range [`Rule::reset`] gives the physical table `id`: the
+/// store's codec encodes it into the keyspace where Go uses keyspace-aware
+/// rules (label rules are consumed as region boundary keys, so V2 encodes
+/// the whole outer key rather than prefixing a mem-encoded table key), else
+/// `codec.EncodeBytes` of the table prefix.
+#[must_use]
+pub fn table_range_hex(codec: &dyn LabelCodec, id: i64) -> (String, String) {
+    let (start_key, end_key) = if use_keyspace_aware_rules(codec) {
+        codec.encode_region_range(&gen_table_prefix(id), &gen_table_prefix(id.wrapping_add(1)))
+    } else {
+        (
+            mem_comparable(&gen_table_prefix(id)),
+            mem_comparable(&gen_table_prefix(id.wrapping_add(1))),
+        )
+    };
+    (hex_lower(&start_key), hex_lower(&end_key))
+}
+
 /// Go `NewRuleID`.
 #[must_use]
 pub fn new_rule_id(
@@ -349,6 +367,40 @@ impl Rule {
     #[must_use]
     pub fn clone_rule(&self) -> Self {
         self.clone()
+    }
+
+    /// The key ranges of a key-range rule, `(start_key, end_key)` as its
+    /// data holds them (Go formats the map values with `%s`).
+    #[must_use]
+    pub fn key_ranges(&self) -> Vec<(String, String)> {
+        let Some(data) = &self.data else {
+            return Vec::new();
+        };
+        let data = data.read().clone();
+        let Some(items) = data.as_array() else {
+            return Vec::new();
+        };
+        items
+            .iter()
+            .filter_map(serde_json::Value::as_object)
+            .map(|range| {
+                let text = |key: &str| match range.get(key) {
+                    Some(serde_json::Value::String(value)) => value.clone(),
+                    Some(value) => value.to_string(),
+                    None => "%!s(<nil>)".to_owned(),
+                };
+                (text("start_key"), text("end_key"))
+            })
+            .collect()
+    }
+
+    /// Whether the rule ranges over one of the physical tables `ids` (with
+    /// `codec`'s ranges): a rule a dropped table left under a name a new
+    /// table now has ranges over the dropped table's IDs only.
+    #[must_use]
+    pub fn covers_any(&self, codec: &dyn LabelCodec, ids: &[i64]) -> bool {
+        let ranges = self.key_ranges();
+        ids.iter().any(|&id| ranges.contains(&table_range_hex(codec, id)))
     }
 
     /// Go `Reset`: rewrites the rule for a table or partition. The reserved
@@ -451,23 +503,10 @@ impl Rule {
             sorted_ids
                 .iter()
                 .map(|&id| {
-                    let (start_key, end_key) = if use_keyspace {
-                        // Label rules are consumed as region boundary keys, so V2
-                        // encodes the whole outer key rather than prefixing a
-                        // mem-encoded table key.
-                        codec.encode_region_range(
-                            &gen_table_prefix(id),
-                            &gen_table_prefix(id.wrapping_add(1)),
-                        )
-                    } else {
-                        (
-                            mem_comparable(&gen_table_prefix(id)),
-                            mem_comparable(&gen_table_prefix(id.wrapping_add(1))),
-                        )
-                    };
+                    let (start_key, end_key) = table_range_hex(codec, id);
                     let mut range = BTreeMap::new();
-                    range.insert("start_key".to_owned(), hex_lower(&start_key));
-                    range.insert("end_key".to_owned(), hex_lower(&end_key));
+                    range.insert("start_key".to_owned(), start_key);
+                    range.insert("end_key".to_owned(), end_key);
                     range
                 })
                 .map(|range| serde_json::to_value(range).expect("string key-range maps serialize"))

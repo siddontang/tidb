@@ -1897,7 +1897,7 @@ impl GcJobContext {
         // TODO in Go too: the rules are read from PD and filtered.
         let rules = self.deps.rules.get_label_rules(&rule_ids)?;
         physical_table_ids.push(history_job.table_id);
-        let rule_ids = get_gc_rules(&physical_table_ids, &rules);
+        let rule_ids = get_gc_rules(&physical_table_ids, &rules, self.deps.rules.label_codec().as_ref());
         self.deps.rules.delete_label_rules(rule_ids)
     }
 }
@@ -2121,26 +2121,24 @@ pub(crate) fn do_gc_placement_rules(
 }
 
 /// Go `getGCRules`: the ids of the rules whose key ranges are exactly the
-/// tables `ids`.
+/// tables `ids`, as the store's `codec` ranges them. Go compares
+/// keyspace-less ranges only, so on a next-generation kernel, whose rules
+/// range over keyspace-encoded keys (`UseKeyspaceAwareRules`), it never
+/// finds a dropped table's rule; here the ranges are the ones the rules were
+/// built with ([`tidb_ddl_label::table_range_hex`]), which a classic store's
+/// codec leaves keyspace-less (multi-keyspace design §6.2).
 pub fn get_gc_rules(
     ids: &[i64],
     rules: &HashMap<String, tidb_ddl_label::Rule>,
+    codec: &dyn tidb_ddl_label::LabelCodec,
 ) -> Vec<String> {
-    let mut old_ranges = HashSet::new();
-    for &id in ids {
-        let mut start_key = Vec::new();
-        tidb_codec::encode_bytes(&mut start_key, &tidb_tablecodec::table_key::gen_table_prefix(id));
-        let mut end_key = Vec::new();
-        tidb_codec::encode_bytes(
-            &mut end_key,
-            &tidb_tablecodec::table_key::gen_table_prefix(id + 1),
-        );
-        old_ranges.insert(format!(
-            "{}{}",
-            hex_encode(&start_key),
-            hex_encode(&end_key)
-        ));
-    }
+    let old_ranges = ids
+        .iter()
+        .map(|&id| {
+            let (start_key, end_key) = tidb_ddl_label::table_range_hex(codec, id);
+            format!("{start_key}{end_key}")
+        })
+        .collect::<HashSet<_>>();
 
     let mut gc_rules = Vec::new();
     for rule in rules.values() {

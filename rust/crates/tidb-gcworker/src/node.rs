@@ -387,6 +387,13 @@ impl GcRuleClient for NodeGcRules {
         .collect())
     }
 
+    fn label_codec(&self) -> Box<dyn tidb_ddl_label::LabelCodec> {
+        match self.codec {
+            Some(codec) => Box::new(codec),
+            None => Box::new(tidb_ddl_label::CodecV1),
+        }
+    }
+
     fn delete_label_rules(&self, rule_ids: Vec<String>) -> GcResult<()> {
         self.info_syncer()
             .label_rule_manager()
@@ -406,6 +413,34 @@ mod tests {
     use tidb_domain_infosync::label_manager::{LabelRuleManager, MockLabelManager};
 
     use super::*;
+
+    /// A keyspace's GC finds a dropped table's label rule by the ranges the
+    /// rule was built with, its keyspace's (design §6.2). Go's `getGCRules`
+    /// compares keyspace-less ranges, which never match a next-generation
+    /// rule, so the rule stayed in PD forever.
+    #[test]
+    fn gc_finds_a_dropped_tables_keyspace_label_rule() {
+        if !tidb_config_kerneltype::is_next_gen() {
+            // Keyspace-aware label rules are next-generation only.
+            return;
+        }
+        let own = InfoSyncer::new(1);
+        let mut rule: tidb_ddl_label::Rule =
+            serde_json::from_value(serde_json::json!({"labels": [{"key": "merge_option", "value": "deny"}]})).unwrap();
+        rule.reset(own.label_codec(), "d", "t", "", &[100]);
+        let rules = NodeGcRules {
+            pd_http_client: None,
+            codec: tidb_domain_infosync::info_syncer::store_codec(1),
+            info_syncer: Some(Arc::new(own)),
+        };
+        let held = [(rule.id.clone(), rule)].into_iter().collect();
+        assert_eq!(
+            crate::gc_worker::get_gc_rules(&[100], &held, GcRuleClient::label_codec(&rules).as_ref()),
+            ["keyspace/1/schema/d/t"]
+        );
+        assert!(crate::gc_worker::get_gc_rules(&[100], &held, &tidb_ddl_label::CodecV1).is_empty());
+        assert!(crate::gc_worker::get_gc_rules(&[101], &held, GcRuleClient::label_codec(&rules).as_ref()).is_empty());
+    }
 
     /// A keyspace's GC reads only its own keyspace's label rules (design
     /// §6.2): the same table rule of another keyspace, and one whose ID

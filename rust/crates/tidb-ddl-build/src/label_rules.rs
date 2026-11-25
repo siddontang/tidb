@@ -160,19 +160,35 @@ pub struct OldLabelRules {
 }
 
 impl OldLabelRules {
-    /// Go's `oldRuleIDs`: the table's rule ID, then its partitions'.
+    /// Go's `oldRuleIDs` (the table's rule ID, then its partitions'), less
+    /// the IDs whose rules are not the table's own: a dropped table's rule
+    /// under the name stays for GC.
     #[must_use]
-    pub fn old_rule_ids(&self) -> &[String] {
-        &self.old_rule_ids
+    pub fn old_rule_ids(&self) -> Vec<String> {
+        self.old_rule_ids
+            .iter()
+            .filter(|id| self.old_rules.contains_key(*id))
+            .cloned()
+            .collect()
     }
 }
 
+/// The rules of `rules` that range over one of the physical tables `ids`.
+/// Rules are found by name, and a dropped table's rule keeps its name until
+/// GC removes it: a table that now has the name must not inherit it, so a
+/// rule over none of the table's IDs is not the table's (Go inherits it).
+fn owned_rules(rules: BTreeMap<String, Rule>, codec: &dyn LabelCodec, ids: &[i64]) -> BTreeMap<String, Rule> {
+    rules.into_iter().filter(|(_, rule)| rule.covers_any(codec, ids)).collect()
+}
+
 /// Go `getOldLabelRules`. `table` supplies the partition definitions, whose
-/// order [`update_label_rules`] relies on.
+/// order [`update_label_rules`] relies on; only the rules over one of
+/// `owned_ids` (the table's physical IDs before the job) are its own.
 pub fn get_old_label_rules(
     manager: &dyn LabelRuleManager,
     codec: &dyn LabelCodec,
     table: &LabelRuleTable,
+    owned_ids: &[i64],
     old_schema_name: &str,
     old_table_name: &str,
 ) -> Result<OldLabelRules, String> {
@@ -184,7 +200,7 @@ pub fn get_old_label_rules(
         .collect::<Vec<_>>();
     let mut old_rule_ids = vec![table_rule_id.clone()];
     old_rule_ids.extend(part_rule_ids.iter().cloned());
-    let old_rules = manager.get_label_rules(&old_rule_ids)?;
+    let old_rules = owned_rules(manager.get_label_rules(&old_rule_ids)?, codec, owned_ids);
     Ok(OldLabelRules {
         table_rule_id,
         part_rule_ids,
@@ -236,7 +252,7 @@ pub fn alter_table_label_rule(
     ids: &[i64],
 ) -> Result<Option<LabelRuleWrite>, String> {
     let table_rule_id = ddl_label::new_rule_id(codec, schema_name, &table.name, "");
-    let old_rule = manager.get_label_rules(std::slice::from_ref(&table_rule_id))?;
+    let old_rule = owned_rules(manager.get_label_rules(std::slice::from_ref(&table_rule_id))?, codec, ids);
     let Some(rule) = old_rule.get(&table_rule_id) else {
         return Ok(None);
     };
@@ -270,6 +286,7 @@ pub fn update_truncate_partition_label_rules(
     codec: &dyn LabelCodec,
     schema_name: &str,
     table: &LabelRuleTable,
+    owned_ids: &[i64],
     new_partitions: &[(String, i64)],
 ) -> Result<LabelRuleWrite, String> {
     let table_rule_id = ddl_label::new_rule_id(codec, schema_name, &table.name, "");
@@ -279,7 +296,7 @@ pub fn update_truncate_partition_label_rules(
         .collect::<Vec<_>>();
     let mut rule_ids = old_part_rules.clone();
     rule_ids.push(table_rule_id.clone());
-    let rules = manager.get_label_rules(&rule_ids)?;
+    let rules = owned_rules(manager.get_label_rules(&rule_ids)?, codec, owned_ids);
     let mut new_rules = Vec::with_capacity(new_partitions.len() + 1);
     if let Some(rule) = rules.get(&table_rule_id) {
         let mut ids = table.partition_ids();
@@ -372,6 +389,7 @@ pub fn partition_label_writes(
                 codec,
                 schema_name,
                 after,
+                &before_ids,
                 &replaced,
             )?);
         }
@@ -529,10 +547,13 @@ impl ExchangePartitionLabelSwap {
         manager: &dyn LabelRuleManager,
         codec: &dyn LabelCodec,
     ) -> Result<LabelRuleWrite, String> {
-        let rules = manager
-            .get_label_rules(&self.rule_ids(codec))?
-            .into_values()
-            .collect::<Vec<_>>();
+        let rules = owned_rules(
+            manager.get_label_rules(&self.rule_ids(codec))?,
+            codec,
+            &[self.partition_id, self.standalone_id],
+        )
+        .into_values()
+        .collect::<Vec<_>>();
         Ok(LabelRuleWrite::Patch(self.patch(codec, &rules)))
     }
 }

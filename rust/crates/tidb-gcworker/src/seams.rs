@@ -209,6 +209,11 @@ pub trait GcRuleClient: Send + Sync {
     ) -> GcResult<std::collections::HashMap<String, tidb_ddl_label::Rule>>;
     /// Go `infosync.UpdateLabelRules(label.NewRulePatch([], rule_ids))`.
     fn delete_label_rules(&self, rule_ids: Vec<String>) -> GcResult<()>;
+    /// Go `w.store.GetCodec()` as the label rules range keys: the
+    /// keyspace-less codec unless the store serves a keyspace.
+    fn label_codec(&self) -> Box<dyn tidb_ddl_label::LabelCodec> {
+        Box::new(tidb_ddl_label::CodecV1)
+    }
 }
 
 /// Go `extworkload.Manager`, the GC v2 hand-off of `notifyGCV2AfterGC`.

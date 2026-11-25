@@ -770,6 +770,7 @@ fn recover_table(
         label_rules.manager(),
         label_rules.codec(),
         &label_table,
+        &label_table.ids(),
         &old_schema_name,
         &old_table_name,
     )
@@ -815,7 +816,7 @@ fn recover_table(
                 &active.job.schema_name.to_string(),
                 &label_table,
                 &old_rules,
-                old_rules.old_rule_ids(),
+                &old_rules.old_rule_ids(),
                 table_info.id,
             ),
             Some("failed to update the label rule to PD"),

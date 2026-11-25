@@ -532,6 +532,51 @@ fn enum_set_binary_literal_members_decode_in_the_column_charset() {
     );
 }
 
+/// A dropped table's label rule keeps its name until GC removes it. A new
+/// table that takes the name does not inherit the rule: RENAME, TRUNCATE,
+/// ADD PARTITION and TRUNCATE PARTITION re-key only the rules that range over
+/// the table's own physical IDs (Go inherits any rule of the name). The
+/// dropped table's rule stays for GC.
+#[test]
+fn a_new_table_does_not_inherit_a_dropped_tables_label_rule() {
+    let mut session = Session::new();
+    let info_syncer = crate::domain::mock_store::domain_of(&session).expect("a mock-store session").info_syncer();
+    let labels = info_syncer.label_rule_manager();
+    let codec = info_syncer.label_codec();
+    let rule_id = |table: &str, partition: &str| tidb_ddl_label::new_rule_id(codec, "test", table, partition);
+    let held = |ids: &[String]| labels.get_label_rules(ids).unwrap().into_keys().collect::<Vec<_>>();
+    session.run("use test").unwrap();
+    for sql in [
+        "create table t (c int)",
+        "alter table t attributes = 'merge_option=deny'",
+        "create table pt (c int) partition by range (c) (partition p0 values less than (10))",
+        "alter table pt attributes = 'merge_option=deny'",
+        "alter table pt partition p0 attributes = 'merge_option=deny'",
+        "drop table t, pt",
+        "create table t (c int)",
+        "create table pt (c int) partition by range (c) (partition p0 values less than (10))",
+    ] {
+        session.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let dropped = [rule_id("pt", ""), rule_id("pt", "p0"), rule_id("t", "")];
+    assert_eq!(held(&dropped), dropped.to_vec(), "the dropped tables' rules wait for GC");
+
+    for sql in [
+        "truncate table t",
+        "rename table t to t2",
+        "alter table pt add partition (partition p1 values less than (20))",
+        "alter table pt truncate partition p0",
+        "truncate table pt",
+        "rename table pt to pt2",
+    ] {
+        session.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let inherited = [rule_id("t2", ""), rule_id("pt2", ""), rule_id("pt2", "p0")];
+    assert!(held(&inherited).is_empty(), "{:?}", held(&inherited));
+    assert_eq!(held(&dropped), dropped.to_vec());
+    assert!(row_text(session.run("select * from information_schema.attributes where id like '%t2%'")).is_empty());
+}
+
 /// Go `ALTER TABLE ... [PARTITION p] ATTRIBUTES` over the mock store's label
 /// manager, read back through `information_schema.ATTRIBUTES`, and the rule
 /// upkeep of the jobs that rename, re-ID, add, drop or exchange what a rule

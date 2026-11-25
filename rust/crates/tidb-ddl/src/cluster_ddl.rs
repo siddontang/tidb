@@ -6155,6 +6155,7 @@ fn apply_truncate_table(
         label_rules.manager(),
         label_rules.codec(),
         &label_table,
+        &LabelRuleTable::from_table_info(stored).ids(),
         &schema.go_to_lower(),
         &label_table.name,
     )
