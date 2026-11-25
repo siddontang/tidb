@@ -215,10 +215,10 @@ impl FlashReplicaDeprecated {
                 id: status.id,
                 ..TableInfo::default()
             };
-            tidb_domain_infosync::tiflash_manager::delete_tiflash_table_sync_progress(&table_info);
+            tidb_domain_infosync::info_syncer::delete_tiflash_table_sync_progress(&table_info);
         } else {
             let progress = status.flash_region_count as f64 / status.region_count as f64;
-            tidb_domain_infosync::tiflash_manager::update_tiflash_progress_cache(
+            tidb_domain_infosync::info_syncer::update_tiflash_progress_cache(
                 status.id, progress,
             );
         }

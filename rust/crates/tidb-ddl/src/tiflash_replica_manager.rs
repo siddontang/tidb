@@ -298,7 +298,7 @@ impl TiFlashReplicaManager {
 
     /// Go `infosync.UpdateTiFlashProgressCache`.
     fn record_progress(&self, _state: &mut PollState, id: i64, progress: f64) {
-        tidb_domain_infosync::tiflash_manager::update_tiflash_progress_cache(id, progress);
+        tidb_domain_infosync::info_syncer::update_tiflash_progress_cache(id, progress);
     }
 
     fn http_call(
@@ -331,7 +331,7 @@ impl TiFlashReplicaManager {
             let mut state = self.state.lock().expect("TiFlash poll state");
             let now = std::time::Instant::now();
             if !state.has_set_tiflash_group && state.next_set_tiflash_group_time.is_none_or(|next| now >= next) {
-                match tidb_domain_infosync::tiflash_manager::set_tiflash_group_config() {
+                match tidb_domain_infosync::info_syncer::set_tiflash_group_config() {
                     Ok(()) => state.has_set_tiflash_group = true,
                     Err(error) => {
                         tidb_ddl_logutil::ddl_logger().warn("SetTiFlashGroupConfig failed", &[zap_error(&error)]);
@@ -341,7 +341,7 @@ impl TiFlashReplicaManager {
             }
         }
         if !self.ddl.is_owner() {
-            tidb_domain_infosync::tiflash_manager::clean_tiflash_progress_cache();
+            tidb_domain_infosync::info_syncer::clean_tiflash_progress_cache();
             return Ok(());
         }
         let catalog = self.catalog.get_latest();
@@ -396,7 +396,7 @@ impl TiFlashReplicaManager {
                 }
             }
             if check_columnar {
-                match tidb_domain_infosync::tiflash_manager::calculate_columnar_progress(id, &tikv_stores) {
+                match tidb_domain_infosync::info_syncer::calculate_columnar_progress(id, &tikv_stores) {
                     Ok(progress) => columnar_progress = progress,
                     Err(error) => {
                         tidb_ddl_logutil::ddl_logger().error(
@@ -458,7 +458,7 @@ impl TiFlashReplicaManager {
                 }
             }
             if check_columnar {
-                match tidb_domain_infosync::tiflash_manager::calculate_columnar_progress(table_id, &tikv_stores) {
+                match tidb_domain_infosync::info_syncer::calculate_columnar_progress(table_id, &tikv_stores) {
                     Ok(progress) => columnar_progress = progress,
                     Err(error) => {
                         tidb_ddl_logutil::ddl_logger().error(
@@ -532,7 +532,7 @@ impl TiFlashReplicaManager {
         if !tidb_config::config_tree::config::get_global_config().cse.is_tiflash_enabled() {
             return;
         }
-        let manager = tidb_domain_infosync::tiflash_manager::tiflash_replica_manager();
+        let manager = tidb_domain_infosync::info_syncer::tiflash_replica_manager();
         let mut fixed = std::collections::HashSet::new();
         for (database, table_infos) in catalog.list_tables_with_special_attribute(|t| t.tiflash_replica.is_some()) {
             for table in table_infos {
@@ -633,7 +633,7 @@ impl TiFlashReplicaManager {
 
 impl Drop for TiFlashReplicaManager {
     fn drop(&mut self) {
-        tidb_domain_infosync::tiflash_manager::clean_tiflash_progress_cache();
+        tidb_domain_infosync::info_syncer::clean_tiflash_progress_cache();
     }
 }
 
@@ -917,12 +917,12 @@ mod tests {
         let poller = fixture_manager(&http, ddl.clone(), &[(7, true)]);
         poller.poll_once().unwrap();
         assert_eq!(
-            tidb_domain_infosync::tiflash_manager::get_tiflash_progress_from_cache(7),
+            tidb_domain_infosync::info_syncer::get_tiflash_progress_from_cache(7),
             None
         );
         poller.poll_once().unwrap();
         assert_eq!(
-            tidb_domain_infosync::tiflash_manager::get_tiflash_progress_from_cache(7),
+            tidb_domain_infosync::info_syncer::get_tiflash_progress_from_cache(7),
             Some(0.5)
         );
         assert!(
@@ -932,7 +932,7 @@ mod tests {
         ddl.owner.store(false, Ordering::SeqCst);
         poller.poll_once().unwrap();
         assert_eq!(
-            tidb_domain_infosync::tiflash_manager::get_tiflash_progress_from_cache(7),
+            tidb_domain_infosync::info_syncer::get_tiflash_progress_from_cache(7),
             None,
             "Go clears progress on owner loss"
         );
@@ -967,7 +967,7 @@ mod tests {
         )
         .unwrap();
         poller.poll_once().unwrap();
-        assert_eq!(tidb_domain_infosync::tiflash_manager::get_tiflash_progress_from_cache(66661), Some(0.5));
+        assert_eq!(tidb_domain_infosync::info_syncer::get_tiflash_progress_from_cache(66661), Some(0.5));
         poller.poll_once().unwrap();
         assert_eq!(
             http.requests
@@ -979,7 +979,7 @@ mod tests {
             1
         );
         drop(poller);
-        assert_eq!(tidb_domain_infosync::tiflash_manager::get_tiflash_progress_from_cache(66661), None);
+        assert_eq!(tidb_domain_infosync::info_syncer::get_tiflash_progress_from_cache(66661), None);
     }
 
     #[test]
@@ -1259,10 +1259,8 @@ mod tests {
 
     #[test]
     fn the_columnar_progress_is_read_from_the_tikv_status_api_like_go() {
-        use tidb_domain_infosync::tiflash_manager::{
-            calculate_columnar_index_progress, calculate_columnar_progress, collect_columnar_status,
-            ColumnarStatusResp,
-        };
+        use tidb_domain_infosync::info_syncer::{calculate_columnar_index_progress, calculate_columnar_progress};
+        use tidb_domain_infosync::tiflash_manager::{collect_columnar_status, ColumnarStatusResp};
         let http = HttpFixture::new(columnar_response);
         let security = tidb_pd_client::ClusterSecurity::default();
         let collect = |table_id, index_id| collect_columnar_status(&security, &http.address, table_id, index_id);
@@ -1322,7 +1320,7 @@ mod tests {
     /// and the table's progress is the smaller of the two.
     #[test]
     fn the_poller_bounds_the_tiflash_progress_by_the_columnar_one_like_go() {
-        use tidb_domain_infosync::tiflash_manager::get_tiflash_progress_from_cache;
+        use tidb_domain_infosync::info_syncer::get_tiflash_progress_from_cache;
         let poll = |columnar_store_type: &str| {
             tidb_config::config_tree::config::update_global(|config| {
                 config.cse.columnar_store_type = columnar_store_type.to_owned()
@@ -1373,7 +1371,8 @@ mod tests {
     /// the non-TiFlash stores, done once every one is ready.
     #[test]
     fn a_columnar_index_is_done_once_every_tikv_store_built_it_like_go() {
-        use tidb_domain_infosync::tiflash_manager::{init_tiflash_replica_manager, TiFlashReplicaManager};
+        use tidb_domain_infosync::info_syncer::init_tiflash_replica_manager;
+        use tidb_domain_infosync::tiflash_manager::TiFlashReplicaManager;
         struct Stores(pd_http::StoresInfo);
         impl TiFlashReplicaManager for Stores {
             fn set_tiflash_group_config(&self) -> Result<(), String> {
@@ -1620,7 +1619,8 @@ mod tests {
     /// for, a zero-count table and a failed lookup are left alone.
     #[test]
     fn missing_tiflash_rules_are_repaired_by_a_reset_replica_job() {
-        use tidb_domain_infosync::tiflash_manager::{init_tiflash_replica_manager, make_new_rule, TiFlashReplicaManager};
+        use tidb_domain_infosync::info_syncer::init_tiflash_replica_manager;
+        use tidb_domain_infosync::tiflash_manager::{make_new_rule, TiFlashReplicaManager};
         struct Rules;
         impl TiFlashReplicaManager for Rules {
             fn set_tiflash_group_config(&self) -> Result<(), String> {

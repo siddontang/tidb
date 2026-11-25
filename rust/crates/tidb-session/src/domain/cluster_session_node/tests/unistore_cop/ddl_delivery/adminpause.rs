@@ -134,7 +134,7 @@ fn run_cases(cases: &[&[StmtCase]], vector: bool, partition: bool) {
             &mut tk,
             "alter table t_user_vec set tiflash replica 3 location labels 'a','b'",
         );
-        tidb_domain_infosync::tiflash_manager::set_mock_tiflash(Arc::new(
+        tidb_domain_infosync::info_syncer::set_mock_tiflash(Arc::new(
             tidb_domain_infosync::tiflash_manager::MockTiFlash::new(),
         ));
     }

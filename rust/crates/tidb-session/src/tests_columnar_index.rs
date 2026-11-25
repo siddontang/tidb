@@ -86,7 +86,7 @@ fn enable(name: &str, action: &str) -> tidb_failpoint::Guard {
 
 fn mock_tiflash_session() -> Session {
     let session = Session::new_with_mock_tiflash(2);
-    tidb_domain_infosync::tiflash_manager::set_mock_tiflash(std::sync::Arc::new(
+    tidb_domain_infosync::info_syncer::set_mock_tiflash(std::sync::Arc::new(
         tidb_domain_infosync::tiflash_manager::MockTiFlash::new(),
     ));
     session
@@ -472,7 +472,7 @@ fn add_vector_index_rollback_like_go() {
     assert_eq!(index_names(session, "t1"), ["c1|BTREE"]);
 
     // Case2: do 'admin cancel ddl job to rollback job.
-    tidb_domain_infosync::tiflash_manager::set_mock_tiflash(std::sync::Arc::new(
+    tidb_domain_infosync::info_syncer::set_mock_tiflash(std::sync::Arc::new(
         tidb_domain_infosync::tiflash_manager::MockTiFlash::new(),
     ));
     {

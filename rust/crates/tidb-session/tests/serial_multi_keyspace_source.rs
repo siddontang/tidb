@@ -688,13 +688,13 @@ fn a_multi_keyspace_node_leaves_pd_and_tiflash_progress_alone_after_a_cutover() 
     let alerts = |session: &mut Session, id: i64| {
         row_text(session.run(&format!("select count(*) from mysql.tidb_mview_refresh_alert where MVIEW_ID = {id}")))
     };
-    let cache = |id| tidb_domain_infosync::tiflash_manager::get_tiflash_progress_from_cache(id);
+    let cache = |id| tidb_domain_infosync::info_syncer::get_tiflash_progress_from_cache(id);
 
     // Single-keyspace: the cutover deletes the alert, the affinity group
     // and the progress entry.
     let old = physical_id(&mut session, "mv", None);
     session.run(&alert(old)).unwrap();
-    tidb_domain_infosync::tiflash_manager::update_tiflash_progress_cache(old, 0.5);
+    tidb_domain_infosync::info_syncer::update_tiflash_progress_cache(old, 0.5);
     session.run("refresh materialized view mv complete out of place").unwrap();
     assert_ne!(physical_id(&mut session, "mv", None), old);
     assert_eq!(alerts(&mut session, old), [["0"]]);
@@ -706,7 +706,7 @@ fn a_multi_keyspace_node_leaves_pd_and_tiflash_progress_alone_after_a_cutover() 
     tidb_keyspace::set_multi_keyspace_mode(true);
     let old = physical_id(&mut session, "mv", None);
     session.run(&alert(old)).unwrap();
-    tidb_domain_infosync::tiflash_manager::update_tiflash_progress_cache(old, 0.5);
+    tidb_domain_infosync::info_syncer::update_tiflash_progress_cache(old, 0.5);
     assert_eq!(refusal(&mut session, "refresh materialized view mv complete out of place"), None);
     assert_ne!(physical_id(&mut session, "mv", None), old);
     assert_eq!(
@@ -720,7 +720,7 @@ fn a_multi_keyspace_node_leaves_pd_and_tiflash_progress_alone_after_a_cutover() 
     assert_eq!(affinity.calls(), affinity_calls, "no affinity call in multi-keyspace mode");
 
     tidb_keyspace::set_multi_keyspace_mode(false);
-    tidb_domain_infosync::tiflash_manager::delete_tiflash_progress_from_cache(old);
+    tidb_domain_infosync::info_syncer::delete_tiflash_progress_from_cache(old);
     tidb_domain_affinity::init_manager(None);
 }
 
@@ -753,7 +753,7 @@ fn a_resumed_add_partition_writes_no_tiflash_progress_on_a_multi_keyspace_node()
     // The mock's regions have no TiFlash peers: Go's failpoint reports the
     // new partitions replicated, so only the guard keeps the cache write out.
     let _replicated = tidb_failpoint::enable_for_test("github.com/pingcap/tidb/pkg/ddl/mockWaitTiFlashReplicaOK", "return(true)");
-    let cache = |id| tidb_domain_infosync::tiflash_manager::get_tiflash_progress_from_cache(id);
+    let cache = |id| tidb_domain_infosync::info_syncer::get_tiflash_progress_from_cache(id);
 
     // Single-keyspace: the new partition's progress is cached.
     session.run("alter table ft add partition (partition p1 values less than (20))").unwrap();
@@ -771,7 +771,7 @@ fn a_resumed_add_partition_writes_no_tiflash_progress_on_a_multi_keyspace_node()
             let part_info = args.read().part_info.get().unwrap().read().clone_like_go();
             for definition in part_info.definitions.snapshot() {
                 // Another keyspace's table with the same partition ID.
-                tidb_domain_infosync::tiflash_manager::update_tiflash_progress_cache(definition.id, 0.25);
+                tidb_domain_infosync::info_syncer::update_tiflash_progress_cache(definition.id, 0.25);
                 seeded.lock().unwrap().push(definition.id);
             }
         },
@@ -801,7 +801,7 @@ fn a_resumed_add_partition_writes_no_tiflash_progress_on_a_multi_keyspace_node()
 
     tidb_keyspace::set_multi_keyspace_mode(false);
     for id in adding.into_iter().chain([p1]) {
-        tidb_domain_infosync::tiflash_manager::delete_tiflash_progress_from_cache(id);
+        tidb_domain_infosync::info_syncer::delete_tiflash_progress_from_cache(id);
     }
 }
 
@@ -820,7 +820,7 @@ fn a_resumed_columnar_index_does_not_poll_progress_on_a_multi_keyspace_node() {
     }
     let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
     let store = MockStoreDomain::create_with_mock_tiflash(2).unwrap();
-    tidb_domain_infosync::tiflash_manager::set_mock_tiflash(std::sync::Arc::new(
+    tidb_domain_infosync::info_syncer::set_mock_tiflash(std::sync::Arc::new(
         tidb_domain_infosync::tiflash_manager::MockTiFlash::new(),
     ));
     let mut session = store.new_session().unwrap();
@@ -927,7 +927,7 @@ fn a_resumed_flashback_without_a_pd_schedule_record_is_cancelled_on_a_multi_keys
         .unwrap();
     let schedule = std::sync::Arc::new(CountingSchedule::default());
     schedule.config.lock().unwrap().insert("merge-schedule-limit".to_owned(), serde_json::json!(9));
-    tidb_domain_infosync::schedule_manager::init_schedule_manager(Some(schedule.clone()));
+    tidb_domain_infosync::info_syncer::init_schedule_manager(Some(schedule.clone()));
     let states = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = states.clone();
     let _after = tidb_failpoint::enable_call_for_test("github.com/pingcap/tidb/pkg/ddl/afterRunOneJobStep", move |job| {
@@ -951,7 +951,7 @@ fn a_resumed_flashback_without_a_pd_schedule_record_is_cancelled_on_a_multi_keys
     let sql = format!("flashback cluster to timestamp '{}'", time.format("%Y-%m-%d %H:%M:%S%.6f"));
     let refused = refusal(&mut session, &sql);
     tidb_keyspace::set_multi_keyspace_mode(false);
-    tidb_domain_infosync::schedule_manager::init_schedule_manager(None);
+    tidb_domain_infosync::info_syncer::init_schedule_manager(None);
     let (code, message) = refused.expect("the resumed job was cancelled");
     assert_eq!(code, 1105, "{message}");
     assert!(message.contains("hands them off to the operator"), "{message}");

@@ -85,7 +85,7 @@ fn close_pd_schedule(state: &str, closed: impl FnOnce()) -> Result<(), DdlPlanEr
         .iter()
         .map(|key| ((*key).to_owned(), serde_json::json!(0)))
         .collect();
-    tidb_domain_infosync::schedule_manager::set_pd_schedule_config(&close_map).map_err(unknown)?;
+    tidb_domain_infosync::info_syncer::set_pd_schedule_config(&close_map).map_err(unknown)?;
     closed();
     Ok(())
 }
@@ -95,7 +95,7 @@ fn save_pd_schedule(args: &mut FlashbackClusterArgs) -> Result<(), DdlPlanError>
     if !super::step_pd_write("FLASHBACK CLUSTER")? {
         return Ok(());
     }
-    let ret_value = tidb_domain_infosync::schedule_manager::get_pd_schedule_config().map_err(unknown)?;
+    let ret_value = tidb_domain_infosync::info_syncer::get_pd_schedule_config().map_err(unknown)?;
     args.pd_schedule_value = Some(
         PD_SCHEDULE_KEY
             .iter()
@@ -162,7 +162,7 @@ fn pd_schedule_ownership(schema_state: SchemaState, args: &FlashbackClusterArgs)
 fn hand_off_pd_schedule(job: &mut Job, args: &FlashbackClusterArgs) {
     let saved = serde_json::to_string(&args.pd_schedule_value).unwrap_or_default();
     // A read only, for the report: the limits are not written.
-    let current = tidb_domain_infosync::schedule_manager::get_pd_schedule_config().map_or_else(
+    let current = tidb_domain_infosync::info_syncer::get_pd_schedule_config().map_or_else(
         |error| format!("unknown ({error})"),
         |config| {
             let current: BTreeMap<_, _> = PD_SCHEDULE_KEY
@@ -202,7 +202,7 @@ fn recover_pd_schedule(pd_schedule_param: Option<&BTreeMap<String, serde_json::V
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    tidb_domain_infosync::schedule_manager::set_pd_schedule_config(&config).map_err(unknown)
+    tidb_domain_infosync::info_syncer::set_pd_schedule_config(&config).map_err(unknown)
 }
 
 /// Go `oracle.GetTimeFromTS(ts)`'s instant, in milliseconds.

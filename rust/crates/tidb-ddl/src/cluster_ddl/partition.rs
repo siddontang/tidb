@@ -818,7 +818,7 @@ pub(super) fn on_add_table_partition(
                     for definition in part_info.definitions.snapshot().iter() {
                         // Go: a failed cache update only logs.
                         if tiflash_pd {
-                            tidb_domain_infosync::tiflash_manager::update_tiflash_progress_cache(
+                            tidb_domain_infosync::info_syncer::update_tiflash_progress_cache(
                                 definition.id,
                                 1.0,
                             );

@@ -209,7 +209,7 @@ impl tidb_br::glue::Domain for BrDomain {
     }
 
     fn get_label_rules(&self, rule_ids: &[String]) -> Result<Vec<tidb_br::glue::LabelRule>> {
-        let rules = tidb_domain_infosync::label_manager::label_rule_manager()
+        let rules = tidb_domain_infosync::info_syncer::label_rule_manager()
             .get_label_rules(rule_ids)
             .map_err(errorf)?;
         Ok(rules
@@ -367,7 +367,7 @@ impl tidb_br::glue::Domain for BrDomain {
 
     /// Go `infosync.GetTiFlashProgressStores`.
     fn tiflash_progress_stores(&self) -> Result<tidb_br::glue::TiFlashProgressStores> {
-        tidb_domain_infosync::tiflash_manager::get_tiflash_progress_stores().map_err(errorf)
+        tidb_domain_infosync::info_syncer::get_tiflash_progress_stores().map_err(errorf)
     }
 
     /// Go `infosync.MustGetTiFlashProgress`.
@@ -378,7 +378,7 @@ impl tidb_br::glue::Domain for BrDomain {
         replica_count: u64,
         stores: &tidb_br::glue::TiFlashProgressStores,
     ) -> Result<f64> {
-        tidb_domain_infosync::tiflash_manager::must_get_tiflash_progress(
+        tidb_domain_infosync::info_syncer::must_get_tiflash_progress(
             physical_id,
             replica_count,
             &stores.0,
@@ -389,7 +389,7 @@ impl tidb_br::glue::Domain for BrDomain {
 
     /// Go `infosync.UpdateLabelRules`.
     fn update_label_rules(&self, patch: &tidb_ddl_label::LabelRulePatch) -> Result<()> {
-        tidb_domain_infosync::label_manager::label_rule_manager()
+        tidb_domain_infosync::info_syncer::label_rule_manager()
             .update_label_rules(patch)
             .map_err(errorf)
     }

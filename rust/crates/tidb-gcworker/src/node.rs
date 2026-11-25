@@ -87,6 +87,9 @@ pub fn gc_worker_deps<S: tidb_store_driver_txn::transaction::StoreClient + 'stat
         )),
         rules: Arc::new(NodeGcRules {
             pd_http_client,
+            // Go `w.store.GetCodec()`: the keyspace the bundles are keyed by,
+            // as the DDL job's delivery keys them.
+            codec: tidb_domain_infosync::info_syncer::store_codec(tidb_keyspace::KeyspaceCodec::keyspace_id(store)),
             info_syncer: factory.info_syncer().cloned(),
         }),
         // Go `extworkload.GetManagerFromStore(w.store)`.
@@ -314,6 +317,8 @@ impl GcSession for NodeGcSession<'_> {
 /// client and the domain's info syncer.
 struct NodeGcRules {
     pd_http_client: Option<tikv_client::pd_http::Client>,
+    /// The store's keyspace codec, `None` for an API-V1 store.
+    codec: Option<tikv_client::request::ApiV2Codec>,
     /// The domain's PD managers (design §6.2); `None` reads the process's.
     info_syncer: Option<Arc<tidb_domain_infosync::info_syncer::InfoSyncer>>,
 }
@@ -346,14 +351,14 @@ impl GcRuleClient for NodeGcRules {
             return Ok(());
         }
         let _info_syncer = tidb_domain_infosync::info_syncer::enter(self.info_syncer());
-        tidb_domain_infosync::tiflash_manager::delete_tiflash_placement_rules(physical_table_ids)
+        tidb_domain_infosync::info_syncer::delete_tiflash_placement_rules(physical_table_ids)
             .map_err(GcError::new)
     }
 
     fn put_rule_bundles(&self, bundles: Vec<tidb_placement::Bundle>) -> GcResult<()> {
         tidb_ddl::placement_delivery::put_rule_bundles(
             self.pd_http_client()?,
-            self.info_syncer().codec(),
+            self.codec.as_ref(),
             &bundles,
             GC_RPC_TIMEOUT,
         )
@@ -424,6 +429,7 @@ mod tests {
         own.init_label_rule_manager(Some(pd.clone()));
         let rules = NodeGcRules {
             pd_http_client: None,
+            codec: None,
             info_syncer: Some(Arc::new(own)),
         };
         let found = GcRuleClient::get_label_rules(&rules, &ids).unwrap();

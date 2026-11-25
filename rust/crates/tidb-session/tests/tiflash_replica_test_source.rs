@@ -152,7 +152,8 @@ fn table_id(tk: &mut TestKit, table: &str) -> String {
 /// as the job runs; a zero count is the rule's delete.
 #[test]
 fn tiflash_replica_jobs_set_pd_rules_through_infosync() {
-    use tidb_domain_infosync::tiflash_manager::{init_tiflash_replica_manager, MockTiFlashReplicaManagerCtx};
+    use tidb_domain_infosync::info_syncer::init_tiflash_replica_manager;
+    use tidb_domain_infosync::tiflash_manager::MockTiFlashReplicaManagerCtx;
     let _store_count = enable_failpoint("github.com/pingcap/tidb/pkg/infoschema/mockTiFlashStoreCount", "return(true)");
     let mut tk = TestKit::new();
     let manager = std::sync::Arc::new(MockTiFlashReplicaManagerCtx::default());

@@ -4681,7 +4681,7 @@ pub(crate) fn configure_tiflash_pd_for_table(id: i64, count: u64, labels: &[Stri
     if !step_pd_write("TIFLASH REPLICA")? {
         return Ok(());
     }
-    tidb_domain_infosync::tiflash_manager::configure_tiflash_pd_for_table(id, count, labels)
+    tidb_domain_infosync::info_syncer::configure_tiflash_pd_for_table(id, count, labels)
         .map_err(|error| pd_step_error(None, error))
 }
 
@@ -4697,7 +4697,7 @@ pub(crate) fn configure_tiflash_pd_for_partitions(
         return Ok(());
     }
     let ids: Vec<i64> = definitions.iter().map(|definition| definition.id).collect();
-    tidb_domain_infosync::tiflash_manager::configure_tiflash_pd_for_partitions(accel, &ids, count, labels, table_id)
+    tidb_domain_infosync::info_syncer::configure_tiflash_pd_for_partitions(accel, &ids, count, labels, table_id)
         .map_err(|error| pd_step_error(None, error))
 }
 
@@ -5271,7 +5271,7 @@ impl ResourceGroupUpdate {
     pub fn apply(&self) -> Result<(), String> {
         match self {
             Self::Add(group) => {
-                match tidb_domain_infosync::resource_manager_client::add_resource_group((**group).clone()) {
+                match tidb_domain_infosync::info_syncer::add_resource_group((**group).clone()) {
                     Ok(()) => Ok(()),
                     // Go: TiDB adds the default group when it bootstraps, so a
                     // keyspace-mode TiDB skips that one's "already exists".
@@ -5285,9 +5285,9 @@ impl ResourceGroupUpdate {
                 }
             }
             Self::Modify(group) => {
-                tidb_domain_infosync::resource_manager_client::modify_resource_group((**group).clone())
+                tidb_domain_infosync::info_syncer::modify_resource_group((**group).clone())
             }
-            Self::Delete(name) => tidb_domain_infosync::resource_manager_client::delete_resource_group(name),
+            Self::Delete(name) => tidb_domain_infosync::info_syncer::delete_resource_group(name),
         }
     }
 }

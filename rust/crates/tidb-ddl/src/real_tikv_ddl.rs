@@ -110,7 +110,7 @@ fn deliver_label_rules(write: &DdlWrite) -> Result<Option<LabelDeliveryReceipt>,
     if write.label_rules.is_empty() {
         return Ok(None);
     }
-    let manager = tidb_domain_infosync::label_manager::label_rule_manager();
+    let manager = tidb_domain_infosync::info_syncer::label_rule_manager();
     let mut rule_ids = write
         .label_rules
         .iter()
@@ -1785,7 +1785,7 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
         // Go `infosync.PutRuleBundlesWithDefaultRetry` on a node without
         // PD: the info syncer's `mockPlacementManager`.
         if !write.placement_bundles.is_empty() {
-            if let Err(error) = tidb_domain_infosync::placement_manager::put_rule_bundles_with_default_retry(
+            if let Err(error) = tidb_domain_infosync::info_syncer::put_rule_bundles_with_default_retry(
                 &write.placement_bundles,
             ) {
                 let _ = transaction.rollback();

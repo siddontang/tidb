@@ -14,7 +14,14 @@
 
 //! Go `domain/infosync`'s PD HTTP client (`GlobalInfoSyncerInit`): the
 //! store's client with the info syncer's caller id and `pdResponseHandler`,
-//! which turns any answer but 200, 404 and 412 into `ErrHTTPServiceError`.
+//! which turns any answer but 200, 404 and 412 into `ErrHTTPServiceError`;
+//! and the info syncer's `pdHTTPCli` interface over it ([`PdHttpClient`],
+//! Go `pdhttp.Client`), which `region.go`'s calls use.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use tikv_client::pd_http;
 
 /// Go infosync `GlobalInfoSyncerInit`'s client: the store's PD HTTP client
 /// `WithCallerID("tidb-info-syncer").WithRespHandler(pdResponseHandler)`,
@@ -87,6 +94,71 @@ pub fn http_service_error(message: &str) -> Option<tidb_terror::TerrorError> {
     message
         .strip_prefix(&http_service_error_prefix())
         .map(|body| crate::infosync_errors::ERR_HTTP_SERVICE_ERROR.generate(body))
+}
+
+/// The info syncer's `pdHTTPCli` (Go `pd.Client`), for the calls
+/// `region.go` makes.
+pub trait PdHttpClient: Send + Sync {
+    /// Go `GetRegionDistributionByKeyRange`.
+    fn get_region_distribution_by_key_range(
+        &self,
+        key_range: &pd_http::KeyRange,
+        engine: &str,
+    ) -> Result<pd_http::RegionDistributions, String>;
+    /// Go `GetSchedulerConfig`.
+    fn get_scheduler_config(&self, scheduler_name: &str) -> Result<serde_json::Value, String>;
+    /// Go `CreateSchedulerWithInput`.
+    fn create_scheduler_with_input(
+        &self,
+        name: &str,
+        input: &mut HashMap<String, serde_json::Value>,
+    ) -> Result<(), String>;
+    /// Go `CancelSchedulerJob`.
+    fn cancel_scheduler_job(&self, scheduler_name: &str, job_id: u64) -> Result<(), String>;
+}
+
+impl PdHttpClient for pd_http::Client {
+    fn get_region_distribution_by_key_range(
+        &self,
+        key_range: &pd_http::KeyRange,
+        engine: &str,
+    ) -> Result<pd_http::RegionDistributions, String> {
+        tidb_store_driver_txn::cluster_http::block_on_pd_http(
+            pd_http::Client::get_region_distribution_by_key_range(self, key_range, engine),
+        )
+    }
+
+    fn get_scheduler_config(&self, scheduler_name: &str) -> Result<serde_json::Value, String> {
+        tidb_store_driver_txn::cluster_http::block_on_pd_http(pd_http::Client::get_scheduler_config(
+            self,
+            scheduler_name,
+        ))
+    }
+
+    fn create_scheduler_with_input(
+        &self,
+        name: &str,
+        input: &mut HashMap<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        tidb_store_driver_txn::cluster_http::block_on_pd_http(
+            pd_http::Client::create_scheduler_with_input(self, name, input),
+        )
+    }
+
+    fn cancel_scheduler_job(&self, scheduler_name: &str, job_id: u64) -> Result<(), String> {
+        tidb_store_driver_txn::cluster_http::block_on_pd_http(pd_http::Client::cancel_scheduler_job(
+            self,
+            scheduler_name,
+            job_id,
+        ))
+    }
+}
+
+/// The info syncer's `pdHTTPCli` derived from the store's PD HTTP client,
+/// or none.
+#[must_use]
+pub fn pd_http_cli_of(cli: Option<&pd_http::Client>) -> Option<Arc<dyn PdHttpClient>> {
+    cli.map(|cli| Arc::new(info_syncer_pd_http_client(cli)) as Arc<dyn PdHttpClient>)
 }
 
 #[cfg(test)]

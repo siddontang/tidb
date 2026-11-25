@@ -99,7 +99,7 @@ fn add_partition_keeps_an_available_tiflash_replica_available_like_go() {
         .parse()
         .unwrap();
     assert_eq!(
-        tidb_domain_infosync::tiflash_manager::get_tiflash_progress_from_cache(pn),
+        tidb_domain_infosync::info_syncer::get_tiflash_progress_from_cache(pn),
         Some(1.0)
     );
     // `information_schema.tiflash_replica` is read on the DDL owner's status

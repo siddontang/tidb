@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::TimeZone as _;
-use tidb_domain_infosync::schedule_manager::{get_pd_schedule_config, set_pd_schedule_config};
+use tidb_domain_infosync::info_syncer::{get_pd_schedule_config, set_pd_schedule_config};
 use tidb_model::{ActionType, Job, JobState, SchemaState};
 
 use super::Session;
@@ -370,7 +370,7 @@ impl RecordedSchedule {
     fn install(limit: i64) -> Self {
         let manager = Arc::new(RecordingScheduleManager::default());
         manager.config.lock().unwrap().insert("merge-schedule-limit".to_owned(), serde_json::json!(limit));
-        tidb_domain_infosync::schedule_manager::init_schedule_manager(Some(manager.clone()));
+        tidb_domain_infosync::info_syncer::init_schedule_manager(Some(manager.clone()));
         Self(manager)
     }
 
@@ -386,7 +386,7 @@ impl RecordedSchedule {
 
 impl Drop for RecordedSchedule {
     fn drop(&mut self) {
-        tidb_domain_infosync::schedule_manager::init_schedule_manager(None);
+        tidb_domain_infosync::info_syncer::init_schedule_manager(None);
     }
 }
 

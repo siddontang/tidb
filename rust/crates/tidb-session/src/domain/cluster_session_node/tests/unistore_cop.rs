@@ -16393,7 +16393,7 @@ fn label_rule_ddl_writes_the_nodes_label_manager() {
         .execute_write("DROP DATABASE d2")
         .unwrap();
     assert_eq!(
-        tidb_domain_infosync::label_manager::label_rule_manager()
+        tidb_domain_infosync::info_syncer::label_rule_manager()
             .get_label_rules(&["schema/d2/x".to_owned()])
             .unwrap()
             .len(),

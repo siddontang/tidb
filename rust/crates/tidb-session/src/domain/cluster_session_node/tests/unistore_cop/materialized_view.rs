@@ -2697,7 +2697,7 @@ fn test_materialized_view_refresh_complete_out_of_place_replaces_m_log() {
         assert_eq!(policy.read().name.lowercase(), "mv_oop_policy");
         let latest = stack.factory.catalog.get_latest();
         let bundle = latest.placement_bundle_by_physical_table_id(log.id).expect("the log's bundle").clone();
-        let pd_bundle = tidb_domain_infosync::placement_manager::get_rule_bundle(&bundle.id).unwrap();
+        let pd_bundle = tidb_domain_infosync::info_syncer::get_rule_bundle(&bundle.id).unwrap();
         assert_eq!(bundle, pd_bundle);
     };
     let (mut old_mv, mut old_log) = (latest_table(&stack, "mv"), latest_table(&stack, "$mlog$mv"));
@@ -5129,11 +5129,11 @@ fn table_prefix_hex(id: i64) -> String {
 #[test]
 fn test_materialized_view_refresh_complete_out_of_place_cutover_keeps_tiflash_progress_until_commit() {
     use std::sync::atomic::{AtomicI64, Ordering};
-    use tidb_domain_infosync::tiflash_manager as tiflash;
+    use tidb_domain_infosync::{info_syncer, tiflash_manager as tiflash};
     let _store_count = tidb_failpoint::enable_for_test("github.com/pingcap/tidb/pkg/infoschema/mockTiFlashStoreCount", "return(true)");
     let (stack, _users, mut tk) = go_master_mview_stack();
     let mock = Arc::new(tiflash::MockTiFlash::new());
-    tiflash::set_mock_tiflash(Arc::clone(&mock));
+    info_syncer::set_mock_tiflash(Arc::clone(&mock));
     must_exec_all(&mut tk, &[
         "set tidb_mview_enable = on",
         "use test",
@@ -5159,9 +5159,9 @@ fn test_materialized_view_refresh_complete_out_of_place_cutover_keeps_tiflash_pr
     };
     let old_replica = replica_of(old_mlog_id);
     assert!(old_replica.available);
-    tiflash::update_tiflash_progress_cache(old_mview_id, 0.75);
-    tiflash::update_tiflash_progress_cache(old_mlog_id, 1.0);
-    assert!(tiflash::get_tiflash_progress_from_cache(old_mview_id).is_some());
+    info_syncer::update_tiflash_progress_cache(old_mview_id, 0.75);
+    info_syncer::update_tiflash_progress_cache(old_mlog_id, 1.0);
+    assert!(info_syncer::get_tiflash_progress_from_cache(old_mview_id).is_some());
 
     must_exec_all(&mut tk, &["set global tidb_ddl_error_count_limit = 0"]);
     let cancelled_job_id = Arc::new(AtomicI64::new(0));
@@ -5189,13 +5189,13 @@ fn test_materialized_view_refresh_complete_out_of_place_cutover_keeps_tiflash_pr
         answer(&mut tk, &format!("select start_key, end_key from mysql.gc_delete_range where job_id = {job_id} union all select start_key, end_key from mysql.gc_delete_range_done where job_id = {job_id}")),
         format!(r#"RS:[["{}","{}"]]"#, table_prefix_hex(log_id), table_prefix_hex(log_id + 1))
     );
-    assert!(tiflash::get_tiflash_progress_from_cache(old_mview_id).is_some());
-    assert!(tiflash::get_tiflash_progress_from_cache(old_mlog_id).is_some());
+    assert!(info_syncer::get_tiflash_progress_from_cache(old_mview_id).is_some());
+    assert!(info_syncer::get_tiflash_progress_from_cache(old_mlog_id).is_some());
     let kept = replica_of(old_mlog_id);
     assert_eq!(serde_json::to_value(&kept).unwrap(), serde_json::to_value(&old_replica).unwrap());
 
     must_exec_all(&mut tk, &["refresh materialized view mv_tiflash_cutover complete out of place"]);
-    assert!(tiflash::get_tiflash_progress_from_cache(old_mview_id).is_none());
+    assert!(info_syncer::get_tiflash_progress_from_cache(old_mview_id).is_none());
     let new_log = latest_table(&stack, "$mlog$mv_tiflash_cutover");
     assert_ne!(new_log.id, old_mlog_id);
     let replica = new_log.tiflash_replica.as_ref().expect("the replacement log's replica").read().clone();
@@ -5209,7 +5209,7 @@ fn test_materialized_view_refresh_complete_out_of_place_cutover_keeps_tiflash_pr
     assert_eq!(rule.count, replica.count as i64);
     assert_eq!(rule.location_labels, replica.location_labels.iter().cloned().collect::<Vec<_>>());
     // t.Run("old log progress")
-    assert!(tiflash::get_tiflash_progress_from_cache(old_mlog_id).is_none());
+    assert!(info_syncer::get_tiflash_progress_from_cache(old_mlog_id).is_none());
 }
 
 /// Go `ddl.ExecutorForTest`: the job `sql` builds now, delivered later by

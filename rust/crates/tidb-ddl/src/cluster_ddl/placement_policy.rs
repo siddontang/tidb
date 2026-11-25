@@ -46,7 +46,7 @@ fn check_policy_validation(settings: &tidb_model::PlacementSettings) -> Result<(
 /// # Errors
 /// The placement manager's.
 pub fn get_range_placement_policy_name(range_bundle_id: &str) -> Result<String, String> {
-    let bundle = tidb_domain_infosync::placement_manager::get_rule_bundle(range_bundle_id)?;
+    let bundle = tidb_domain_infosync::info_syncer::get_rule_bundle(range_bundle_id)?;
     let Some(rule) = bundle.rules.first() else {
         return Ok(String::new());
     };

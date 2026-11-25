@@ -1467,7 +1467,7 @@ pub(super) fn on_create_columnar_index(
             // Send sync schema notification to TiFlash.
             if active.job.snapshot_version == 0 {
                 if super::step_pd_write("COLUMNAR INDEX")? {
-                    tidb_domain_infosync::tiflash_manager::sync_tiflash_table_schema(info.id)
+                    tidb_domain_infosync::info_syncer::sync_tiflash_table_schema(info.id)
                         .map_err(DdlPlanError::Encode)?;
                 }
                 // Go `getValidCurrentVersion`; the step's start timestamp
@@ -1577,14 +1577,14 @@ fn check_columnar_index_process(
 /// Go `checkColumnarIndexProcessFromTiKV` checks the backfill process of a
 /// columnar index from TiKV.
 pub(crate) fn check_columnar_index_process_from_tikv(table_id: i64, index_id: i64) -> Result<bool, DdlPlanError> {
-    use tidb_domain_infosync::tiflash_manager;
-    let tikv_stats = tiflash_manager::get_tiflash_stores_stat().map_err(DdlPlanError::Encode)?;
+    use tidb_domain_infosync::{info_syncer, tiflash_manager};
+    let tikv_stats = info_syncer::get_tiflash_stores_stat().map_err(DdlPlanError::Encode)?;
     let tikv_stores: Vec<_> = tikv_stats
         .stores
         .into_iter()
         .filter(|store| !tiflash_manager::is_tiflash_http_resp(&store.store))
         .collect();
-    let progress = tiflash_manager::calculate_columnar_index_progress(table_id, index_id, &tikv_stores)
+    let progress = info_syncer::calculate_columnar_index_progress(table_id, index_id, &tikv_stores)
         .map_err(DdlPlanError::Encode)?;
     Ok(progress >= 1.0)
 }

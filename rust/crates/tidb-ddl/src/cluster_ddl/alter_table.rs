@@ -2198,7 +2198,7 @@ pub(super) fn plan_persisted_alter_table_job_step(
                 // cache, named by bare table IDs, alone.
                 if info.tiflash_replica.is_some() && super::step_pd_write("TIFLASH REPLICA")? {
                     // Go `infosync.DeleteTiFlashTableSyncProgress`.
-                    tidb_domain_infosync::tiflash_manager::delete_tiflash_table_sync_progress(
+                    tidb_domain_infosync::info_syncer::delete_tiflash_table_sync_progress(
                         &info,
                     );
                 }

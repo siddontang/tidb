@@ -921,7 +921,7 @@ mod tests {
         // availability.
         post(&format!(r#"{{"id":{table_id},"region_count":4,"flash_region_count":1}}"#)).unwrap();
         assert_eq!(
-            tidb_domain_infosync::tiflash_manager::get_tiflash_progress_from_cache(table_id),
+            tidb_domain_infosync::info_syncer::get_tiflash_progress_from_cache(table_id),
             Some(0.25)
         );
         assert!(!fetch()[0].available);

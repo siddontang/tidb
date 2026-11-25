@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Go `infosync/tiflash_manager.go` and the `infosync` entry points over it:
-//! the TiFlash placement rules DDL jobs set (`ConfigureTiFlashPDForTable`,
+//! Go `infosync/tiflash_manager.go`: the TiFlash replica manager behind the
+//! `infosync` entry points ([`crate::info_syncer`], Go `info.go`) that set
+//! the TiFlash placement rules DDL jobs need (`ConfigureTiFlashPDForTable`,
 //! `ConfigureTiFlashPDForPartitions`), the GC worker deletes
 //! (`DeleteTiFlashPlacementRules`) and the replica poller's group config
 //! (`SetTiFlashGroupConfig`).
@@ -451,53 +452,12 @@ impl TiFlashReplicaManager for MockTiFlashReplicaManagerCtx {
     }
 }
 
-/// Go `InfoSyncer.initTiFlashReplicaManager` on the process's info syncer:
-/// PD's manager, or a mock when the node has no PD.
-pub fn init_tiflash_replica_manager(manager: Option<Arc<dyn TiFlashReplicaManager>>) {
-    crate::info_syncer::global_info_syncer().init_tiflash_replica_manager(manager);
-}
-
-/// The TiFlash replica manager of the info syncer this thread reads
-/// ([`crate::info_syncer::get`]).
-pub fn tiflash_replica_manager() -> Arc<dyn TiFlashReplicaManager> {
-    crate::info_syncer::get().tiflash_replica_manager()
-}
-
-fn tiflash_enabled() -> bool {
+pub(crate) fn tiflash_enabled() -> bool {
     tidb_config::config_tree::config::get_global_config().cse.is_tiflash_enabled()
 }
 
-fn info(message: &str, fields: &[Field]) {
+pub(crate) fn info(message: &str, fields: &[Field]) {
     tidb_logutil::bg_logger().info(message, fields);
-}
-
-/// Go `infosync.SetMockTiFlash`: the mock manager's TiFlash.
-pub fn set_mock_tiflash(tiflash: Arc<MockTiFlash>) {
-    tiflash_replica_manager().set_mock_tiflash(tiflash);
-}
-
-/// Go `infosync.GetTiFlashStoresStat`.
-pub fn get_tiflash_stores_stat() -> Result<pd_http::StoresInfo, String> {
-    tiflash_replica_manager().get_stores_stat()
-}
-
-/// Go `infosync.SyncTiFlashTableSchema`: the table's schema synced to every
-/// store labelled `engine=tiflash`.
-pub fn sync_tiflash_table_schema(table_id: i64) -> Result<(), String> {
-    let manager = tiflash_replica_manager();
-    let tikv_stats = manager.get_stores_stat()?;
-    let tiflash_stores: Vec<pd_http::StoreInfo> = tikv_stats
-        .stores
-        .into_iter()
-        .filter(|store| {
-            store
-                .store
-                .labels
-                .iter()
-                .any(|label| label.key == "engine" && label.value == "tiflash")
-        })
-        .collect();
-    manager.sync_tiflash_table_schema(table_id, &tiflash_stores)
 }
 
 /// Go `helper.ColumnarStatusResp`: the response from the TiKV's status API.
@@ -557,62 +517,6 @@ pub fn collect_columnar_status(
         );
     }
     Ok(columnar_status)
-}
-
-/// The loop Go's `calculateColumnarProgressWithCtx` and
-/// `CalculateColumnarIndexProgress` share: the `ready_of` count of every
-/// TiKV store over their total, a failed store an error unless it is a
-/// tombstone.
-fn columnar_progress(
-    table_id: i64,
-    index_id: Option<i64>,
-    tikv_stores: &[pd_http::StoreInfo],
-    ready_of: fn(&ColumnarStatusResp) -> u64,
-) -> Result<f64, String> {
-    let security = tiflash_replica_manager().security();
-    let mut ready = 0;
-    let mut total = 0;
-    for store_stat in tikv_stores {
-        let addr = &store_stat.store.status_address;
-        let Ok(columnar_status) = collect_columnar_status(&security, addr, table_id, index_id) else {
-            tidb_logutil::bg_logger().error(
-                "Fail to get columnar status from TiKV.",
-                &[
-                    Field::new("tableID", Value::I64(table_id)),
-                    Field::new("addr", Value::Str(addr.clone())),
-                ],
-            );
-            // If the store is not tombstone, return error
-            if store_stat.store.state_name != "Tombstone" {
-                return Err(format!(
-                    "Failed to get columnar status from TiKV, store {addr} is {}",
-                    store_stat.store.state_name
-                ));
-            }
-            continue;
-        };
-        ready += ready_of(&columnar_status);
-        total += columnar_status.total;
-    }
-    if total == 0 {
-        return Ok(0.0);
-    }
-    Ok(ready as f64 / total as f64)
-}
-
-/// Go `infosync.CalculateColumnarProgress` calculates columnar progress.
-pub fn calculate_columnar_progress(table_id: i64, tikv_stores: &[pd_http::StoreInfo]) -> Result<f64, String> {
-    columnar_progress(table_id, None, tikv_stores, |status| status.ready)
-}
-
-/// Go `infosync.CalculateColumnarIndexProgress` calculates columnar index
-/// progress.
-pub fn calculate_columnar_index_progress(
-    table_id: i64,
-    index_id: i64,
-    tikv_stores: &[pd_http::StoreInfo],
-) -> Result<f64, String> {
-    columnar_progress(table_id, Some(index_id), tikv_stores, |status| status.vector_index_ready)
 }
 
 /// Go `engine.IsTiFlashHTTPResp` tests whether the store is a TiFlash node
@@ -755,27 +659,6 @@ pub fn calculate_tiflash_progress(
     Ok((full_replica_progress, one_replica_progress))
 }
 
-/// Go `infosync.GetTiFlashProgressStores`: the TiFlash write stores and the
-/// TiKV stores, TiFlash compute nodes left out.
-///
-/// # Errors
-/// PD's error.
-pub fn get_tiflash_progress_stores(
-) -> Result<(Vec<pd_http::StoreInfo>, Vec<pd_http::StoreInfo>), String> {
-    let stats = get_tiflash_stores_stat()?;
-    let (mut tiflash_stores, mut tikv_stores) = (Vec::new(), Vec::new());
-    for store in stats.stores {
-        if is_tiflash_http_resp(&store.store) {
-            if is_tiflash_write_http_resp(&store.store) {
-                tiflash_stores.push(store);
-            }
-            continue;
-        }
-        tikv_stores.push(store);
-    }
-    Ok((tiflash_stores, tikv_stores))
-}
-
 /// Go `engine.IsTiFlashWriteHTTPResp`: a TiFlash node under the classic
 /// kernel or a TiFlash write node under the next-gen one.
 #[must_use]
@@ -784,134 +667,6 @@ pub fn is_tiflash_write_http_resp(store: &pd_http::MetaStore) -> bool {
         .labels
         .iter()
         .any(|label| label.key == "engine" && label.value == "tiflash")
-}
-
-/// Go `infosync.MustGetTiFlashProgress`: the cached progress, or the
-/// lower of the TiFlash progress (with TiFlash stores) and the columnar
-/// progress (with TiKV stores), cached.
-///
-/// # Errors
-/// The calculation's error.
-pub fn must_get_tiflash_progress(
-    table_id: i64,
-    replica_count: u64,
-    tiflash_stores: &[pd_http::StoreInfo],
-    tikv_stores: &[pd_http::StoreInfo],
-) -> Result<f64, String> {
-    let manager = tiflash_replica_manager();
-    if let Some(progress) = manager.get_tiflash_progress_from_cache(table_id) {
-        return Ok(progress);
-    }
-    let mut tiflash_progress = 1.0;
-    let mut columnar_progress = 1.0;
-    if !tiflash_stores.is_empty() {
-        tiflash_progress = manager
-            .calculate_tiflash_progress(table_id, replica_count, tiflash_stores)?
-            .0;
-    }
-    if !tikv_stores.is_empty() {
-        columnar_progress = calculate_columnar_progress(table_id, tikv_stores)?;
-    }
-    let progress = f64::min(tiflash_progress, columnar_progress);
-    manager.update_tiflash_progress_cache(table_id, progress);
-    Ok(progress)
-}
-
-/// Go `infosync.UpdateTiFlashProgressCache`.
-pub fn update_tiflash_progress_cache(table_id: i64, progress: f64) {
-    tiflash_replica_manager().update_tiflash_progress_cache(table_id, progress);
-}
-
-/// Go `infosync.GetTiFlashProgressFromCache`.
-pub fn get_tiflash_progress_from_cache(table_id: i64) -> Option<f64> {
-    tiflash_replica_manager().get_tiflash_progress_from_cache(table_id)
-}
-
-/// Go `infosync.DeleteTiFlashProgressFromCache`.
-pub fn delete_tiflash_progress_from_cache(table_id: i64) {
-    tiflash_replica_manager().delete_tiflash_progress_from_cache(table_id);
-}
-
-/// Go `infosync.CleanTiFlashProgressCache`.
-pub fn clean_tiflash_progress_cache() {
-    tiflash_replica_manager().clean_tiflash_progress_cache();
-}
-
-/// Go `infosync.DeleteTiFlashTableSyncProgress`: drops the cached progress
-/// of the table, or of each of its partitions.
-pub fn delete_tiflash_table_sync_progress(table_info: &tidb_model::table_info::TableInfo) {
-    let manager = tiflash_replica_manager();
-    if let Some(pi) = table_info.get_partition_info() {
-        for p in pi.read().definitions.snapshot() {
-            manager.delete_tiflash_progress_from_cache(p.id);
-        }
-    } else {
-        manager.delete_tiflash_progress_from_cache(table_info.id);
-    }
-}
-
-/// Go `infosync.SetTiFlashGroupConfig`.
-pub fn set_tiflash_group_config() -> Result<(), String> {
-    info("SetTiFlashGroupConfig", &[]);
-    tiflash_replica_manager().set_tiflash_group_config()
-}
-
-/// Go `infosync.ConfigureTiFlashPDForTable`.
-pub fn configure_tiflash_pd_for_table(id: i64, count: u64, location_labels: &[String]) -> Result<(), String> {
-    if !tiflash_enabled() {
-        return Ok(());
-    }
-    info(
-        "ConfigureTiFlashPDForTable",
-        &[Field::new("tableID", Value::I64(id)), Field::new("count", Value::U64(count))],
-    );
-    tiflash_replica_manager().set_placement_rule(&make_new_rule(id, count, location_labels))
-}
-
-/// Go `infosync.ConfigureTiFlashPDForPartitions`: one rule per partition in
-/// one batch, then, when `accel`, the accelerated scheduling of them.
-pub fn configure_tiflash_pd_for_partitions(
-    accel: bool,
-    partition_ids: &[i64],
-    count: u64,
-    location_labels: &[String],
-    table_id: i64,
-) -> Result<(), String> {
-    if !tiflash_enabled() {
-        return Ok(());
-    }
-    let rules: Vec<_> = partition_ids
-        .iter()
-        .map(|&id| {
-            info(
-                "ConfigureTiFlashPDForPartitions",
-                &[
-                    Field::new("tableID", Value::I64(table_id)),
-                    Field::new("partID", Value::I64(id)),
-                    Field::new("accel", Value::Bool(accel)),
-                    Field::new("count", Value::U64(count)),
-                ],
-            );
-            make_new_rule(id, count, location_labels)
-        })
-        .collect();
-    let manager = tiflash_replica_manager();
-    manager.set_placement_rule_batch(&rules)?;
-    if accel {
-        manager.post_accelerate_schedule_batch(partition_ids)?;
-    }
-    Ok(())
-}
-
-/// Go `infosync.DeleteTiFlashPlacementRules`: a zero-count rule per table,
-/// which the batch deletes.
-pub fn delete_tiflash_placement_rules(physical_table_ids: &[i64]) -> Result<(), String> {
-    info("DeleteTiFlashPlacementRules", &[]);
-    let rules: Vec<_> = physical_table_ids
-        .iter()
-        .map(|&id| make_new_rule(id, 0, &[]))
-        .collect();
-    tiflash_replica_manager().set_placement_rule_batch(&rules)
 }
 
 /// Go `MakeRuleID`: the rule ID for TiFlash with the given table ID.

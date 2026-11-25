@@ -18,7 +18,7 @@
 use crate::support::testkit::*;
 
 fn get_rule_bundle(name: &str) -> tidb_placement::Bundle {
-    tidb_domain_infosync::placement_manager::get_rule_bundle(name).unwrap()
+    tidb_domain_infosync::info_syncer::get_rule_bundle(name).unwrap()
 }
 
 /// Go `TestAlterRangePlacementPolicy`.

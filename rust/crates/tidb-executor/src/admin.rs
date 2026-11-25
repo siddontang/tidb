@@ -1849,7 +1849,7 @@ pub fn execute_alter_range(
             ..tidb_placement::Bundle::default()
         }
     };
-    tidb_domain_infosync::placement_manager::put_rule_bundles_with_default_retry(&[bundle]).map_err(unknown)
+    tidb_domain_infosync::info_syncer::put_rule_bundles_with_default_retry(&[bundle]).map_err(unknown)
 }
 
 /// Go `killBySQLStmt`: a SQL `KILL` of a connection (not `KILL QUERY`) marks

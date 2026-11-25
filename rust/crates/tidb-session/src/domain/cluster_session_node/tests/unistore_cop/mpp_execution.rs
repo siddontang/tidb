@@ -2512,7 +2512,7 @@ fn test_mpp_shared_cte_scan() {
 #[test]
 fn test_tiflash_ann_index() {
     let (stack, mut session) = tiflash_session(2, 2171);
-    tidb_domain_infosync::tiflash_manager::set_mock_tiflash(std::sync::Arc::new(
+    tidb_domain_infosync::info_syncer::set_mock_tiflash(std::sync::Arc::new(
         tidb_domain_infosync::tiflash_manager::MockTiFlash::new(),
     ));
     tidb_failpoint::enable("github.com/pingcap/tidb/pkg/ddl/MockCheckColumnarIndexProcess", "return(1)").unwrap();
@@ -2545,7 +2545,7 @@ fn test_tiflash_ann_index() {
 /// table for joins, and `t1`'s TiFlash replica available.
 fn vector_search_with_pk_session(connection_id: u64) -> (UnistoreClusterStack, Session) {
     let (stack, mut session) = tiflash_session(2, connection_id);
-    tidb_domain_infosync::tiflash_manager::set_mock_tiflash(std::sync::Arc::new(
+    tidb_domain_infosync::info_syncer::set_mock_tiflash(std::sync::Arc::new(
         tidb_domain_infosync::tiflash_manager::MockTiFlash::new(),
     ));
     rows(&mut session, "drop table if exists t1");
@@ -2620,7 +2620,7 @@ fn test_vector_search_heavy_function() {
 #[test]
 fn test_inverted_index() {
     let (stack, mut session) = tiflash_session(2, 2175);
-    tidb_domain_infosync::tiflash_manager::set_mock_tiflash(std::sync::Arc::new(
+    tidb_domain_infosync::info_syncer::set_mock_tiflash(std::sync::Arc::new(
         tidb_domain_infosync::tiflash_manager::MockTiFlash::new(),
     ));
     rows(&mut session, "drop table if exists t1;");

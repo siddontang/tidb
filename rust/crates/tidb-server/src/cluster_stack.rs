@@ -1091,7 +1091,7 @@ fn new_cluster_domain(
             as Arc<dyn tidb_domain_infosync::label_manager::LabelRuleManager>
     }));
     // Go `GlobalInfoSyncerInit`'s `pdHTTPCli`.
-    info_syncer.init_pd_http_cli(tidb_domain_infosync::region::pd_http_cli_of(pd_http_client.as_ref()));
+    info_syncer.init_pd_http_cli(tidb_domain_infosync::pd_http::pd_http_cli_of(pd_http_client.as_ref()));
     // Go `InfoSyncer.initPlacementManager`: PD's placement rule bundles.
     info_syncer.init_placement_manager(pd_http_client.as_ref().map(|client| {
         Arc::new(tidb_domain_infosync::placement_manager::PdPlacementManager::new(client))

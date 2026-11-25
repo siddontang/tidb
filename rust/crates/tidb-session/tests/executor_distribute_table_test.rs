@@ -43,7 +43,7 @@ struct MockState {
     distributions: HashMap<(Vec<u8>, Vec<u8>), pd_http::RegionDistributions>,
 }
 
-impl tidb_domain_infosync::region::PdHttpClient for MockDistributePdCli {
+impl tidb_domain_infosync::pd_http::PdHttpClient for MockDistributePdCli {
     fn get_region_distribution_by_key_range(
         &self,
         key_range: &pd_http::KeyRange,
@@ -93,7 +93,7 @@ impl tidb_domain_infosync::region::PdHttpClient for MockDistributePdCli {
 }
 
 fn install(cli: &Arc<MockDistributePdCli>) -> impl FnOnce() {
-    tidb_domain_infosync::region::set_pd_http_cli_for_test(Arc::clone(cli) as Arc<dyn tidb_domain_infosync::region::PdHttpClient>)
+    tidb_domain_infosync::region::set_pd_http_cli_for_test(Arc::clone(cli) as Arc<dyn tidb_domain_infosync::pd_http::PdHttpClient>)
 }
 
 fn table_key(pid: i64) -> Vec<u8> {

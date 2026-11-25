@@ -3677,7 +3677,7 @@ pub(super) fn cleanup_mview_out_of_place_cutover_after_commit(
         if id == 0 {
             continue;
         }
-        tidb_domain_infosync::tiflash_manager::delete_tiflash_table_sync_progress(&TableInfo { id, ..TableInfo::default() });
+        tidb_domain_infosync::info_syncer::delete_tiflash_table_sync_progress(&TableInfo { id, ..TableInfo::default() });
     }
 }
 

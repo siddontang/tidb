@@ -21,76 +21,7 @@ use std::sync::Arc;
 
 use tikv_client::pd_http;
 
-/// The info syncer's `pdHTTPCli` (Go `pd.Client`), for the calls
-/// `region.go` makes.
-pub trait PdHttpClient: Send + Sync {
-    /// Go `GetRegionDistributionByKeyRange`.
-    fn get_region_distribution_by_key_range(
-        &self,
-        key_range: &pd_http::KeyRange,
-        engine: &str,
-    ) -> Result<pd_http::RegionDistributions, String>;
-    /// Go `GetSchedulerConfig`.
-    fn get_scheduler_config(&self, scheduler_name: &str) -> Result<serde_json::Value, String>;
-    /// Go `CreateSchedulerWithInput`.
-    fn create_scheduler_with_input(
-        &self,
-        name: &str,
-        input: &mut HashMap<String, serde_json::Value>,
-    ) -> Result<(), String>;
-    /// Go `CancelSchedulerJob`.
-    fn cancel_scheduler_job(&self, scheduler_name: &str, job_id: u64) -> Result<(), String>;
-}
-
-impl PdHttpClient for pd_http::Client {
-    fn get_region_distribution_by_key_range(
-        &self,
-        key_range: &pd_http::KeyRange,
-        engine: &str,
-    ) -> Result<pd_http::RegionDistributions, String> {
-        tidb_store_driver_txn::cluster_http::block_on_pd_http(
-            pd_http::Client::get_region_distribution_by_key_range(self, key_range, engine),
-        )
-    }
-
-    fn get_scheduler_config(&self, scheduler_name: &str) -> Result<serde_json::Value, String> {
-        tidb_store_driver_txn::cluster_http::block_on_pd_http(pd_http::Client::get_scheduler_config(
-            self,
-            scheduler_name,
-        ))
-    }
-
-    fn create_scheduler_with_input(
-        &self,
-        name: &str,
-        input: &mut HashMap<String, serde_json::Value>,
-    ) -> Result<(), String> {
-        tidb_store_driver_txn::cluster_http::block_on_pd_http(
-            pd_http::Client::create_scheduler_with_input(self, name, input),
-        )
-    }
-
-    fn cancel_scheduler_job(&self, scheduler_name: &str, job_id: u64) -> Result<(), String> {
-        tidb_store_driver_txn::cluster_http::block_on_pd_http(pd_http::Client::cancel_scheduler_job(
-            self,
-            scheduler_name,
-            job_id,
-        ))
-    }
-}
-
-/// The info syncer's `pdHTTPCli` derived from the store's PD HTTP client,
-/// or none.
-#[must_use]
-pub fn pd_http_cli_of(cli: Option<&pd_http::Client>) -> Option<Arc<dyn PdHttpClient>> {
-    cli.map(|cli| Arc::new(crate::pd_http::info_syncer_pd_http_client(cli)) as Arc<dyn PdHttpClient>)
-}
-
-/// Go `GlobalInfoSyncerInit`'s `pdHTTPCli` on the process's info syncer:
-/// the store's PD HTTP client as the info syncer derives it, or none.
-pub fn init_pd_http_cli(cli: Option<&pd_http::Client>) {
-    crate::info_syncer::global_info_syncer().init_pd_http_cli(pd_http_cli_of(cli));
-}
+use crate::pd_http::PdHttpClient;
 
 /// Go `SetPDHttpCliForTest` on the info syncer this thread reads: installs
 /// `cli` and answers the function that puts the previous client back.

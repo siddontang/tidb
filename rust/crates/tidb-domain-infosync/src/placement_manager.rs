@@ -14,7 +14,8 @@
 
 //! Go `pkg/domain/infosync/placement_manager.go`: the `InfoSyncer`'s
 //! `placementManager`, PD's placement rule bundles or, without PD, an
-//! in-memory mock; and `info.go`'s `PutRuleBundlesWithDefaultRetry`.
+//! in-memory mock. `info.go`'s `GetRuleBundle` and `PutRuleBundles*` are in
+//! [`crate::info_syncer`].
 //!
 //! PD keeps one namespace of rule groups for the whole cluster, while table
 //! IDs repeat across keyspaces. On a next-generation kernel a keyspace's
@@ -28,8 +29,7 @@
 //! wrote for a keyspace cover keyspace-less ranges and are not read back.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::sync::{Mutex, PoisonError};
 
 use tidb_placement::pd::PeerRoleType;
 use tidb_placement::Bundle;
@@ -162,18 +162,6 @@ fn check_bundles(bundles: &BTreeMap<String, Bundle>) -> Result<(), String> {
     bundles.values().try_for_each(check_bundle)
 }
 
-/// Go `InfoSyncer.initPlacementManager` on the process's info syncer: PD's
-/// manager, or a fresh mock when the node has no PD.
-pub fn init_placement_manager(manager: Option<Arc<dyn PlacementManager>>) {
-    crate::info_syncer::global_info_syncer().init_placement_manager(manager);
-}
-
-/// The placement manager of the info syncer this thread reads
-/// ([`crate::info_syncer::get`]).
-pub fn placement_manager() -> Arc<dyn PlacementManager> {
-    crate::info_syncer::get().placement_manager()
-}
-
 /// The keyspace codec PD keys and ranges a bundle by: the store's, on a
 /// next-generation kernel.
 fn keyspace_codec(codec: Option<&ApiV2Codec>) -> Option<&ApiV2Codec> {
@@ -244,80 +232,4 @@ pub fn decode_bundle(codec: Option<&ApiV2Codec>, id: &str, bundle: Bundle) -> Re
             .map_err(|error| error.to_string())?;
         Ok((encode(&start), encode(&end)))
     })
-}
-
-/// Go `GetRuleBundle`: the bundle `name` of the keyspace this thread's info
-/// syncer serves.
-///
-/// # Errors
-/// The placement manager's.
-pub fn get_rule_bundle(name: &str) -> Result<Bundle, String> {
-    let syncer = crate::info_syncer::get();
-    let bundle = syncer
-        .placement_manager()
-        .get_rule_bundle(&keyspace_bundle_id(syncer.codec(), name))?;
-    decode_bundle(syncer.codec(), name, bundle)
-}
-
-/// Go `RequestPDMaxRetry`.
-const REQUEST_PD_MAX_RETRY: usize = 3;
-/// Go `RequestRetryInterval`.
-const REQUEST_RETRY_INTERVAL: Duration = Duration::from_millis(200);
-
-/// Go `PutRuleBundles`.
-///
-/// # Errors
-/// The placement manager's.
-pub fn put_rule_bundles(bundles: &[Bundle]) -> Result<(), String> {
-    if let Some(value) = tidb_failpoint::eval("github.com/pingcap/tidb/pkg/domain/infosync/putRuleBundlesError") {
-        return Err(if value.bool() {
-            crate::infosync_errors::ERR_HTTP_SERVICE_ERROR.fast_gen("mock service error", &[]).to_string()
-        } else {
-            "mock other error".to_owned()
-        });
-    }
-    let syncer = crate::info_syncer::get();
-    let bundles = bundles
-        .iter()
-        .map(|bundle| encode_bundle(syncer.codec(), bundle))
-        .collect::<Result<Vec<_>, _>>()?;
-    syncer.placement_manager().put_rule_bundles(&bundles)
-}
-
-/// Go `PutRuleBundlesWithRetry`: retries a failure other than PD's own
-/// answer (`ErrHTTPServiceError`).
-///
-/// # Errors
-/// The last attempt's.
-pub fn put_rule_bundles_with_retry(
-    bundles: &[Bundle],
-    max_retry: usize,
-    interval: Duration,
-) -> Result<(), String> {
-    let mut result = Ok(());
-    for i in 0..=max_retry {
-        result = put_rule_bundles(bundles);
-        match &result {
-            Ok(()) => return result,
-            Err(error) if crate::pd_http::is_http_service_error(error) => return result,
-            Err(error) => {
-                if i != max_retry {
-                    tidb_logutil::bg_logger().warn(
-                        "Error occurs when PutRuleBundles, retry",
-                        &[tidb_logutil::zap_error(error)],
-                    );
-                    std::thread::sleep(interval);
-                }
-            }
-        }
-    }
-    result
-}
-
-/// Go `PutRuleBundlesWithDefaultRetry`.
-///
-/// # Errors
-/// The last attempt's.
-pub fn put_rule_bundles_with_default_retry(bundles: &[Bundle]) -> Result<(), String> {
-    put_rule_bundles_with_retry(bundles, REQUEST_PD_MAX_RETRY, REQUEST_RETRY_INTERVAL)
 }

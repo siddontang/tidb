@@ -17,10 +17,11 @@
 //! `ResourceManagerClient` writes `infosync.AddResourceGroup`,
 //! `ModifyResourceGroup` and `DeleteResourceGroup` make, and
 //! `resource_manager_client.go`'s `mockResourceManagerClient`, which a store
-//! without PD gets (`InfoSyncer.initResourceManagerClient(nil)`).
+//! without PD gets (`InfoSyncer.initResourceManagerClient(nil)`). The
+//! `infosync` calls over it are in [`crate::info_syncer`].
 
 use std::collections::HashMap;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{PoisonError, RwLock};
 
 use tidb_proto::resource_manager as rmpb;
 
@@ -141,41 +142,6 @@ impl ResourceManagerClient for MockResourceManagerClient {
             .remove(name);
         Ok("Success!".to_owned())
     }
-}
-
-fn client() -> Arc<dyn ResourceManagerClient> {
-    crate::info_syncer::get().resource_manager_client()
-}
-
-/// Go `InfoSyncer.initResourceManagerClient` on the process's info syncer:
-/// PD's client, or the mock when there is none.
-pub fn init_resource_manager_client(client: Option<Arc<dyn ResourceManagerClient>>) {
-    crate::info_syncer::global_info_syncer().init_resource_manager_client(client);
-}
-
-/// Go `infosync.GetResourceGroup`.
-pub fn get_resource_group(name: &str) -> Result<rmpb::ResourceGroup, String> {
-    client().get_resource_group(name)
-}
-
-/// Go `infosync.ListResourceGroups`.
-pub fn list_resource_groups() -> Result<Vec<rmpb::ResourceGroup>, String> {
-    client().list_resource_groups()
-}
-
-/// Go `infosync.AddResourceGroup`.
-pub fn add_resource_group(group: rmpb::ResourceGroup) -> Result<(), String> {
-    client().add_resource_group(group).map(|_| ())
-}
-
-/// Go `infosync.ModifyResourceGroup`.
-pub fn modify_resource_group(group: rmpb::ResourceGroup) -> Result<(), String> {
-    client().modify_resource_group(group).map(|_| ())
-}
-
-/// Go `infosync.DeleteResourceGroup`.
-pub fn delete_resource_group(name: &str) -> Result<(), String> {
-    client().delete_resource_group(name).map(|_| ())
 }
 
 #[cfg(test)]

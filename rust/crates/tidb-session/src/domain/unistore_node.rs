@@ -342,7 +342,7 @@ impl BootstrapImage {
         ).map_err(|error| error.message)?;
         // The bootstrap's resource group write lands in the mock resource
         // manager, as the stack's own boot initializes it.
-        tidb_domain_infosync::resource_manager_client::init_resource_manager_client(None);
+        tidb_domain_infosync::info_syncer::init_resource_manager_client(None);
         let published = crate::bootstrap_publish::publish_bootstrap_with_effects(
             &stack.opener,
             IN_PROCESS_TIMEOUT,
