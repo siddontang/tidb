@@ -267,6 +267,8 @@ impl fmt::Debug for ConnectionTracker {
 
 impl ConnectionTracker {
     pub(crate) fn begin(self: &Arc<Self>) -> ConnectionLease {
+        // Before the ID: a loss in between leaves the greeting stale.
+        let greeting = self.identity.as_ref().and_then(|identity| identity.greeting());
         let id = self.connection_ids.next_id();
         self.accepted.fetch_add(1, Ordering::AcqRel);
         let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
@@ -274,6 +276,7 @@ impl ConnectionTracker {
         ConnectionLease {
             tracker: Arc::clone(self),
             id,
+            greeting,
             failed: false,
         }
     }
@@ -312,12 +315,18 @@ impl ConnectionTracker {
 pub(crate) struct ConnectionLease {
     tracker: Arc<ConnectionTracker>,
     id: u64,
+    /// The node identity's greeting, taken as the ID was allocated.
+    greeting: Option<tidb_domain::server_id::Greeting>,
     failed: bool,
 }
 
 impl ConnectionLease {
     pub(crate) const fn id(&self) -> u64 {
         self.id
+    }
+
+    pub(crate) const fn greeting(&self) -> Option<tidb_domain::server_id::Greeting> {
+        self.greeting
     }
 
     pub(crate) const fn mark_failed(&mut self) {

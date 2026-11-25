@@ -1302,12 +1302,16 @@ unknown ID), and `EXPLAIN FOR CONNECTION` answers `ER_NO_SUCH_THREAD`.
   Routing also refuses a runtime that still holds an ID the process no longer
   greets with. A tenant keeper wakes every 10s (the retry interval) to follow
   its process's ID, and refreshes its lease every 5 minutes as Go does.
-- A connection is admitted against the ID it was greeted with. Routing takes
-  an `AdmissionTicket` (the tenant reservation's ID and its loss count), and
-  the connection's process registration (opening its session) runs under it:
-  a drain or a SYSTEM rotation since routing fails the login with 1045, and
-  nothing is registered. A loss waits for a registration in progress, then
-  retires it with the rest.
+- A connection is admitted against the ID it was greeted with. The greeting
+  records the SYSTEM reservation's loss count as the connection ID is
+  allocated. Routing takes an `AdmissionTicket` (that greeting, and the
+  tenant reservation's ID and loss count), and the connection's process
+  registration (opening its session) runs under it, holding both
+  reservations' admission locks: a SYSTEM loss since the greeting (even one
+  recovered onto the same number), or a drain or a SYSTEM rotation since
+  routing, fails the login with 1045, and nothing is registered. A loss
+  waits for a registration in progress; a tenant's then retires it with
+  the rest.
 - A fresh tenant claim counts as a successful refresh, so one transient
   refresh error loses nothing. A keeper that lost admission while its lease
   lived recognizes its own claim (the key's lease is its own) and keeps it.

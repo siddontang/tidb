@@ -694,6 +694,9 @@ pub struct ConnectionReport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AcceptedConnectionIdentity {
     connection_id: u64,
+    /// The node's identity when the connection's ID was allocated (design
+    /// §6.6); `None` without a server-ID reservation, or while it is lost.
+    greeting: Option<tidb_domain::server_id::Greeting>,
     peer_addr: PeerAddress,
 }
 
@@ -1338,6 +1341,7 @@ pub(crate) fn serve_mysql_connection_with_runtime<F: QuerySessionFactory>(
             stream,
             AcceptedConnectionIdentity {
                 connection_id: lease.id(),
+                greeting: lease.greeting(),
                 peer_addr,
             },
             cancellation,
@@ -1401,6 +1405,7 @@ fn serve_connection_inner<F: QuerySessionFactory>(
 ) -> Result<ConnectionReport, MysqlConnectionError> {
     let AcceptedConnectionIdentity {
         connection_id,
+        greeting,
         peer_addr,
     } = identity;
     stream.set_nodelay(true).map_err(MysqlConnectionError::Io)?;
@@ -1527,7 +1532,7 @@ fn serve_connection_inner<F: QuerySessionFactory>(
     let mut admission = None;
     let (factory, users) = match router {
         None => (factory, users),
-        Some(router) => match router.route(&response_user, connection_id) {
+        Some(router) => match router.route(&response_user, connection_id, greeting) {
             Some((keyspace, ticket)) => {
                 routed = keyspace;
                 admission = ticket;

@@ -135,24 +135,43 @@ impl ServerIdAuthority {
         })
     }
     /// Whether this identity may admit a connection: its lease is held and,
-    /// for a tenant reservation, it holds the ID its process greets with.
+    /// for a tenant reservation, its process holds its own lease on the
+    /// same ID.
     #[must_use]
     pub fn admits(&self) -> bool {
-        !self.is_lost() && self.process.as_ref().is_none_or(|process| process.id() == self.id())
+        !self.is_lost()
+            && self
+                .process
+                .as_ref()
+                .is_none_or(|process| !process.is_lost() && process.id() == self.id())
     }
-    /// A ticket for a connection greeted with server ID `greeted`, if this
-    /// identity admits it now: it holds its lease, on `greeted`, and (for a
-    /// tenant reservation) on the ID its process greets with. The ticket
-    /// admits the connection's registration only while all of that still
-    /// holds and no loss came in between ([`AdmissionTicket::register`]).
+    /// The [`Greeting`] of the connection whose ID is allocated next from
+    /// this identity, taken before the allocation; `None` while its lease is
+    /// lost.
     #[must_use]
-    pub fn admission_ticket(self: &Arc<Self>, greeted: u64) -> Option<AdmissionTicket> {
+    pub fn greeting(&self) -> Option<Greeting> {
+        // The loss count first: a loss sets `lost` before it counts, so a
+        // held lease read after it was held under this count (or a later
+        // loss makes the count stale).
         let generation = self.generation.load(Ordering::Acquire);
-        (self.admits() && self.id() == greeted).then(|| AdmissionTicket {
+        (!self.is_lost()).then_some(Greeting { generation })
+    }
+    /// A ticket for a connection greeted with server ID `greeted` under
+    /// `greeting` (of [`Self::admission`]), if this identity admits it now:
+    /// it holds its lease, on `greeted`, and the identity that greeted the
+    /// connection has held its own lease since the greeting. The ticket
+    /// admits the connection's registration only while all of that still
+    /// holds and neither lease was lost in between
+    /// ([`AdmissionTicket::register`]).
+    #[must_use]
+    pub fn admission_ticket(self: &Arc<Self>, greeted: u64, greeting: Greeting) -> Option<AdmissionTicket> {
+        let ticket = AdmissionTicket {
             authority: Arc::clone(self),
             greeted,
-            generation,
-        })
+            generation: self.generation.load(Ordering::Acquire),
+            greeting,
+        };
+        ticket.admits().then_some(ticket)
     }
     /// The identity whose loss stops new handshakes: a tenant reservation's
     /// process reservation, otherwise this one.
@@ -196,25 +215,48 @@ impl ServerIdAuthority {
     }
 }
 
+/// The identity a connection was greeted with
+/// ([`ServerIdAuthority::greeting`]): the loss count of the reservation
+/// whose ID its connection ID carries. A connection greeted before a loss
+/// is not admitted after it, even once the same ID is held again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Greeting {
+    generation: u64,
+}
+
 /// A connection's admission under the identity it was greeted with
 /// ([`ServerIdAuthority::admission_ticket`]).
 pub struct AdmissionTicket {
     authority: Arc<ServerIdAuthority>,
     greeted: u64,
+    /// The authority's loss count when the ticket was taken.
     generation: u64,
+    /// The greeting identity's ([`ServerIdAuthority::admission`]) loss
+    /// count when the connection was greeted.
+    greeting: Greeting,
 }
 impl AdmissionTicket {
     /// Runs `register` (the connection's process registration) if the
-    /// identity still admits the greeted ID with no loss since the ticket
-    /// was taken; `None` otherwise, and nothing is registered. A loss waits
-    /// for a running `register`, then retires what it registered.
+    /// identity still admits the greeted ID, with no loss of its lease since
+    /// the ticket was taken and none of the greeting identity's since the
+    /// greeting; `None` otherwise, and nothing is registered. Either loss
+    /// waits for a running `register`: a tenant's then retires what it
+    /// registered.
     pub fn register<R>(&self, register: impl FnOnce() -> R) -> Option<R> {
+        let greeter = self.authority.admission();
+        // Both identities' admission locks, the greeting identity's first;
+        // a loss takes only its own.
+        let _greeter = (!Arc::ptr_eq(&greeter, &self.authority))
+            .then(|| greeter.admission.read().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let _admission = self.authority.admission.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.admits().then(register)
+    }
+    fn admits(&self) -> bool {
         let authority = &self.authority;
-        let _admission = authority.admission.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        (authority.generation.load(Ordering::Acquire) == self.generation
+        authority.admission().generation.load(Ordering::Acquire) == self.greeting.generation
+            && authority.generation.load(Ordering::Acquire) == self.generation
             && authority.admits()
-            && authority.id() == self.greeted)
-            .then(register)
+            && authority.id() == self.greeted
     }
 }
 
@@ -1025,7 +1067,8 @@ mod tests {
         expire(&system);
         process_state.tick(Instant::now(), &process_syncer, &receive);
         assert!(process.is_lost() && a.admission().is_lost() && b.admission().is_lost());
-        assert!(a.admits() && b.admits(), "the tenants still hold the ID their connections carry");
+        assert!(!a.is_lost() && !b.is_lost(), "the tenants still hold the ID their connections carry");
+        assert!(!a.admits() && !b.admits(), "no new connection while the process holds no lease");
         assert_eq!(process_kills.load(Ordering::SeqCst), 0);
         system.expired.store(false, Ordering::SeqCst);
         let fresh = id + 1;
@@ -1178,7 +1221,7 @@ mod tests {
         let (etcd, tenant, syncer, mut state) = reserved_tenant(&process, "multi", &receive);
         let registered = registry(&tenant);
         let id = tenant.id();
-        let routed = tenant.admission_ticket(id).expect("routing admits");
+        let routed = tenant.admission_ticket(id, process.greeting().unwrap()).expect("routing admits");
         expire(&etcd);
         state.tick(clock.next(), &syncer, &receive);
         assert!(routed.register(|| registered.lock().unwrap().push(1)).is_none());
@@ -1188,13 +1231,13 @@ mod tests {
         assert!(routed.register(|| registered.lock().unwrap().push(1)).is_none(), "a drain came in between");
         assert!(registered.lock().unwrap().is_empty());
         // A connection routed now registers.
-        let fresh = tenant.admission_ticket(id).expect("routing admits again");
+        let fresh = tenant.admission_ticket(id, process.greeting().unwrap()).expect("routing admits again");
         assert!(fresh.register(|| registered.lock().unwrap().push(2)).is_some());
         assert_eq!(*registered.lock().unwrap(), [2]);
 
         // A loss that starts while a registration runs waits for it, then
         // retires what it registered.
-        let ticket = tenant.admission_ticket(id).unwrap();
+        let ticket = tenant.admission_ticket(id, process.greeting().unwrap()).unwrap();
         let loser = tenant.clone();
         let seen = registered.clone();
         let mut drain = None;
@@ -1220,6 +1263,7 @@ mod tests {
         let (_send, receive) = mpsc::channel();
         let (_etcd, tenant, syncer, mut state) = reserved_tenant(&process, "multi", &receive);
         let greeted = process.id();
+        let greeting = process.greeting().unwrap();
         expire(&system);
         process_state.tick(clock.next(), &process_syncer, &receive);
         system.expired.store(false, Ordering::SeqCst);
@@ -1229,7 +1273,73 @@ mod tests {
         state.tick(clock.next(), &syncer, &receive);
         assert!(tenant.admits());
         assert_eq!(tenant.id(), fresh);
-        assert!(tenant.admission_ticket(greeted).is_none(), "greeted with the old ID");
-        assert!(tenant.admission_ticket(fresh).is_some());
+        assert!(tenant.admission_ticket(greeted, greeting).is_none(), "greeted with the old ID");
+        assert!(tenant.admission_ticket(fresh, process.greeting().unwrap()).is_some());
+    }
+
+    /// SYSTEM loses its lease after a connection was greeted and routed,
+    /// while the process still shows the old number and the tenant still
+    /// holds it: the greeted connection does not register. Once SYSTEM holds
+    /// the same number again, a connection greeted before the loss is still
+    /// refused (its greeting is stale), and one greeted after it registers.
+    #[test]
+    fn a_system_loss_refuses_a_connection_greeted_before_it() {
+        let mut clock = Clock::default();
+        let system = Arc::new(Etcd::default());
+        let (process, mut process_state, process_syncer) = process_reservation(&system);
+        let (_send, receive) = mpsc::channel();
+        let (_etcd, tenant, _syncer, _state) = reserved_tenant(&process, "multi", &receive);
+        let registered = registry(&tenant);
+        let id = process.id();
+        let greeting = process.greeting().expect("the process greets");
+        let routed = tenant.admission_ticket(id, greeting).expect("routing admits");
+        let before_loss = process.greeting().unwrap();
+
+        expire(&system);
+        process_state.tick(clock.next(), &process_syncer, &receive);
+        assert!(process.is_lost() && !tenant.is_lost());
+        assert_eq!(process.id(), id, "the loss keeps the number");
+        assert!(process.greeting().is_none(), "no greeting while the lease is lost");
+        assert!(routed.register(|| registered.lock().unwrap().push(1)).is_none(), "registered after SYSTEM's loss");
+        assert!(tenant.admission_ticket(id, before_loss).is_none(), "routed after SYSTEM's loss");
+
+        // SYSTEM holds the same number again; the tenant never moved.
+        system.expired.store(false, Ordering::SeqCst);
+        force_candidates(&[id]);
+        process_state.tick(clock.next(), &process_syncer, &receive);
+        assert!(!process.is_lost());
+        assert_eq!((process.id(), tenant.id()), (id, id));
+        assert!(routed.register(|| registered.lock().unwrap().push(1)).is_none(), "the routed connection's greeting is stale");
+        assert!(tenant.admission_ticket(id, before_loss).is_none(), "a stale greeting routes");
+        let fresh = tenant.admission_ticket(id, process.greeting().unwrap()).expect("a fresh greeting routes");
+        assert!(fresh.register(|| registered.lock().unwrap().push(2)).is_some());
+        assert_eq!(*registered.lock().unwrap(), [2]);
+    }
+
+    /// A SYSTEM loss that starts while a registration runs waits for it: the
+    /// registration either completes before the loss or does not happen.
+    #[test]
+    fn a_system_loss_waits_for_a_running_registration() {
+        let system = Arc::new(Etcd::default());
+        let (process, _process_state, _) = process_reservation(&system);
+        let (_send, receive) = mpsc::channel();
+        let (_etcd, tenant, _syncer, _state) = reserved_tenant(&process, "multi", &receive);
+        let id = process.id();
+        let ticket = tenant.admission_ticket(id, process.greeting().unwrap()).unwrap();
+        let loser = process.clone();
+        let lost_during = Arc::new(AtomicBool::new(false));
+        let seen = lost_during.clone();
+        let mut loss = None;
+        ticket
+            .register(|| {
+                loss = Some(std::thread::spawn(move || loser.mark_lost()));
+                std::thread::sleep(Duration::from_millis(50));
+                seen.store(process.is_lost(), Ordering::SeqCst);
+            })
+            .expect("admitted before the loss");
+        loss.unwrap().join().unwrap();
+        assert!(!lost_during.load(Ordering::SeqCst), "the loss did not wait for the registration");
+        assert!(process.is_lost());
+        assert!(ticket.register(|| ()).is_none());
     }
 }
