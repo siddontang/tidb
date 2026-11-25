@@ -2,34 +2,46 @@
 """Live GC gate for two tenants of one multi-keyspace node (design §9, §6.5).
 
 A read transaction held open in tenant A must hold back A's GC safe point
-and only A's:
+and only A's. The evidence is the GC safe point PD stores for each
+keyspace (keyspace-level GC: what the GC job's AdvanceGCSafePoint
+publishes, `/pd/<cluster>/keyspaces/gc_safe_point/<keyspace id>` in PD's
+etcd), compared with the reader's full start TSO. The `mysql.tidb` GC rows
+are written before a job runs, so they prove nothing.
 
 1. A and B each get a table with original rows. A's reader begins a
-   transaction and reads them; its start TS is recorded.
-2. Both tenants then overwrite and delete those rows (old versions for GC
-   to remove) and run a DDL, so no other node's report is held back by
-   a schema older than the reader.
-3. The script waits until GC has run in both keyspaces at least
-   `tidb_gc_life_time` after the reader began (keyspace-level GC; the
-   minimum life time and run interval are 10m, so this takes about 25
-   minutes), and checks:
-   - B's GC safe point passed the reader's start TS;
-   - A's GC ran when its life time alone would have passed the reader,
-     and A's safe point did not pass the reader's start TS;
-   - the reader still reads the original rows.
+   transaction, reads them, and records its start TSO.
+2. Both tenants overwrite and delete those rows (old versions for GC to
+   remove). Every two minutes each tenant runs a DDL, so no node's report
+   (an older node's stays at its keyspace's last DDL) holds a keyspace
+   back before the reader.
+3. While the reader is open, on every poll A's PD safe point must not pass
+   the reader's TSO. The gate waits until:
+   - B's PD safe point moved past the reader's TSO (a B job completed);
+   - A's PD safe point moved in a poll that began after A's TSO minus its
+     configured `tidb_gc_life_time` (plus a margin) had passed the reader:
+     a job completed when the life time alone would have passed the reader,
+     so only the reader held A back.
+   Then the reader must still read its original rows.
+4. The reader rolls back; A's PD safe point must pass the same TSO within
+   `tidb_gc_run_interval` plus a margin.
 
-Run with PyMySQL against a multi-keyspace node serving both tenants.
-Environment: TIDB_MULTI_KEYSPACE_DEV_ROOT_PASSWORD (required, never
-printed); TIDB_TEST_HOST / TIDB_TEST_PORT (default 127.0.0.1:4002);
+Each wait fails the gate with the step that timed out. Run with PyMySQL
+against a multi-keyspace node serving both tenants. Environment:
+TIDB_MULTI_KEYSPACE_DEV_ROOT_PASSWORD (required, never printed);
+TIDB_TEST_HOST / TIDB_TEST_PORT (default 127.0.0.1:4002);
 TIDB_TEST_TENANT_A / TIDB_TEST_TENANT_B (default keyspace1 / keyspace2);
-GC_GATE_TIMEOUT seconds (default 2400). Each run uses and drops its own
+PD_ADDR (default 127.0.0.1:2379). With the minimum 10m life time and run
+interval it takes about 35 minutes. Each run uses and drops its own
 databases.
 """
 
-import datetime
+import base64
+import json
 import os
+import re
 import sys
 import time
+import urllib.request
 import uuid
 
 import pymysql
@@ -38,7 +50,42 @@ HOST = os.getenv("TIDB_TEST_HOST", "127.0.0.1")
 PORT = int(os.getenv("TIDB_TEST_PORT", "4002"))
 TENANT_A = os.getenv("TIDB_TEST_TENANT_A", "keyspace1")
 TENANT_B = os.getenv("TIDB_TEST_TENANT_B", "keyspace2")
-TIMEOUT = int(os.getenv("GC_GATE_TIMEOUT", "2400"))
+PD = os.getenv("PD_ADDR", "127.0.0.1:2379")
+POLL = 30
+DDL_EVERY = 120
+# A GC job computes its safe point at its start and publishes it at its
+# end; a poll that began this long after the life time passed the reader
+# only sees jobs that computed after it.
+JOB_MARGIN_MS = 60_000
+
+
+class GateFailed(Exception):
+    pass
+
+
+def http_json(url, body=None):
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.load(resp)
+
+
+def pd_safe_point(cluster_id, keyspace_id):
+    """The keyspace's GC safe point as PD stores it (0 before any)."""
+    key = "/pd/%d/keyspaces/gc_safe_point/%08d" % (cluster_id, keyspace_id)
+    resp = http_json("http://%s/v3/kv/range" % PD, {"key": base64.b64encode(key.encode()).decode()})
+    for kv in resp.get("kvs", []):
+        if base64.b64decode(kv["key"]).decode() == key:
+            return int(json.loads(base64.b64decode(kv["value"]))["safe_point"])
+    return 0
+
+
+def go_duration_ms(text):
+    units = {"h": 3_600_000, "m": 60_000, "s": 1000, "ms": 1}
+    parts = re.findall(r"(\d+(?:\.\d+)?)(ms|h|m|s)", text)
+    if not parts:
+        raise ValueError("not a Go duration: %r" % text)
+    return int(sum(float(value) * units[unit] for value, unit in parts))
 
 
 def connect(tenant):
@@ -53,98 +100,156 @@ def one(cursor, sql):
     return row[0] if row else None
 
 
-def physical_ms(ts):
+def current_tso(cursor):
+    cursor.execute("BEGIN")
+    try:
+        return int(one(cursor, "SELECT @@tidb_current_ts"))
+    finally:
+        cursor.execute("ROLLBACK")
+
+
+def ms(ts):
     return ts >> 18
 
 
-def gc_time_ms(value):
-    """mysql.tidb's GC times, Go's `20060102-15:04:05.000 -0700`."""
-    if not value:
-        return None
-    return int(datetime.datetime.strptime(value, "%Y%m%d-%H:%M:%S.%f %z").timestamp() * 1000)
+def clock(ts):
+    return time.strftime("%H:%M:%S", time.localtime(ms(ts) / 1000)) + ".%03d" % (ms(ts) % 1000)
 
 
-def gc_state(cursor):
-    cursor.execute("SELECT variable_name, variable_value FROM mysql.tidb WHERE variable_name IN "
-                   "('tikv_gc_safe_point', 'tikv_gc_last_run_time', 'tikv_gc_life_time', 'tikv_gc_enable')")
-    return dict(cursor.fetchall())
+class Gate:
+    def __init__(self):
+        self.schema = "gc_gate_" + uuid.uuid4().hex[:12]
+        self.cluster = int(http_json("http://%s/pd/api/v1/cluster" % PD)["id"])
+        self.ids = {t: int(http_json("http://%s/pd/api/v2/keyspaces/%s" % (PD, t))["id"]) for t in (TENANT_A, TENANT_B)}
+        self.admin = {t: connect(t).cursor() for t in (TENANT_A, TENANT_B)}
+        self.life_ms = go_duration_ms(one(self.admin[TENANT_A], "SELECT @@global.tidb_gc_life_time"))
+        self.interval_ms = go_duration_ms(one(self.admin[TENANT_A], "SELECT @@global.tidb_gc_run_interval"))
+        self.last_ddl = 0
+        self.ddl_seq = 0
+        self.reader = None
 
+    def safe_points(self):
+        return {t: pd_safe_point(self.cluster, self.ids[t]) for t in (TENANT_A, TENANT_B)}
 
-def stamp(ms):
-    return datetime.datetime.fromtimestamp(ms / 1000).strftime("%H:%M:%S.%f")[:-3] if ms else "-"
+    def ddl_tick(self):
+        if time.time() - self.last_ddl < DDL_EVERY:
+            return
+        self.last_ddl = time.time()
+        self.ddl_seq += 1
+        for cursor in self.admin.values():
+            cursor.execute("CREATE TABLE %s.tick_%d (a INT)" % (self.schema, self.ddl_seq))
+            if self.ddl_seq > 1:
+                cursor.execute("DROP TABLE %s.tick_%d" % (self.schema, self.ddl_seq - 1))
+
+    def setup(self):
+        for cursor in self.admin.values():
+            cursor.execute("CREATE DATABASE " + self.schema)
+            cursor.execute("CREATE TABLE %s.t (id INT PRIMARY KEY, v VARCHAR(16))" % self.schema)
+            cursor.execute("INSERT INTO %s.t VALUES (1, 'original'), (2, 'original')" % self.schema)
+        self.reader = connect(TENANT_A).cursor()
+        self.reader.execute("BEGIN")
+        self.reader.execute("SELECT id, v FROM %s.t ORDER BY id" % self.schema)
+        self.original = self.reader.fetchall()
+        self.start = int(one(self.reader, "SELECT @@tidb_current_ts"))
+        for cursor in self.admin.values():
+            cursor.execute("UPDATE %s.t SET v = 'overwritten' WHERE id = 1" % self.schema)
+            cursor.execute("DELETE FROM %s.t WHERE id = 2" % self.schema)
+        self.ddl_tick()
+
+    def hold(self):
+        """Phase 3: the reader is open; returns the evidence for both."""
+        deadline = time.time() + (self.life_ms + 2 * self.interval_ms) / 1000 + 300
+        points = self.safe_points()
+        print("PD safe points at the reader's start: A %d, B %d" % (points[TENANT_A], points[TENANT_B]), flush=True)
+        a_prev, b_done, a_done = points[TENANT_A], None, None
+        poll_started = current_tso(self.admin[TENANT_A])
+        while time.time() < deadline:
+            time.sleep(POLL)
+            self.reader.execute("SELECT 1")
+            self.reader.fetchall()
+            self.ddl_tick()
+            points = self.safe_points()
+            a_now = current_tso(self.admin[TENANT_A])
+            a, b = points[TENANT_A], points[TENANT_B]
+            if a > self.start:
+                raise GateFailed("A's PD safe point %d passed its open reader %d" % (a, self.start))
+            if b > self.start and b_done is None:
+                b_done = (b, a_now)
+                print("  B's PD safe point %d (%s) passed the reader" % (b, clock(b)), flush=True)
+            # The poll began after A's TSO minus its life time passed the
+            # reader by the job margin: a job seen completing now computed
+            # its safe point when the life time alone would have passed
+            # the reader.
+            life_passed = ms(poll_started) - self.life_ms - JOB_MARGIN_MS > ms(self.start)
+            if a != a_prev:
+                print("  A's PD safe point moved %d -> %d (%s); life time passed the reader before this poll: %s"
+                      % (a_prev, a, clock(a), life_passed), flush=True)
+                if life_passed and a_done is None:
+                    a_done = (a, poll_started)
+            a_prev = a
+            if b_done and a_done:
+                return b_done, a_done
+            poll_started = a_now
+        missing = [what for what, done in (("B's GC completing past the reader", b_done),
+                                           ("A's GC completing after its life time passed the reader", a_done)) if not done]
+        raise GateFailed("timed out waiting for " + " and ".join(missing))
+
+    def release(self):
+        """Phase 4: after the reader rolls back, A's PD safe point passes it."""
+        self.reader.execute("ROLLBACK")
+        self.reader = None
+        deadline = time.time() + self.interval_ms / 1000 + 300
+        while time.time() < deadline:
+            time.sleep(POLL)
+            self.ddl_tick()
+            a = self.safe_points()[TENANT_A]
+            if a > self.start:
+                return a
+        raise GateFailed("A's PD safe point did not pass the released reader within the run interval")
+
+    def cleanup(self):
+        if self.reader is not None:
+            try:
+                self.reader.execute("ROLLBACK")
+            except pymysql.err.MySQLError:
+                pass
+        for cursor in self.admin.values():
+            try:
+                cursor.execute("DROP DATABASE IF EXISTS " + self.schema)
+            except pymysql.err.MySQLError:
+                pass
 
 
 def main():
     if not os.getenv("TIDB_MULTI_KEYSPACE_DEV_ROOT_PASSWORD"):
         sys.exit("TIDB_MULTI_KEYSPACE_DEV_ROOT_PASSWORD is required")
-    schema = "gc_gate_" + uuid.uuid4().hex[:12]
-    admin = {tenant: connect(tenant).cursor() for tenant in (TENANT_A, TENANT_B)}
-    for tenant, cursor in admin.items():
-        state = gc_state(cursor)
-        print("%s: GC enable %s, life time %s" % (tenant, state.get("tikv_gc_enable"), state.get("tikv_gc_life_time")))
-        cursor.execute("CREATE DATABASE " + schema)
-        cursor.execute("CREATE TABLE %s.t (id INT PRIMARY KEY, v VARCHAR(16))" % schema)
-        cursor.execute("INSERT INTO %s.t VALUES (1, 'original'), (2, 'original')" % schema)
-    reader = connect(TENANT_A).cursor()
-    reader.execute("BEGIN")
-    reader.execute("SELECT id, v FROM %s.t ORDER BY id" % schema)
-    original = reader.fetchall()
-    start_ts = int(one(reader, "SELECT @@tidb_current_ts"))
-    start_ms = physical_ms(start_ts)
-    print("A's reader start ts %d (%s), reads %s" % (start_ts, stamp(start_ms), original))
-    for tenant, cursor in admin.items():
-        cursor.execute("UPDATE %s.t SET v = 'overwritten' WHERE id = 1" % schema)
-        cursor.execute("DELETE FROM %s.t WHERE id = 2" % schema)
-        cursor.execute("CREATE TABLE %s.after_reader (a INT)" % schema)
-    failures = []
-    deadline = time.time() + TIMEOUT
-    last = None
+    gate = Gate()
+    print("A=%s (keyspace %d), B=%s (keyspace %d); A's GC life time %dms, run interval %dms"
+          % (TENANT_A, gate.ids[TENANT_A], TENANT_B, gate.ids[TENANT_B], gate.life_ms, gate.interval_ms), flush=True)
     try:
-        while time.time() < deadline:
-            states = {tenant: gc_state(cursor) for tenant, cursor in admin.items()}
-            view = tuple((states[t].get("tikv_gc_safe_point"), states[t].get("tikv_gc_last_run_time")) for t in admin)
-            if view != last:
-                for tenant in admin:
-                    print("  %s: safe point %s, last run %s" % (tenant, states[tenant].get("tikv_gc_safe_point"),
-                                                              states[tenant].get("tikv_gc_last_run_time")), flush=True)
-                last = view
-            b_safe = gc_time_ms(states[TENANT_B].get("tikv_gc_safe_point"))
-            a_run = gc_time_ms(states[TENANT_A].get("tikv_gc_last_run_time"))
-            # A's GC ran when a ten-minute life time alone would have put
-            # its safe point past the reader.
-            a_ran_past = a_run is not None and a_run > start_ms + 10 * 60 * 1000 + 30_000
-            if b_safe is not None and b_safe > start_ms and a_ran_past:
-                break
-            # The reader keeps its transaction alive.
-            reader.execute("SELECT 1")
-            reader.fetchall()
-            time.sleep(30)
-        else:
-            failures.append("GC did not run past the reader in both keyspaces within %ds" % TIMEOUT)
-        states = {tenant: gc_state(cursor) for tenant, cursor in admin.items()}
-        a_safe = gc_time_ms(states[TENANT_A].get("tikv_gc_safe_point"))
-        b_safe = gc_time_ms(states[TENANT_B].get("tikv_gc_safe_point"))
-        print("reader start %s; A's safe point %s; B's safe point %s" % (stamp(start_ms), stamp(a_safe), stamp(b_safe)))
-        if not (b_safe and b_safe > start_ms):
-            failures.append("B's safe point did not pass A's reader")
-        if not (a_safe and a_safe <= start_ms):
-            failures.append("A's safe point passed its open reader")
-        reader.execute("SELECT id, v FROM %s.t ORDER BY id" % schema)
-        still = reader.fetchall()
-        print("A's reader reads %s after both GCs" % (still,))
-        if still != original:
-            failures.append("A's reader lost its rows: %s" % (still,))
+        gate.setup()
+        print("A's reader start TSO %d (%s), reads %s" % (gate.start, clock(gate.start), gate.original), flush=True)
+        (b, b_seen), (a, a_seen) = gate.hold()
+        print("PASS B's PD safe point %d (%s) > reader %d" % (b, clock(b), gate.start))
+        print("PASS A's PD safe point %d (%s) <= reader %d, set by a job that completed after A's TSO %d (%s) minus "
+              "its %dms life time was already %dms past the reader"
+              % (a, clock(a), gate.start, a_seen, clock(a_seen), gate.life_ms,
+                 ms(a_seen) - gate.life_ms - ms(gate.start)))
+        gate.reader.execute("SELECT id, v FROM %s.t ORDER BY id" % gate.schema)
+        still = gate.reader.fetchall()
+        if still != gate.original:
+            raise GateFailed("A's reader lost its rows after both GCs: %s" % (still,))
+        print("PASS A's reader still reads %s after both GCs" % (still,))
+        released = gate.release()
+        print("PASS after the reader rolled back, A's PD safe point %d (%s) > reader %d"
+              % (released, clock(released), gate.start))
+    except GateFailed as failure:
+        print("FAIL " + str(failure))
+        print("FAILED")
+        sys.exit(1)
     finally:
-        try:
-            reader.execute("ROLLBACK")
-        except pymysql.err.MySQLError:
-            pass
-        for cursor in admin.values():
-            cursor.execute("DROP DATABASE IF EXISTS " + schema)
-    for failure in failures:
-        print("FAIL " + failure)
-    print("PASS" if not failures else "FAILED")
-    sys.exit(1 if failures else 0)
+        gate.cleanup()
+    print("PASS")
 
 
 if __name__ == "__main__":

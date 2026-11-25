@@ -1242,18 +1242,25 @@ Moving it into the `Domain` is preferred, because it closes with the tenant.
   cursor kept past its transaction does not know its store, so it holds a
   shared entry that every report reads (as a single-keyspace node does).
 - **Live GC gate** (`rust/scripts/multi-tenant-gc-gate.py`, passed on the
-  development playground). A read transaction held open in `keyspace1`
-  (start 14:31:17.610), with both tenants' rows overwritten and deleted
-  after it: `keyspace1`'s GC ran at 14:43:10, when its 10-minute life
-  time alone would have passed the reader, and set its safe point to the
-  reader's start TS exactly; `keyspace2`'s GC set 14:31:18.260, past the
-  reader; the reader still read its original rows after both. Before the
-  per-keyspace report, `keyspace2`'s safe point could not have passed the
-  reader. `keyspace2`'s did not advance further on that run: the
-  playground's own node (an older build) also serves it, and its report
-  stayed at `keyspace2`'s last DDL. That is the upstream stale-schema
-  report, fixed by `CatalogFollower` following the schema timestamp a
-  reload refreshes (not only its version); the GC gate needs no more.
+  development playground). Its evidence is the GC safe point PD stores for
+  each keyspace (keyspace-level GC: `/pd/<cluster>/keyspaces/gc_safe_point/
+  <keyspace id>`, what a completed GC job's `AdvanceGCSafePoint`
+  publishes), against the reader's full start TSO; the `mysql.tidb` GC rows
+  are written before a job runs and prove nothing. A read transaction held
+  open in `keyspace1` started at TSO 470704065376157703 (15:58:31.109),
+  after which both tenants' rows were overwritten and deleted, and each
+  tenant ran a DDL every two minutes (so the playground's older node,
+  which also serves both keyspaces and reports its keyspace's last DDL,
+  holds neither keyspace back before the reader). Then:
+  - `keyspace2`'s PD safe point moved to 470704097214857216 (16:00:32.564),
+    past the reader;
+  - `keyspace1`'s PD safe point moved to 470704065376157703, the reader's
+    TSO exactly, in a poll that began at 16:11:46.316, when `keyspace1`'s
+    TSO minus its 10m life time was already 195s past the reader: only the
+    reader held it back; it never passed the reader while it was open;
+  - the reader still read its original rows after both;
+  - after the reader rolled back, `keyspace1`'s PD safe point moved to
+    470704252523642880 (16:10:25.020), past it.
 - `DEFAULT_RESOURCE_GROUP` (`tidb-meta/src/transaction.rs:59`) moves per runtime.
   **Not needed:** it only memoizes Go's `DefaultGroupMeta4Test`, an
   immutable value that is the same in every keyspace; each keyspace's own
