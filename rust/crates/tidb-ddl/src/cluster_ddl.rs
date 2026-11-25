@@ -3153,19 +3153,20 @@ fn plan_persisted_ddl_job_with<S: MetaSnapshot>(
     }
     // Go `transitOneJobStep` -> `prepareTxn`'s `attachTopProfilingInfo`:
     // every step, finishing ones included, runs under the job's SQL.
-    crate::job_ctx::attach_top_profiling_info(active.job.id, &active.job.query.to_utf8_lossy_go());
+    let job_key = schema_state.worker.job_key(active.job.id);
+    crate::job_ctx::attach_top_profiling_info(job_key, &active.job.query.to_utf8_lossy_go());
     if let Some(step_kv_context) = &schema_state.step_kv_context {
         // Go `prepareTxn`: `setDDLSourceForDiagnosis`, then the
         // transaction's `kv.RequestSourceType` and `kv.ResourceGroupTagger`.
-        let source_type = crate::job_ctx::set_ddl_source_for_diagnosis(active.job.id, active.job.type_);
+        let source_type = crate::job_ctx::set_ddl_source_for_diagnosis(job_key, active.job.type_);
         step_kv_context.publish(tidb_txnkv::StatementKvContext {
             resource_group_tagger: crate::job_ctx::get_resource_group_tagger_for_top_sql(
-                active.job.id,
+                job_key,
                 schema_state.keyspace.as_ref(),
             ),
             request_source_type: Some(source_type),
             resource_group_name: Some(crate::job_ctx::job_resource_group_name(
-                active.job.id,
+                job_key,
                 active
                     .job
                     .reorg_meta

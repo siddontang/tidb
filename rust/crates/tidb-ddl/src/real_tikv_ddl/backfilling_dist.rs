@@ -254,7 +254,7 @@ fn generate_read_index_plan<S: StoreClient>(
         let range = reorg_transaction(
             &ddl.opener,
             ddl.timeout,
-            &crate::job_ctx::backfill_request_source(reorg.job_id),
+            &crate::job_ctx::backfill_request_source(crate::job_ctx::JobKey::new(ddl.opener.keyspace_id(), reorg.job_id)),
             |_, snapshot, buffer, _| {
                 Ok((
                     table_range(backfiller.as_ref(), reorg, *id, snapshot, buffer)?,
@@ -1413,11 +1413,9 @@ impl<S: StoreClient> tidb_dxf_taskexecutor::Extension for BackfillDistExecutor<S
         }
         match task.base.step {
             BACKFILL_STEP_READ_INDEX => {
-                crate::job_ctx::attach_top_profiling_info(
-                    meta.job.id,
-                    &meta.job.query.to_utf8_lossy_go(),
-                );
-                crate::job_ctx::set_ddl_source_for_diagnosis(meta.job.id, meta.job.type_);
+                let job_key = crate::job_ctx::JobKey::new(self.ddl.opener.keyspace_id(), meta.job.id);
+                crate::job_ctx::attach_top_profiling_info(job_key, &meta.job.query.to_utf8_lossy_go());
+                crate::job_ctx::set_ddl_source_for_diagnosis(job_key, meta.job.type_);
                 Ok(Arc::new(ReadIndexStepExecutor {
                     info: FrameworkInfoSlot::default(),
                     exec_id: self.base.get_exec_id().to_owned(),
@@ -1882,6 +1880,7 @@ mod cloud_storage_uri_tests {
     fn test_resolve_cloud_storage_uri() {
         let original = tidb_vardef::CLOUD_STORAGE_URI.read().unwrap().clone();
         const JOB_ID: i64 = 900001;
+        const KEY: crate::job_ctx::JobKey = crate::job_ctx::JobKey::new(u32::MAX, JOB_ID);
         let new_job = |use_cloud_storage: bool| {
             let mut meta = tidb_model::DDLReorgMeta::default();
             meta.use_cloud_storage = use_cloud_storage;
@@ -1892,21 +1891,21 @@ mod cloud_storage_uri_tests {
         };
         let set_uri = |uri: &str| *tidb_vardef::CLOUD_STORAGE_URI.write().unwrap() = uri.to_owned();
         let with_cache = |uri: &str| {
-            crate::job_ctx::remove_job_ctx(JOB_ID);
-            crate::job_ctx::with_job_ctx(JOB_ID, |jc| jc.cloud_storage_uri = uri.to_owned());
+            crate::job_ctx::remove_job_ctx(KEY);
+            crate::job_ctx::with_job_ctx(KEY, |jc| jc.cloud_storage_uri = uri.to_owned());
         };
 
         // A configured URI recovers an empty owner cache.
         set_uri("s3://bucket");
         with_cache("");
-        let uri = resolve_cloud_storage_uri(&new_job(true), false).unwrap();
+        let uri = resolve_cloud_storage_uri(KEY, &new_job(true), false).unwrap();
         assert_eq!(uri, "s3://bucket/dxf/");
-        assert_eq!(crate::job_ctx::with_job_ctx(JOB_ID, |jc| jc.cloud_storage_uri.clone()), uri);
+        assert_eq!(crate::job_ctx::with_job_ctx(KEY, |jc| jc.cloud_storage_uri.clone()), uri);
 
         // A missing configured URI is unretryable.
         set_uri("");
         with_cache("");
-        let Err(ClusterDdlError::Backfill(error)) = resolve_cloud_storage_uri(&new_job(true), false) else {
+        let Err(ClusterDdlError::Backfill(error)) = resolve_cloud_storage_uri(KEY, &new_job(true), false) else {
             panic!("an empty URI fails the job");
         };
         assert!(
@@ -1918,18 +1917,18 @@ mod cloud_storage_uri_tests {
         // The cached URI wins over a changed configuration.
         set_uri("s3://new-bucket");
         with_cache("s3://cached-bucket/dxf/");
-        assert_eq!(resolve_cloud_storage_uri(&new_job(true), false).unwrap(), "s3://cached-bucket/dxf/");
+        assert_eq!(resolve_cloud_storage_uri(KEY, &new_job(true), false).unwrap(), "s3://cached-bucket/dxf/");
 
         // Local sort permits an empty URI.
         set_uri("");
         with_cache("");
-        assert_eq!(resolve_cloud_storage_uri(&new_job(false), false).unwrap(), "");
+        assert_eq!(resolve_cloud_storage_uri(KEY, &new_job(false), false).unwrap(), "");
 
         // Merge temp index does not require cloud storage.
         with_cache("");
-        assert_eq!(resolve_cloud_storage_uri(&new_job(true), true).unwrap(), "");
+        assert_eq!(resolve_cloud_storage_uri(KEY, &new_job(true), true).unwrap(), "");
 
-        crate::job_ctx::remove_job_ctx(JOB_ID);
+        crate::job_ctx::remove_job_ctx(KEY);
         set_uri(&original);
     }
 }
@@ -2024,8 +2023,12 @@ impl tidb_dxf_execute::Collector for DistTaskRowCntCollector {
 /// in the job context, reloaded when a new DDL owner resumes the job. An
 /// empty URI fails the job: recovering needs the user to restore it, and
 /// retrying would leave the job in write reorganization.
-pub(crate) fn resolve_cloud_storage_uri(job: &Job, merge_temp_index: bool) -> Result<String, ClusterDdlError> {
-    let cached = crate::job_ctx::with_job_ctx(job.id, |jc| jc.cloud_storage_uri.clone());
+pub(crate) fn resolve_cloud_storage_uri(
+    job_key: crate::job_ctx::JobKey,
+    job: &Job,
+    merge_temp_index: bool,
+) -> Result<String, ClusterDdlError> {
+    let cached = crate::job_ctx::with_job_ctx(job_key, |jc| jc.cloud_storage_uri.clone());
     if merge_temp_index
         || !job.reorg_meta.as_ref().is_some_and(|meta| meta.read().use_cloud_storage)
         || !cached.is_empty()
@@ -2033,7 +2036,7 @@ pub(crate) fn resolve_cloud_storage_uri(job: &Job, merge_temp_index: bool) -> Re
         return Ok(cached);
     }
     let cloud_storage_uri = tidb_dxf_handle::get_cloud_storage_uri(tidb_dxf_handle::cluster_id());
-    crate::job_ctx::with_job_ctx(job.id, |jc| jc.cloud_storage_uri = cloud_storage_uri.clone());
+    crate::job_ctx::with_job_ctx(job_key, |jc| jc.cloud_storage_uri = cloud_storage_uri.clone());
     if cloud_storage_uri.is_empty() {
         return Err(ClusterDdlError::backfill(&tidb_dbterror::ERR_INGEST_FAILED.gen_with_stack_by_args(&[format!(
             "cloud storage URI is empty for add-index job {} with cloud storage enabled",
@@ -2105,7 +2108,11 @@ pub(super) fn execute_dist_task<S: StoreClient>(
                     sess_pool,
                     reorg.table.id,
                 ) as _,
-                cloud_storage_uri: resolve_cloud_storage_uri(job, reorg.merging)?,
+                cloud_storage_uri: resolve_cloud_storage_uri(
+                    crate::job_ctx::JobKey::new(opener.keyspace_id(), job.id),
+                    job,
+                    reorg.merging,
+                )?,
                 version: crate::backfilling_dist_executor::BACKFILL_TASK_META_VERSION_1,
                 ..Default::default()
             };

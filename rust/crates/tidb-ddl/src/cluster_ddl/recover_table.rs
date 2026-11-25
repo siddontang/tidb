@@ -60,6 +60,11 @@ pub struct DdlStepWorker {
 }
 
 impl DdlStepWorker {
+    /// Job `job_id`'s key in the process: its DDL's keyspace and the job.
+    pub(crate) fn job_key(&self, job_id: i64) -> crate::job_ctx::JobKey {
+        crate::job_ctx::JobKey::new(self.sess_pool.keyspace_id(), job_id)
+    }
+
     /// Go `w.sess.GetAdvisoryLock(name, timeout)`: a lock this delivery
     /// already holds is held again.
     pub fn get_advisory_lock(

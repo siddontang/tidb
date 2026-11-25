@@ -446,7 +446,7 @@ impl<S: StoreClient + 'static> Worker<TableScanTask, IndexRecordChunk, OperatorE
             panic!("mock panic");
         });
         crate::job_ctx::attach_top_profiling_info(
-            self.scan.reorg.job_id,
+            crate::job_ctx::JobKey::new(self.scan.opener.keyspace_id(), self.scan.reorg.job_id),
             &self.scan.reorg.query.to_utf8_lossy_go(),
         );
         if self.se.is_none() {
@@ -538,7 +538,7 @@ impl<S: StoreClient + 'static> TableScanWorker<S> {
         let result = reorg_transaction_at(
             &scan.opener,
             scan.timeout,
-            &crate::job_ctx::backfill_request_source(scan.reorg.job_id),
+            &crate::job_ctx::backfill_request_source(crate::job_ctx::JobKey::new(scan.opener.keyspace_id(), scan.reorg.job_id)),
             start_ts,
             |_, snapshot, buffer, _| {
                 let result = (|| {
@@ -745,7 +745,7 @@ impl<S: StoreClient + 'static> Worker<IndexRecordChunk, IndexWriteResult, Operat
     ) -> Result<(), OperatorError> {
         tidb_failpoint::inject_call("github.com/pingcap/tidb/pkg/ddl/mockIndexIngestWorkerFault", &mut ());
         crate::job_ctx::attach_top_profiling_info(
-            self.scan.reorg.job_id,
+            crate::job_ctx::JobKey::new(self.scan.opener.keyspace_id(), self.scan.reorg.job_id),
             &self.scan.reorg.query.to_utf8_lossy_go(),
         );
         let bytes = self.write_chunk(&chunk)?;

@@ -46,20 +46,20 @@ fn default_analyze_check_interval() -> Duration {
 
 use crate::job_ctx::with_job_ctx;
 
-fn get_analyze_start_time(job_id: i64) -> Option<Instant> {
-    with_job_ctx(job_id, |ctx| ctx.analyze_start_time)
+fn get_analyze_start_time(job: crate::job_ctx::JobKey) -> Option<Instant> {
+    with_job_ctx(job, |ctx| ctx.analyze_start_time)
 }
 
-fn set_analyze_start_time(job_id: i64, t: Instant) {
-    with_job_ctx(job_id, |ctx| ctx.analyze_start_time = Some(t));
+fn set_analyze_start_time(job: crate::job_ctx::JobKey, t: Instant) {
+    with_job_ctx(job, |ctx| ctx.analyze_start_time = Some(t));
 }
 
-fn clear_analyze_start_time(job_id: i64) {
-    with_job_ctx(job_id, |ctx| ctx.analyze_start_time = None);
+fn clear_analyze_start_time(job: crate::job_ctx::JobKey) {
+    with_job_ctx(job, |ctx| ctx.analyze_start_time = None);
 }
 
-fn clear_analyze_cumulative_timeout(job_id: i64) {
-    with_job_ctx(job_id, |ctx| ctx.analyze_cumulative_timeout = None);
+fn clear_analyze_cumulative_timeout(job: crate::job_ctx::JobKey) {
+    with_job_ctx(job, |ctx| ctx.analyze_cumulative_timeout = None);
 }
 
 
@@ -170,9 +170,10 @@ fn analyze_table_inner(
     db_name: &str,
 ) -> (bool, bool, bool) {
     let pool = txn.session().pool;
+    let job_key = txn.job_key(job.id);
     let tbl_name = tbl_info.name.lowercase().to_owned();
     let mut cumulative_timeout =
-        match with_job_ctx(job.id, |ctx| ctx.analyze_cumulative_timeout) {
+        match with_job_ctx(job_key, |ctx| ctx.analyze_cumulative_timeout) {
             Some(timeout) => timeout,
             None => {
                 let mut timeout = default_cumulative_timeout();
@@ -185,12 +186,12 @@ fn analyze_table_inner(
                         timeout = elapsed * 2;
                     }
                 }
-                with_job_ctx(job.id, |ctx| ctx.analyze_cumulative_timeout = Some(timeout));
+                with_job_ctx(job_key, |ctx| ctx.analyze_cumulative_timeout = Some(timeout));
                 timeout
             }
         };
 
-    let has_done_ch = with_job_ctx(job.id, |ctx| ctx.analyze_done.is_some());
+    let has_done_ch = with_job_ctx(job_key, |ctx| ctx.analyze_done.is_some());
     if !has_done_ch {
         let status = match query_analyze_status_since(pool.as_ref(), job.start_ts, db_name, &tbl_name) {
             Ok(status) => status,
@@ -207,7 +208,7 @@ fn analyze_table_inner(
         };
 
         let (done, timed_out, failed, proceed) =
-            analyze_status_decision(job, db_name, &tbl_name, status, cumulative_timeout);
+            analyze_status_decision(job, job_key, db_name, &tbl_name, status, cumulative_timeout);
         if done || timed_out || failed {
             return (done, timed_out, failed);
         }
@@ -217,8 +218,8 @@ fn analyze_table_inner(
             return (false, false, false);
         }
 
-        if get_analyze_start_time(job.id).is_none() {
-            set_analyze_start_time(job.id, Instant::now());
+        if get_analyze_start_time(job_key).is_none() {
+            set_analyze_start_time(job_key, Instant::now());
         }
 
         // A channel the analyze thread can always report an error into
@@ -267,32 +268,32 @@ fn analyze_table_inner(
                 let _ = done_tx.send(Some(error.message));
             }
         }));
-        with_job_ctx(job.id, |ctx| ctx.analyze_done = Some(done_rx));
+        with_job_ctx(job_key, |ctx| ctx.analyze_done = Some(done_rx));
     }
-    let done_ch = with_job_ctx(job.id, |ctx| ctx.analyze_done.take())
+    let done_ch = with_job_ctx(job_key, |ctx| ctx.analyze_done.take())
         .expect("the analyze done channel is set");
     match done_ch.recv_timeout(default_analyze_check_interval()) {
         Ok(error) => {
             tidb_ddl_logutil::ddl_logger()
                 .info("analyze table after create index done", &[Field::new("jobID", Value::I64(job.id))]);
-            clear_analyze_start_time(job.id);
-            clear_analyze_cumulative_timeout(job.id);
+            clear_analyze_start_time(job_key);
+            clear_analyze_cumulative_timeout(job_key);
             (true, false, error.is_some())
         }
         // Go reads nil from the closed channel.
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             tidb_ddl_logutil::ddl_logger()
                 .info("analyze table after create index done", &[Field::new("jobID", Value::I64(job.id))]);
-            clear_analyze_start_time(job.id);
-            clear_analyze_cumulative_timeout(job.id);
+            clear_analyze_start_time(job_key);
+            clear_analyze_cumulative_timeout(job_key);
             (true, false, false)
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            with_job_ctx(job.id, |ctx| ctx.analyze_done = Some(done_ch));
+            with_job_ctx(job_key, |ctx| ctx.analyze_done = Some(done_ch));
             if let Some(timeout) = mock_analyze_timeout() {
                 cumulative_timeout = timeout;
             }
-            if let Some(start) = get_analyze_start_time(job.id) {
+            if let Some(start) = get_analyze_start_time(job_key) {
                 if start.elapsed() > cumulative_timeout {
                     tidb_ddl_logutil::ddl_logger().warn(
                         "analyze table after create index exceed cumulative timeout, proceeding to finish DDL",
@@ -302,12 +303,12 @@ fn analyze_table_inner(
                         ],
                     );
                     // Do not persist job here. Let the caller mark AnalyzeStateTimeout and persist.
-                    clear_analyze_start_time(job.id);
-                    clear_analyze_cumulative_timeout(job.id);
+                    clear_analyze_start_time(job_key);
+                    clear_analyze_cumulative_timeout(job_key);
                     return (false, true, false);
                 }
             } else {
-                set_analyze_start_time(job.id, Instant::now());
+                set_analyze_start_time(job_key, Instant::now());
             }
             (false, false, false)
         }
@@ -387,6 +388,7 @@ fn query_analyze_status_since(
 /// Go `analyzeStatusDecision`: `(done, timedOut, failed, proceed)`.
 fn analyze_status_decision(
     job: &Job,
+    job_key: crate::job_ctx::JobKey,
     db_name: &str,
     tbl_name: &str,
     status: AnalyzeStatus,
@@ -403,8 +405,8 @@ fn analyze_status_decision(
     match status {
         AnalyzeStatus::Finished => {
             logger.info("analyze already finished by other owner", &table_fields());
-            clear_analyze_start_time(job.id);
-            clear_analyze_cumulative_timeout(job.id);
+            clear_analyze_start_time(job_key);
+            clear_analyze_cumulative_timeout(job_key);
             (true, false, false, false)
         }
         AnalyzeStatus::Failed => {
@@ -412,13 +414,13 @@ fn analyze_status_decision(
                 "analyze previously failed on another owner, continue finishing DDL",
                 &table_fields(),
             );
-            clear_analyze_start_time(job.id);
-            clear_analyze_cumulative_timeout(job.id);
+            clear_analyze_start_time(job_key);
+            clear_analyze_cumulative_timeout(job_key);
             (true, false, true, false)
         }
         AnalyzeStatus::Running => {
             // If analyze is running, respect cumulative timeout. If expired, return timeout to let caller proceed.
-            if let Some(start) = get_analyze_start_time(job.id) {
+            if let Some(start) = get_analyze_start_time(job_key) {
                 if start.elapsed() > cumulative_timeout {
                     logger.warn(
                         "analyze table is running but exceeded cumulative timeout, proceeding to finish DDL",
@@ -427,12 +429,12 @@ fn analyze_status_decision(
                             Field::new("elapsed", Value::Duration(start.elapsed().as_nanos() as i64)),
                         ],
                     );
-                    clear_analyze_start_time(job.id);
-                    clear_analyze_cumulative_timeout(job.id);
+                    clear_analyze_start_time(job_key);
+                    clear_analyze_cumulative_timeout(job_key);
                     return (false, true, false, false);
                 }
             } else {
-                set_analyze_start_time(job.id, Instant::now());
+                set_analyze_start_time(job_key, Instant::now());
             }
             std::thread::sleep(default_analyze_check_interval());
             (false, false, false, false)

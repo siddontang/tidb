@@ -59,6 +59,11 @@ impl<'a> JobTxn<'a> {
         }
     }
 
+    /// Job `job_id`'s key in the process: its DDL's keyspace and the job.
+    pub(crate) fn job_key(&self, job_id: i64) -> crate::job_ctx::JobKey {
+        crate::job_ctx::JobKey::new(self.session.pool.keyspace_id(), job_id)
+    }
+
     /// The step's region store (see [`Self::region_store`]).
     #[must_use]
     pub fn with_region_store(
@@ -384,6 +389,10 @@ pub(crate) fn unused_step_session(start_mode: crate::StartMode) -> StepSession {
     struct UnusedPool;
 
     impl tidb_ddl_build::session_pool::DdlSessionPool for UnusedPool {
+        fn keyspace_id(&self) -> u32 {
+            u32::MAX
+        }
+
         fn system_session(&self) -> Box<dyn tidb_ddl_build::session_context::DdlSessionContext> {
             unreachable!("the test's step runs no statement")
         }

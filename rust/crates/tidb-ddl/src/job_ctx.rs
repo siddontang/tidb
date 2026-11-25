@@ -126,19 +126,36 @@ impl ReorgContext {
     }
 }
 
-/// Go `ddlCtx.jobCtx.jobCtxMap`.
-static JOB_CTX_MAP: LazyLock<Mutex<HashMap<i64, ReorgContext>>> = LazyLock::new(Mutex::default);
+/// A job's key in the process. Job IDs are per keyspace, so on a node
+/// serving several keyspaces two tenants' jobs share IDs (design §6.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct JobKey {
+    /// The keyspace ID of the store the job's DDL runs on (`u32::MAX` for
+    /// an API-V1 store).
+    keyspace_id: u32,
+    job_id: i64,
+}
+
+impl JobKey {
+    pub(crate) const fn new(keyspace_id: u32, job_id: i64) -> Self {
+        Self { keyspace_id, job_id }
+    }
+}
+
+/// Go `ddlCtx.jobCtx.jobCtxMap`: Go's is the DDL's own; this process-wide
+/// map is keyed by keyspace and job.
+static JOB_CTX_MAP: LazyLock<Mutex<HashMap<JobKey, ReorgContext>>> = LazyLock::new(Mutex::default);
 
 /// The job's context, created on first use as Go's setters do
 /// (`NewReorgContext`).
-pub(crate) fn with_job_ctx<T>(job_id: i64, f: impl FnOnce(&mut ReorgContext) -> T) -> T {
+pub(crate) fn with_job_ctx<T>(job: JobKey, f: impl FnOnce(&mut ReorgContext) -> T) -> T {
     let mut map = JOB_CTX_MAP.lock().unwrap_or_else(PoisonError::into_inner);
-    f(map.entry(job_id).or_default())
+    f(map.entry(job).or_default())
 }
 
 /// Go `ddlCtx.attachTopProfilingInfo`.
-pub(crate) fn attach_top_profiling_info(job_id: i64, job_query: &str) {
-    with_job_ctx(job_id, |ctx| ctx.attach_top_profiling_info(job_query));
+pub(crate) fn attach_top_profiling_info(job: JobKey, job_query: &str) {
+    with_job_ctx(job, |ctx| ctx.attach_top_profiling_info(job_query));
 }
 
 /// Go `checkIfTableReorgWorkCanSkip` / `checkIfTempIndexReorgWorkCanSkip`:
@@ -150,8 +167,8 @@ pub(crate) fn attach_reorg_skip_check(job_query: &str) {
 
 /// Go `ddlCtx.setDDLSourceForDiagnosis`, returning Go `ddlJobSourceType`:
 /// the request source the job's step transaction carries.
-pub(crate) fn set_ddl_source_for_diagnosis(job_id: i64, job_type: ActionType) -> String {
-    with_job_ctx(job_id, |ctx| {
+pub(crate) fn set_ddl_source_for_diagnosis(job: JobKey, job_type: ActionType) -> String {
+    with_job_ctx(job, |ctx| {
         ctx.set_ddl_label_for_diagnosis(job_type);
         ctx.tp.clone()
     })
@@ -171,14 +188,14 @@ pub(crate) fn internal_ddl_source() -> tidb_txnkv::RequestSource {
 /// Go `kv.WithInternalSourceAndTaskType(ctx, jobContext.ddlJobSourceType(),
 /// kvutil.ExplicitTypeDDL)`: the source of the job's backfill reads and
 /// writes (`BackfillData`, `GetRangeEndKey`, `getTableRange`).
-pub(crate) fn backfill_request_source(job_id: i64) -> tidb_txnkv::RequestSource {
+pub(crate) fn backfill_request_source(job: JobKey) -> tidb_txnkv::RequestSource {
     tidb_txnkv::RequestSource {
         internal: true,
         // Go `ddlCtx.jobContext(jobID).ddlJobSourceType()`.
         source_type: JOB_CTX_MAP
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&job_id)
+            .get(&job)
             .map(|ctx| ctx.tp.clone())
             .unwrap_or_default(),
         explicit_source_type: tikv_client::util::EXPLICIT_TYPE_DDL.to_owned(),
@@ -188,9 +205,9 @@ pub(crate) fn backfill_request_source(job_id: i64) -> tidb_txnkv::RequestSource 
 /// Go `ddlCtx.jobContext(jobID, reorgMeta).resourceGroupName`: the job's
 /// context's group, which a context without one takes from the job's reorg
 /// meta.
-pub(crate) fn job_resource_group_name(job_id: i64, reorg_meta_group: Option<&str>) -> String {
+pub(crate) fn job_resource_group_name(job: JobKey, reorg_meta_group: Option<&str>) -> String {
     let mut map = JOB_CTX_MAP.lock().unwrap_or_else(PoisonError::into_inner);
-    match map.get_mut(&job_id) {
+    match map.get_mut(&job) {
         Some(ctx) => {
             if let (Some(group), true) = (reorg_meta_group, ctx.resource_group_name.is_empty()) {
                 group.clone_into(&mut ctx.resource_group_name);
@@ -206,7 +223,7 @@ pub(crate) fn job_resource_group_name(job_id: i64, reorg_meta_group: Option<&str
 /// job (Go `keyspace.GetKeyspaceNameBytesBySettings()`); `None` is the
 /// process's configured keyspace.
 pub(crate) fn get_resource_group_tagger_for_top_sql(
-    job_id: i64,
+    job: JobKey,
     keyspace: Option<&std::sync::Arc<tidb_keyspace::KeyspaceContext>>,
 ) -> Option<tidb_txnkv::StatementResourceGroupTagger> {
     let keyspace = keyspace.map_or_else(
@@ -216,38 +233,61 @@ pub(crate) fn get_resource_group_tagger_for_top_sql(
     JOB_CTX_MAP
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .get(&job_id)
+        .get(&job)
         .and_then(|ctx| ctx.get_resource_group_tagger_for_top_sql(keyspace))
 }
 
 /// Go `removeJobCtx`: the job is done with its context.
-pub(crate) fn remove_job_ctx(job_id: i64) {
+pub(crate) fn remove_job_ctx(job: JobKey) {
     JOB_CTX_MAP
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .remove(&job_id);
+        .remove(&job);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn key(job_id: i64) -> JobKey {
+        JobKey::new(u32::MAX, job_id)
+    }
+
+    /// Design §6.4: two keyspaces' jobs with the same ID keep contexts of
+    /// their own: one's request source, resource group and removal leave
+    /// the other's alone.
+    #[test]
+    fn jobs_of_two_keyspaces_with_one_id_keep_their_own_contexts() {
+        let (a, b) = (JobKey::new(1, 9_200), JobKey::new(101, 9_200));
+        assert_eq!(set_ddl_source_for_diagnosis(a, ActionType::ACTION_ADD_INDEX), "ddl_add_index");
+        assert_eq!(set_ddl_source_for_diagnosis(b, ActionType::ACTION_REORGANIZE_PARTITION), "ddl_reorganize_partition");
+        assert_eq!(job_resource_group_name(a, Some("rg_a")), "rg_a");
+        assert_eq!(job_resource_group_name(b, Some("rg_b")), "rg_b");
+        assert_eq!(backfill_request_source(a).source_type, "ddl_add_index");
+        assert_eq!(backfill_request_source(b).source_type, "ddl_reorganize_partition");
+        remove_job_ctx(a);
+        assert_eq!(backfill_request_source(a).source_type, "");
+        assert_eq!(backfill_request_source(b).source_type, "ddl_reorganize_partition");
+        assert_eq!(job_resource_group_name(b, None), "rg_b");
+        remove_job_ctx(b);
+    }
+
     /// Go `getDDLRequestSource` / `setDDLLabelForDiagnosis`: a backfilling
     /// job's requests carry `ddl_<backfiller>`, any other `ddl`, and the
     /// first step fixes it.
     #[test]
     fn a_jobs_request_source_names_its_backfill() {
-        assert_eq!(set_ddl_source_for_diagnosis(9_100, ActionType::ACTION_ADD_INDEX), "ddl_add_index");
-        assert_eq!(set_ddl_source_for_diagnosis(9_100, ActionType::ACTION_CREATE_TABLE), "ddl_add_index");
+        assert_eq!(set_ddl_source_for_diagnosis(key(9_100), ActionType::ACTION_ADD_INDEX), "ddl_add_index");
+        assert_eq!(set_ddl_source_for_diagnosis(key(9_100), ActionType::ACTION_CREATE_TABLE), "ddl_add_index");
         assert_eq!(
-            set_ddl_source_for_diagnosis(9_101, ActionType::ACTION_REORGANIZE_PARTITION),
+            set_ddl_source_for_diagnosis(key(9_101), ActionType::ACTION_REORGANIZE_PARTITION),
             "ddl_reorganize_partition"
         );
-        assert_eq!(set_ddl_source_for_diagnosis(9_102, ActionType::ACTION_CREATE_TABLE), "ddl");
+        assert_eq!(set_ddl_source_for_diagnosis(key(9_102), ActionType::ACTION_CREATE_TABLE), "ddl");
         // Go `WithInternalSourceAndTaskType(ctx, ddlJobSourceType(),
         // ExplicitTypeDDL)` for the job's backfill.
         assert_eq!(
-            backfill_request_source(9_100),
+            backfill_request_source(key(9_100)),
             tidb_txnkv::RequestSource {
                 internal: true,
                 source_type: "ddl_add_index".to_owned(),
@@ -256,12 +296,12 @@ mod tests {
         );
         // Go `jobContext(jobID, reorgMeta)`: a context without a group takes
         // the reorg meta's, and keeps it.
-        assert_eq!(job_resource_group_name(9_100, Some("rg1")), "rg1");
-        assert_eq!(job_resource_group_name(9_100, Some("rg2")), "rg1");
-        assert_eq!(job_resource_group_name(9_103, Some("rg3")), "rg3");
-        assert_eq!(job_resource_group_name(9_103, None), "");
+        assert_eq!(job_resource_group_name(key(9_100), Some("rg1")), "rg1");
+        assert_eq!(job_resource_group_name(key(9_100), Some("rg2")), "rg1");
+        assert_eq!(job_resource_group_name(key(9_103), Some("rg3")), "rg3");
+        assert_eq!(job_resource_group_name(key(9_103), None), "");
         for job_id in [9_100, 9_101, 9_102] {
-            remove_job_ctx(job_id);
+            remove_job_ctx(key(job_id));
         }
     }
 
@@ -275,7 +315,7 @@ mod tests {
     /// query changes and reusing the cached one otherwise.
     #[test]
     fn attach_labels_the_thread_with_the_jobs_sql_digest() {
-        let job_id = 9_001;
+        let job_id = key(9_001);
         std::thread::spawn(move || {
             tidb_topsql_state::disable_top_sql();
             attach_top_profiling_info(job_id, "ALTER TABLE t ADD INDEX i (a)");

@@ -70,8 +70,8 @@ pub(super) enum TableRecordOutcome {
 
 /// What [`write_physical_table_record`] runs its tasks with.
 pub(super) struct BackfillExecutor<'a> {
-    /// Go `job.ID`.
-    pub job_id: i64,
+    /// Go `job.ID`, with its DDL's keyspace.
+    pub job: crate::job_ctx::JobKey,
     /// Go `job.Query`.
     pub job_query: &'a str,
     /// Go `jobCtx.store`'s region cache; `None` is Go's non-TiKV storage.
@@ -412,7 +412,7 @@ pub(super) fn write_physical_table_record(
                     let Ok(task) = task_rx.recv() else {
                         return;
                     };
-                    crate::job_ctx::attach_top_profiling_info(exec.job_id, exec.job_query);
+                    crate::job_ctx::attach_top_profiling_info(exec.job, exec.job_query);
                     if tidb_failpoint::eval("github.com/pingcap/tidb/pkg/ddl/mockBackfillRunErr").is_some() && id == 0 {
                         let result = BackfillResult {
                             task_id: task.id,
@@ -702,7 +702,7 @@ mod tests {
         let updates = Mutex::new(Vec::new());
         let update = |key: &[u8]| updates.lock().unwrap().push(key.to_vec());
         let exec = BackfillExecutor {
-            job_id: 7,
+            job: crate::job_ctx::JobKey::new(u32::MAX, 7),
             job_query: "ALTER TABLE t ADD INDEX i (a)",
             region_store: Some(&Regions),
             physical_id: 1,
@@ -800,7 +800,7 @@ mod tests {
         let range_end = |_: &[u8], end: &[u8]| Ok(end.to_vec());
         let update = |_: &[u8]| {};
         let exec = BackfillExecutor {
-            job_id: 7,
+            job: crate::job_ctx::JobKey::new(u32::MAX, 7),
             job_query: "",
             region_store: Some(&Regions),
             physical_id: 1,

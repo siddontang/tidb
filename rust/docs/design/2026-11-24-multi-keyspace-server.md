@@ -747,7 +747,7 @@ operator listener exists, Op means node config.
 | Schema meta (meta keys, schema version, global IDs) | TS | SQL (DDL) | Isolated: the store is opened with the keyspace's API v2 codec. `GLOBAL_ID_MUTEX` is a process lock (contention only). | `tidb-server/src/cluster_stack.rs:114`; `tidb-txnkv/src/driver/tikv_store.rs:158`; `tidb-meta/src/transaction.rs:52` | — |
 | Infoschema cache, schema lease, schema-version sync | RT | SQL (DDL) | Isolated: one loader per runtime; schema sync on the tenant's etcd; the validator keeps its keyspace's `tidb_max_delta_schema_count` of deltas. | `cluster_stack.rs:799,970` | — |
 | DDL job queue and history, DDL owner | TS + tenant etcd | SQL | Isolated: owner managers are keyed by keyspace. A job's reorganization reads its keyspace's vardef values on every thread it spawns. | `tidb-ddl/src/owner_mgr.rs:16`; `tidb-ddl/src/real_tikv_ddl.rs` (job scope) | — |
-| `JOB_CTX_MAP` (reorg contexts by job ID) | P | — | Shared: job IDs collide across tenants. | `tidb-ddl/src/job_ctx.rs:130` | 3d |
+| `JOB_CTX_MAP` (reorg contexts by job ID) | P | — | Isolated: keyed by keyspace and job ID (`JobKey`). | `tidb-ddl/src/job_ctx.rs` | — |
 | `JOB_VER_IN_USE`, `GLOBAL_INDEX_V1_SUPPORTED` | P | Each tenant's DDL version check | Shared: the last tenant's DDL worker sets the value for every tenant. | `tidb-model/src/job_enums.rs:210`; `tidb-model/src/index.rs:84`; `tidb-ddl/src/worker.rs:700,784` | 3d (§6.4) |
 | MDL (`mysql.tidb_mdl_info`, schema pins) | TS + RT | — | Isolated: pins per domain. Next-generation kernels always lock, so `ENABLE_MDL` is an instance setting. | vardef appendix | — |
 | Accounts (`mysql.user`, `db`, `tables_priv`, roles, `global_priv`, password history) | TS | SQL | Isolated: privileges per domain, privilege watch on the tenant's etcd, username policy per runtime. Users without a prefix route to the configured keyspace. | `tidb-server/src/keyspace_registry.rs` (`route`) | Prefix-less users: Phase 2 (Q2) |
@@ -795,8 +795,7 @@ operator listener exists, Op means node config.
 - GC: a statement result or cursor kept past its transaction holds back
   every tenant's reported min-start-ts (conservative, §6.5).
 - DDL: a peer on an old version in one tenant's fleet sets the job version
-  for every tenant on the node; reorganization contexts collide when job IDs
-  overlap (3d).
+  for every tenant on the node (3d).
 - Statistics: with overlapping table IDs, one tenant's async statistics
   loader drains another tenant's load demand (3d).
 - Diagnostics (§6.8): what has no keyspace-correct source is refused or
@@ -1218,9 +1217,12 @@ Table and job IDs are per keyspace, so these caches collide across tenants:
 - the auto-analyze process ID generator (`auto_analyze_proc_id_generator.rs:101`).
   **Done in Phase 2** (§6.6, step 6): IDs come from the one process
   allocator, so they are unique in the process.
-- `JOB_CTX_MAP` (`tidb-ddl/src/job_ctx.rs:129`). **Open:** its twenty-odd
-  callers name only the job ID; each needs its runtime's DDL (or the
-  keyspace) passed down to key it by `(keyspace_id, job_id)`.
+- `JOB_CTX_MAP` (`tidb-ddl/src/job_ctx.rs:129`). **Done:** keyed by
+  `JobKey` (the keyspace ID of the store the DDL runs on, and the job ID).
+  Go's map is the DDL's own; its callers here reach no DDL handle, so each
+  names its keyspace from what it has: the step's session pool
+  (`DdlSessionPool::keyspace_id`, through `DdlStepWorker::job_key` and
+  `JobTxn::job_key`) or the reorganization's transaction opener.
 - `JOB_VER_IN_USE` and `GLOBAL_INDEX_V1_SUPPORTED` (`tidb-model/src/job_enums.rs:210`,
   `tidb-model/src/index.rs:84`): derived from each tenant's server-info
   versions, so they belong to the tenant's DDL, not the process. **Open:**

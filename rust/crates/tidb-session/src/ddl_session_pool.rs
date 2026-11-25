@@ -336,6 +336,11 @@ impl DdlSessionPool for NodeDdlSessionPool {
         self.sess_pool.get().cloned()
     }
 
+    /// The domain's store's; before the pool is bound, the API-V1 value.
+    fn keyspace_id(&self) -> u32 {
+        self.domain.get().and_then(Weak::upgrade).map_or(u32::MAX, |domain| domain.keyspace_id())
+    }
+
     fn vardef(&self) -> Option<Arc<tidb_vardef::VardefSnapshot>> {
         self.domain.get().and_then(Weak::upgrade).map(|domain| domain.vardef())
     }
@@ -589,6 +594,11 @@ impl tidb_sqlexec::RestrictedSqlExecutor for CrossKsRestrictedSql {
 impl DdlSessionPool for CrossKsDdlSessionPool {
     fn sess_pool(&self) -> Option<Arc<tidb_ddl_session::DynPool>> {
         Some(Arc::clone(&self.sess_pool))
+    }
+
+    /// The target keyspace's store's.
+    fn keyspace_id(&self) -> u32 {
+        self.resources.target.transactions.keyspace_id()
     }
 
     /// A fresh statement of a default session.

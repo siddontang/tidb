@@ -253,6 +253,14 @@ impl Domain {
         }
     }
 
+    /// Go `Domain.Store().GetCodec().GetKeyspaceID()` (`u32::MAX` for an
+    /// API-V1 store): what the domain's process-wide state is keyed by
+    /// beside its own IDs (design §6.4).
+    #[must_use]
+    pub fn keyspace_id(&self) -> u32 {
+        self.transactions.keyspace_id()
+    }
+
     /// Pins snapshot timestamp `ts` against this domain's keyspace's GC
     /// (its min-start-ts report) until the guard drops (design §6.5).
     #[must_use]

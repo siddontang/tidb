@@ -115,6 +115,11 @@ pub trait DdlSessionPool: Send + Sync {
         None
     }
 
+    /// The keyspace ID of the store the DDL runs on (`u32::MAX` for an
+    /// API-V1 store). Job IDs are per keyspace: what the DDL keys by job
+    /// in the process it keys by this too (design §6.4).
+    fn keyspace_id(&self) -> u32;
+
     /// The keyspace values of the vardef global statics the DDL runs with
     /// (multi-keyspace design §6.3): its domain's. `None` where no node is
     /// bound, which reads the process statics.

@@ -1175,7 +1175,7 @@ fn transit_one_job_step_and_wait_sync<S: StoreClient>(
                 // session notified (`jobCtx.notifyDone`); `cleanMDLInfo`
                 // follows in `transitOneJobStepAndWaitSync`.
                 // Go `removeJobCtx`: the job context goes with the job.
-                crate::job_ctx::remove_job_ctx(ddl_job_id);
+                crate::job_ctx::remove_job_ctx(schema_state.worker.job_key(ddl_job_id));
                 if let Err(error) = add_index_reorg::clean_ddl_reorg_handles(
                     schema_state.worker.sess_pool.as_ref(),
                     ddl_job_id,
