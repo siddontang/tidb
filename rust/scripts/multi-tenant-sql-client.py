@@ -5,12 +5,16 @@ Run directly with PyMySQL installed. Set TIDB_MULTI_KEYSPACE_DEV_ROOT_PASSWORD
 to the test password for both accounts. TIDB_TEST_HOST / TIDB_TEST_PORT select
 the listener. TIDB_TEST_TENANT_A / TIDB_TEST_TENANT_B select the keyspaces.
 TIDB_TEST_PD selects the PD whose keyspace-qualified objects the PD cases read.
+The PD cases run DDL in both tenants and need each tenant's DDL owner to make
+the PD writes; they compare PD's rule ranges byte for byte. `--self-test` runs
+the offline checks of those guards over recorded responses.
 Each case creates and removes its own databases. Use dedicated development
 tenants with similar DDL histories for the physical table-ID collision case.
 """
 
 import json
 import os
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -19,7 +23,10 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
-import pymysql
+try:
+    import pymysql
+except ImportError:  # --self-test needs no driver
+    pymysql = None
 
 
 class TenantSQLTests(unittest.TestCase):
@@ -432,48 +439,31 @@ class TenantSQLTests(unittest.TestCase):
     def keyspace_id(self, tenant):
         return self.pd_get("/pd/api/v2/keyspaces/" + urllib.parse.quote(tenant))["id"]
 
-    def execute_through_split(self, cursor, sql, done):
-        """Runs DDL that puts a PD rule over a tenant's table. PD then splits
-        the tenant's regions at the rule's bounds, and a read that meets the
-        split can fail to decode the new region's bounds ("invalid marker
-        byte"; the client and the playground's TiKV, not the rule): the
-        statement fails while its job finishes, which `done` observes."""
-        try:
-            cursor.execute(sql)
-        except pymysql.err.OperationalError as error:
-            if error.args[0] != 1105 or "invalid marker byte" not in error.args[1]:
-                raise
-            for _ in range(50):
-                if done():
-                    return
-                time.sleep(0.2)
-            raise
+    def ddl_owner(self, cursor):
+        """The address of the tenant's DDL owner (ADMIN SHOW DDL)."""
+        cursor.execute("ADMIN SHOW DDL")
+        return cursor.fetchone()[2]
 
-    def ddl_owned_here(self):
-        """The tenants whose DDL owner is this node. A tenant's job steps
-        write PD on its DDL owner, which may be another node of the fleet
-        (the playground's older multi-keyspace node refuses them)."""
-        here = "%s:%s" % (os.getenv("TIDB_TEST_HOST", "127.0.0.1"), os.getenv("TIDB_TEST_PORT", "4000"))
-        owned = []
-        for index, cursor in enumerate(self.clients):
-            cursor.execute("ADMIN SHOW DDL")
-            if cursor.fetchone()[2] == here:
-                owned.append(index)
-        if not owned:
-            self.skipTest("this node owns neither tenant's DDL")
-        return owned
+    def run_pd_ddl(self, index, sql, owners):
+        """Runs DDL that writes PD in tenant `index` until it succeeds, and
+        records the tenant's DDL owner, whose job step made the PD write."""
+        cursor = self.clients[index]
+        owners[self.tenants[index]] = self.ddl_owner(cursor)
+        run_ddl_until_success(cursor.execute, sql)
 
     def test_resource_groups_are_tenant_local(self):
-        """Phase 3b: the tenants whose DDL this node owns create a group of
-        the same name; PD keeps it under each one's keyspace, and no other
-        tenant reads it."""
-        owned = self.ddl_owned_here()
+        """Phase 3b: both tenants create a group of the same name, each on
+        its own DDL owner; PD keeps it under each one's keyspace, and no
+        other tenant reads it."""
         name = "rg_" + uuid.uuid4().hex[:12]
-        for index in owned:
-            self.clients[index].execute("CREATE RESOURCE GROUP %s RU_PER_SEC = %d" % (name, 100 * (index + 1)))
-            self.addCleanup(self.clients[index].execute, "DROP RESOURCE GROUP IF EXISTS " + name)
+        owners = {}
+        for index, cursor in enumerate(self.clients):
+            self.addCleanup(cursor.execute, "DROP RESOURCE GROUP IF EXISTS " + name)
+            self.run_pd_ddl(index, "CREATE RESOURCE GROUP IF NOT EXISTS %s RU_PER_SEC = %d"
+                            % (name, 100 * (index + 1)), owners)
+        require_owner_coverage(self.tenants, owners)
         for index, (tenant, cursor) in enumerate(zip(self.tenants, self.clients)):
-            want = [100 * (index + 1)] if index in owned else []
+            want = [100 * (index + 1)]
             cursor.execute("SELECT ru_per_sec FROM information_schema.resource_groups WHERE name = %s", (name,))
             self.assertEqual([int(row[0]) for row in cursor.fetchall()], want, tenant)
             groups = self.pd_get("/resource-manager/api/v1/config/groups?keyspace_name="
@@ -484,76 +474,64 @@ class TenantSQLTests(unittest.TestCase):
 
     def test_attributes_are_tenant_local(self):
         """Phase 3b: the same table gets a label rule in PD per tenant, named
-        and ranged by its keyspace, and each tenant's ATTRIBUTES lists only
-        its own."""
-        owned = self.ddl_owned_here()
+        by its keyspace and ranged over exactly its keyspace's table bytes,
+        and each tenant's ATTRIBUTES lists only its own."""
         options = ("deny", "allow")
-        for index in owned:
-            cursor = self.clients[index]
-            self.execute_through_split(
-                cursor, "ALTER TABLE t ATTRIBUTES = 'merge_option=%s'" % options[index],
-                lambda: self.scalar(cursor, "SELECT COUNT(*) FROM information_schema.attributes WHERE id LIKE %s",
-                                    ("%" + self.schema + "%",)))
-        rule_ids = ["keyspace/%d/schema/%s/t" % (self.keyspace_id(tenant), self.schema) for tenant in self.tenants]
-        try:
-            for index, cursor in enumerate(self.clients):
-                cursor.execute("SELECT id, attributes FROM information_schema.attributes WHERE id LIKE %s",
-                               ("%" + self.schema + "%",))
-                want = (("schema/%s/t" % self.schema, '"merge_option=%s"' % options[index]),) if index in owned else ()
-                self.assertEqual(cursor.fetchall(), want, self.tenants[index])
-            rules = {rule["id"]: rule for rule in self.pd_get("/pd/api/v1/config/region-label/rules")
-                     if self.schema in rule["id"]}
-            self.assertEqual(sorted(rules), sorted(rule_ids[index] for index in owned))
-            for index in owned:
-                labels = rules[rule_ids[index]]["labels"]
-                self.assertIn({"key": "merge_option", "value": options[index]}, labels)
-        finally:
-            for index in owned:
-                self.clients[index].execute("ALTER TABLE t ATTRIBUTES = DEFAULT")
-        remaining = [rule["id"] for rule in self.pd_get("/pd/api/v1/config/region-label/rules")
-                     if self.schema in rule["id"]]
-        self.assertEqual(remaining, [])
+        owners = {}
+        for index, cursor in enumerate(self.clients):
+            self.addCleanup(cursor.execute, "ALTER TABLE t ATTRIBUTES = DEFAULT")
+            self.run_pd_ddl(index, "ALTER TABLE t ATTRIBUTES = 'merge_option=%s'" % options[index], owners)
+        keyspace_ids = [self.keyspace_id(tenant) for tenant in self.tenants]
+        table_ids = [self.scalar(cursor, "SELECT tidb_table_id FROM information_schema.tables "
+                                         "WHERE table_schema = %s AND table_name = 't'", (self.schema,))
+                     for cursor in self.clients]
+        for index, cursor in enumerate(self.clients):
+            cursor.execute("SELECT id, attributes FROM information_schema.attributes WHERE id LIKE %s",
+                           ("%" + self.schema + "%",))
+            self.assertEqual(cursor.fetchall(),
+                             (("schema/%s/t" % self.schema, '"merge_option=%s"' % options[index]),),
+                             self.tenants[index])
+        rules = [rule for rule in self.pd_get("/pd/api/v1/config/region-label/rules") if self.schema in rule["id"]]
+        verify_label_rules(self.tenants, owners, keyspace_ids, table_ids, self.schema, options, rules)
 
     def test_placement_policies_are_tenant_local(self):
         """Phase 3b: both tenants create a policy of the same name and read
-        only their own; ALTER RANGE runs on this node and puts each tenant's
-        range bundle under its keyspace, keyspace-<id>-TiDB_GLOBAL. The
-        tenants whose DDL this node owns attach the policy to a table, whose
-        bundle PD keeps as keyspace-<id>-TiDB_DDL_<table id>."""
+        only their own, and attach it to a table on their own DDL owner,
+        whose bundle PD keeps as keyspace-<id>-TiDB_DDL_<table id> over the
+        table's keyspace bytes. ALTER RANGE global puts each tenant's range
+        bundle under its keyspace, keyspace-<id>-TiDB_GLOBAL, over its whole
+        keyspace; each tenant's previous global policy is put back."""
         name = "pp_" + uuid.uuid4().hex[:12]
-        owned = self.ddl_owned_here()
         bundle = lambda group: self.pd_get("/pd/api/v1/config/placement-rule/" + group)
         ids = [self.keyspace_id(tenant) for tenant in self.tenants]
+        owners = {}
         for index, cursor in enumerate(self.clients):
             cursor.execute("CREATE PLACEMENT POLICY %s FOLLOWERS = %d" % (name, index + 1))
             self.addCleanup(cursor.execute, "DROP PLACEMENT POLICY IF EXISTS " + name)
-        for index in owned:
-            cursor = self.clients[index]
+        # Every tenant's previous global policy goes back, whichever tenant
+        # fails, before any of them changes it.
+        for index, cursor in enumerate(self.clients):
+            previous = range_policy(bundle("keyspace-%d-TiDB_GLOBAL" % ids[index]))
+            self.addCleanup(cursor.execute, "ALTER RANGE global PLACEMENT POLICY " + previous)
+        for index, cursor in enumerate(self.clients):
             self.addCleanup(cursor.execute, "DROP TABLE IF EXISTS tp")
-            table_id = lambda: self.scalar(cursor, "SELECT tidb_table_id FROM information_schema.tables "
-                                                   "WHERE table_schema = %s AND table_name = 'tp'", (self.schema,))
-            self.execute_through_split(cursor, "CREATE TABLE tp (id INT) PLACEMENT POLICY = " + name, table_id)
-            table_id = table_id()
+            self.run_pd_ddl(index, "CREATE TABLE IF NOT EXISTS tp (id INT) PLACEMENT POLICY = " + name, owners)
+        require_owner_coverage(self.tenants, owners)
+        for index, cursor in enumerate(self.clients):
+            table_id = self.scalar(cursor, "SELECT tidb_table_id FROM information_schema.tables "
+                                           "WHERE table_schema = %s AND table_name = 'tp'", (self.schema,))
             group = "keyspace-%d-TiDB_DDL_%d" % (ids[index], table_id)
-            rules = bundle(group)["rules"]
-            self.assertEqual({rule["group_id"] for rule in rules}, {group})
-            self.assertEqual(sum(rule["count"] for rule in rules), index + 2)
+            verify_bundle(bundle(group), group, index + 2, table_range(ids[index], table_id))
         for index, cursor in enumerate(self.clients):
             self.assertEqual(self.scalar(cursor, "SELECT followers FROM information_schema.placement_policies "
                                                  "WHERE policy_name = %s", (name,)), index + 1)
             cursor.execute("ALTER RANGE global PLACEMENT POLICY " + name)
-        try:
-            for index, cursor in enumerate(self.clients):
-                rules = bundle("keyspace-%d-TiDB_GLOBAL" % ids[index])["rules"]
-                self.assertEqual(sum(rule["count"] for rule in rules), index + 2)
-                cursor.execute("SHOW PLACEMENT")
-                self.assertIn(("RANGE TiDB_GLOBAL", "FOLLOWERS=%d" % (index + 1)),
-                              [row[:2] for row in cursor.fetchall()])
-        finally:
-            for cursor in self.clients:
-                cursor.execute("ALTER RANGE global PLACEMENT POLICY default")
-        for keyspace_id in ids:
-            self.assertFalse(bundle("keyspace-%d-TiDB_GLOBAL" % keyspace_id).get("rules"))
+        for index, cursor in enumerate(self.clients):
+            group = "keyspace-%d-TiDB_GLOBAL" % ids[index]
+            verify_bundle(bundle(group), group, index + 2, keyspace_range(ids[index]))
+            cursor.execute("SHOW PLACEMENT")
+            self.assertIn(("RANGE TiDB_GLOBAL", "FOLLOWERS=%d" % (index + 1)),
+                          [row[:2] for row in cursor.fetchall()])
 
     def test_pd_objects_without_a_keyspace_are_refused(self):
         """TiFlash rules and PD's schedulers and affinity groups are keyed by
@@ -569,5 +547,190 @@ class TenantSQLTests(unittest.TestCase):
                 self.assertEqual(raised.exception.args[0], 1235, sql)
 
 
+def is_split_decode_error(error):
+    """The client-visible error of a read that met a region split whose new
+    bounds it could not decode ("invalid marker byte")."""
+    args = getattr(error, "args", ())
+    return len(args) >= 2 and args[0] == 1105 and "invalid marker byte" in str(args[1])
+
+
+def run_ddl_until_success(execute, sql, attempts=5, interval=1.0):
+    """Runs `sql` (idempotent DDL) until it answers success. A statement that
+    failed with the split decode error is retried; it must still end in a
+    successful response: catalog state that appears after a failed response
+    is not success."""
+    for attempt in range(attempts):
+        try:
+            execute(sql)
+            return
+        except Exception as error:  # pymysql's OperationalError
+            if not is_split_decode_error(error) or attempt == attempts - 1:
+                raise AssertionError("%s did not succeed: %r" % (sql, error))
+            time.sleep(interval)
+
+
+def require_owner_coverage(tenants, owners):
+    """Every tenant's DDL ran on its own DDL owner (`owners`: tenant to the
+    owner that ran it): a case that exercised one tenant's owner only proves
+    nothing about the other's."""
+    missing = [tenant for tenant in tenants if not owners.get(tenant)]
+    if missing:
+        raise AssertionError("no DDL ran on the DDL owner of %s (exercised: %r)" % (missing, owners))
+
+
+def encode_bytes(key):
+    """Go `codec.EncodeBytes`: memcomparable groups of eight bytes."""
+    out = bytearray()
+    for index in range(0, len(key) + 1, 8):
+        group = key[index:index + 8]
+        pad = 8 - len(group)
+        out += group + b"\x00" * pad + bytes([0xFF - pad])
+    return bytes(out)
+
+
+def table_prefix(table_id):
+    """Go `tablecodec.GenTablePrefix`."""
+    return b"t" + ((table_id ^ (1 << 63)) & ((1 << 64) - 1)).to_bytes(8, "big")
+
+
+def keyspace_prefix(keyspace_id):
+    """The API-V2 transaction prefix of a keyspace."""
+    return b"x" + keyspace_id.to_bytes(3, "big")
+
+
+def table_range(keyspace_id, table_id):
+    """The hex region range a keyspace's label rule or table bundle covers
+    (`codec.EncodeRegionRange` of the table prefix up to the next table's)."""
+    prefix = keyspace_prefix(keyspace_id)
+    return (encode_bytes(prefix + table_prefix(table_id)).hex(),
+            encode_bytes(prefix + table_prefix(table_id + 1)).hex())
+
+
+def keyspace_range(keyspace_id):
+    """The hex region range of a whole keyspace (the global range)."""
+    return (encode_bytes(keyspace_prefix(keyspace_id)).hex(),
+            encode_bytes(keyspace_prefix(keyspace_id + 1)).hex())
+
+
+def range_policy(bundle):
+    """The policy a range bundle's first rule names (`<policy>_rule_...`),
+    `default` without one."""
+    rules = (bundle or {}).get("rules") or []
+    rule_id = rules[0]["id"] if rules else ""
+    position = rule_id.rfind("_rule_")
+    return rule_id[:position] if position > 0 else "default"
+
+
+def verify_label_rules(tenants, owners, keyspace_ids, table_ids, schema, options, rules):
+    """PD's label rules of the case: one per tenant, ran on its owner,
+    `keyspace/<id>/schema/<db>/t`, labelled with the tenant's option and
+    ranged over exactly the tenant's table bytes."""
+    require_owner_coverage(tenants, owners)
+    by_id = {rule["id"]: rule for rule in rules}
+    want = {"keyspace/%d/schema/%s/t" % (keyspace_id, schema): index
+            for index, keyspace_id in enumerate(keyspace_ids)}
+    if sorted(by_id) != sorted(want):
+        raise AssertionError("PD's label rules %r, want %r" % (sorted(by_id), sorted(want)))
+    for rule_id, index in want.items():
+        rule = by_id[rule_id]
+        if {"key": "merge_option", "value": options[index]} not in rule.get("labels", []):
+            raise AssertionError("%s labels %r" % (rule_id, rule.get("labels")))
+        ranges = [(item["start_key"], item["end_key"]) for item in rule.get("data") or []]
+        expected = [table_range(keyspace_ids[index], table_ids[index])]
+        if ranges != expected:
+            raise AssertionError("%s ranges %r, want %r" % (rule_id, ranges, expected))
+
+
+def verify_bundle(bundle, group, peers, expected_range):
+    """A bundle of PD's: its rules are the group's, place `peers` peers and
+    range over exactly `expected_range`."""
+    rules = (bundle or {}).get("rules") or []
+    if not rules:
+        raise AssertionError("PD holds no rules under %s" % group)
+    if {rule["group_id"] for rule in rules} != {group}:
+        raise AssertionError("%s rules of groups %r" % (group, {rule["group_id"] for rule in rules}))
+    if sum(rule["count"] for rule in rules) != peers:
+        raise AssertionError("%s places %d peers, want %d" % (group, sum(rule["count"] for rule in rules), peers))
+    for rule in rules:
+        if (rule["start_key"], rule["end_key"]) != expected_range:
+            raise AssertionError("%s rule %s ranges %r, want %r"
+                                 % (group, rule["id"], (rule["start_key"], rule["end_key"]), expected_range))
+
+
+class SelfTests(unittest.TestCase):
+    """Offline checks that the guards reject what must not pass, over
+    recorded responses (`--self-test`; no listener or PD needed)."""
+
+    tenants = ("keyspace1", "keyspace2")
+
+    def test_one_owner_coverage_is_rejected(self):
+        with self.assertRaises(AssertionError):
+            require_owner_coverage(self.tenants, {"keyspace2": "127.0.0.1:4000"})
+        require_owner_coverage(self.tenants, {"keyspace1": "127.0.0.1:4001", "keyspace2": "127.0.0.1:4000"})
+
+    def test_an_accepted_1105_is_rejected(self):
+        class SplitError(Exception):
+            pass
+        def failing(sql):
+            raise SplitError(1105, "invalid marker byte, group bytes \"\\x00\"")
+        with self.assertRaises(AssertionError):
+            run_ddl_until_success(failing, "ALTER TABLE t ATTRIBUTES = 'merge_option=deny'", interval=0)
+        calls = []
+        def flaky(sql):
+            calls.append(sql)
+            if len(calls) == 1:
+                failing(sql)
+        run_ddl_until_success(flaky, "ALTER TABLE t ATTRIBUTES = 'merge_option=deny'", interval=0)
+        self.assertEqual(len(calls), 2)
+
+    def test_a_range_mismatch_is_rejected(self):
+        group = "keyspace-2-TiDB_DDL_120"
+        good = {"rules": [{"id": "table_rule_120_0", "group_id": group, "count": 2,
+                           "start_key": table_range(2, 120)[0], "end_key": table_range(2, 120)[1]}]}
+        verify_bundle(good, group, 2, table_range(2, 120))
+        keyspace_less = {"rules": [dict(good["rules"][0], start_key=encode_bytes(table_prefix(120)).hex(),
+                                        end_key=encode_bytes(table_prefix(121)).hex())]}
+        other_keyspace = {"rules": [dict(good["rules"][0], start_key=table_range(1, 120)[0],
+                                         end_key=table_range(1, 120)[1])]}
+        for bundle in (keyspace_less, other_keyspace, {"rules": []}):
+            with self.assertRaises(AssertionError):
+                verify_bundle(bundle, group, 2, table_range(2, 120))
+
+    def test_the_recorded_vacuous_attributes_run_is_rejected(self):
+        """The run that passed before: one DDL owner exercised (keyspace2's),
+        a client-visible 1105 on keyspace1's ALTER, and PD's rule with an
+        empty range list. Each guard rejects it."""
+        owners = {"keyspace2": "127.0.0.1:4000"}
+        rules = [{"id": "keyspace/2/schema/s/t", "labels": [{"key": "merge_option", "value": "allow"}],
+                  "data": []}]
+        with self.assertRaises(AssertionError):
+            verify_label_rules(self.tenants, owners, [1, 2], [110, 110], "s", ("deny", "allow"), rules)
+        owners["keyspace1"] = "127.0.0.1:4001"
+        with self.assertRaises(AssertionError):
+            verify_label_rules(self.tenants, owners, [1, 2], [110, 110], "s", ("deny", "allow"), rules)
+        def recorded(sql):
+            raise RuntimeError(1105, "invalid marker byte, group bytes")
+        with self.assertRaises(AssertionError):
+            run_ddl_until_success(recorded, "ALTER TABLE t ATTRIBUTES = 'merge_option=deny'", interval=0)
+        complete = [
+            {"id": "keyspace/%d/schema/s/t" % keyspace_id,
+             "labels": [{"key": "merge_option", "value": option}],
+             "data": [dict(zip(("start_key", "end_key"), table_range(keyspace_id, 110)))]}
+            for keyspace_id, option in ((1, "deny"), (2, "allow"))
+        ]
+        verify_label_rules(self.tenants, owners, [1, 2], [110, 110], "s", ("deny", "allow"), complete)
+
+    def test_the_encoding_matches_the_keyspace_codec(self):
+        # tidb-ddl-label's encode_region_range of keyspace 1's table 100.
+        self.assertEqual(encode_bytes(b""), bytes([0] * 8 + [0xF7]))
+        # x 000001 t 8000000000000064, memcomparable in groups of eight.
+        self.assertEqual(table_range(1, 100), ("7800000174800000ff0000000064000000fc",
+                                               "7800000174800000ff0000000065000000fc"))
+        self.assertEqual(keyspace_range(1), (encode_bytes(b"x\x00\x00\x01").hex(), encode_bytes(b"x\x00\x00\x02").hex()))
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.argv.remove("--self-test")
+        unittest.main(defaultTest="SelfTests", verbosity=2)
     unittest.main(verbosity=2)
