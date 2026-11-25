@@ -65,7 +65,22 @@ pub struct FlashbackClusterArgs {
     /// The key ranges the flashback covers.
     #[serde(rename = "key_ranges", default, skip_serializing_if = "ranges_are_empty")]
     pub flashback_key_ranges: Option<Vec<KeyRange>>,
+    /// How far the job got with PD's schedule limits, which only this port
+    /// records (Go has no such field and ignores it): whether the job owns
+    /// the closed limits it restores at the end. Empty for a job whose
+    /// arguments predate the field (or a Go node's).
+    #[serde(rename = "pd_schedule_state", default, skip_serializing_if = "String::is_empty")]
+    pub pd_schedule_state: String,
 }
+
+/// [`FlashbackClusterArgs::pd_schedule_state`]: `pd_schedule_value` holds
+/// the limits read before the job touched them.
+pub const PD_SCHEDULE_SAVED: &str = "saved";
+/// [`FlashbackClusterArgs::pd_schedule_state`]: persisted before the job
+/// asks PD to close its limits. The close may or may not have happened.
+pub const PD_SCHEDULE_CLOSING: &str = "closing";
+/// [`FlashbackClusterArgs::pd_schedule_state`]: PD answered the job's close.
+pub const PD_SCHEDULE_CLOSED: &str = "closed";
 
 const fn is_zero_u64(value: &u64) -> bool {
     *value == 0
@@ -92,7 +107,7 @@ impl JobArgs for FlashbackClusterArgs {
 
     fn get_args_v1(value: Option<&GoShared<Self>>, _job: &Job) -> GoSharedSlice<GoAny> {
         let value = value.expect("nil *FlashbackClusterArgs receiver").read();
-        GoSharedSlice::from_vec(vec![
+        let mut args: Vec<GoAny> = vec![
             ColumnDefaultValue::Uint(value.flashback_ts).into(),
             typed_value_any(
                 builtin_type("map[string]interface {}", GoTypeKind::Map),
@@ -109,7 +124,13 @@ impl JobArgs for FlashbackClusterArgs {
                 builtin_type("[]model.KeyRange", GoTypeKind::Slice),
                 value.flashback_key_ranges.clone(),
             ),
-        ])
+        ];
+        // A trailing argument Go's decoder ignores; absent when empty, so
+        // the list is Go's own.
+        if !value.pd_schedule_state.is_empty() {
+            args.push(ColumnDefaultValue::Str(value.pd_schedule_state.clone().into()).into());
+        }
+        GoSharedSlice::from_vec(args)
     }
 
     fn decode_v1(job: &mut Job) -> Result<Option<GoShared<Self>>, serde_json::Error> {
@@ -126,6 +147,7 @@ impl JobArgs for FlashbackClusterArgs {
         let commit_ts = GoField::<u64>::default();
         let ttl_job_enable_value = GoField::<String>::default();
         let flashback_key_ranges = GoField::<Option<Vec<KeyRange>>>::default();
+        let pd_schedule_state = GoField::<String>::default();
         decoder.decode(&flashback_ts, uint64())?;
         decoder.decode(
             &pd_schedule_value,
@@ -142,6 +164,7 @@ impl JobArgs for FlashbackClusterArgs {
             &flashback_key_ranges,
             builtin_type("[]model.KeyRange", GoTypeKind::Slice),
         )?;
+        decoder.decode(&pd_schedule_state, string())?;
         decoder.finish(job);
         Ok(Some(GoShared::new(Self {
             flashback_ts: flashback_ts.get(),
@@ -154,6 +177,7 @@ impl JobArgs for FlashbackClusterArgs {
             start_ts: start_ts.get(),
             commit_ts: commit_ts.get(),
             flashback_key_ranges: flashback_key_ranges.get(),
+            pd_schedule_state: pd_schedule_state.get(),
         })))
     }
 }

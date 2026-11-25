@@ -342,3 +342,230 @@ fn the_flashback_concurrency_follows_its_global_variable_like_go() {
     exec(session, "set global tidb_ddl_flashback_concurrency = 32");
     assert_eq!(tidb_vardef::get_ddl_flashback_concurrency(), 32);
 }
+
+/// A schedule manager that keeps its configuration and records every write,
+/// installed as the node's until the guard drops.
+#[derive(Debug, Default)]
+struct RecordingScheduleManager {
+    config: Mutex<HashMap<String, serde_json::Value>>,
+    writes: Mutex<Vec<HashMap<String, serde_json::Value>>>,
+}
+
+impl tidb_domain_infosync::schedule_manager::ScheduleManager for RecordingScheduleManager {
+    fn get_schedule_config(&self) -> Result<HashMap<String, serde_json::Value>, String> {
+        Ok(self.config.lock().unwrap().clone())
+    }
+
+    fn set_schedule_config(&self, config: &HashMap<String, serde_json::Value>) -> Result<(), String> {
+        self.writes.lock().unwrap().push(config.clone());
+        self.config.lock().unwrap().extend(config.iter().map(|(key, value)| (key.clone(), value.clone())));
+        Ok(())
+    }
+}
+
+struct RecordedSchedule(Arc<RecordingScheduleManager>);
+
+impl RecordedSchedule {
+    /// Installs a recording manager whose `merge-schedule-limit` is `limit`.
+    fn install(limit: i64) -> Self {
+        let manager = Arc::new(RecordingScheduleManager::default());
+        manager.config.lock().unwrap().insert("merge-schedule-limit".to_owned(), serde_json::json!(limit));
+        tidb_domain_infosync::schedule_manager::init_schedule_manager(Some(manager.clone()));
+        Self(manager)
+    }
+
+    /// The `merge-schedule-limit` of every write, in order.
+    fn writes(&self) -> Vec<serde_json::Value> {
+        self.0.writes.lock().unwrap().iter().map(|write| write["merge-schedule-limit"].clone()).collect()
+    }
+
+    fn limit(&self) -> serde_json::Value {
+        self.0.config.lock().unwrap()["merge-schedule-limit"].clone()
+    }
+}
+
+impl Drop for RecordedSchedule {
+    fn drop(&mut self) {
+        tidb_domain_infosync::schedule_manager::init_schedule_manager(None);
+    }
+}
+
+fn pd_schedule_state(job: &mut Job) -> String {
+    tidb_model::get_flashback_cluster_args(job).unwrap().unwrap().read().pd_schedule_state.clone()
+}
+
+/// Rewrites the job's arguments as a node without `pd_schedule_state` (a Go
+/// node, or this port before the field) would have left them.
+fn forget_pd_schedule_state(job: &mut Job) {
+    let args = tidb_model::get_flashback_cluster_args(job).unwrap().unwrap();
+    args.write().pd_schedule_state.clear();
+    job.fill_args(Some(args));
+    job.encode(true).unwrap();
+}
+
+fn cancel(job: &mut Job) {
+    job.state = JobState::CANCELLED;
+    job.error = Some(tidb_model::GoShared::new(tidb_dbterror::ERR_CANCELLED_DDL_JOB.clone()));
+}
+
+/// The last finished job's persisted warning, if any.
+fn last_history_warning(session: &mut Session) -> Option<String> {
+    let meta = rows(session, "select job_meta from mysql.tidb_ddl_history order by job_id desc limit 1").remove(0).remove(0);
+    let job: serde_json::Value = serde_json::from_str(&meta).expect("a job's JSON");
+    job["warning"].get("Message").or_else(|| job["warning"].get("message")).map(|message| message.to_string())
+}
+
+/// A job that closed PD's schedule limits restores them, whether it
+/// finishes, is cancelled after the close, or is refused in the step that
+/// closed them.
+#[test]
+fn flashback_restores_the_pd_schedule_it_closed() {
+    let mut session = mock_store_session();
+    let session = &mut session;
+    exec(session, "use test");
+    exec(session, "create table t(a int)");
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let ts = get_timestamp(session);
+    let _mock = mock_flashback(session, ts);
+
+    let schedule = RecordedSchedule::install(1);
+    exec(session, &flashback_to(ts));
+    assert_eq!(schedule.writes(), [serde_json::json!(0), serde_json::json!(1)]);
+    assert_eq!(schedule.limit(), serde_json::json!(1));
+    drop(schedule);
+
+    let schedule = RecordedSchedule::install(3);
+    let after = enable_call("afterRunOneJobStep", |job| {
+        if job.schema_state == SchemaState::WRITE_REORGANIZATION {
+            assert_eq!(pd_schedule_state(job), tidb_model::PD_SCHEDULE_CLOSED);
+            cancel(job);
+        }
+    });
+    let ts = get_timestamp(session);
+    assert_eq!(error_of(session, &flashback_to(ts)), (8214, "Cancelled DDL job".to_owned()));
+    drop(after);
+    assert_eq!(schedule.writes(), [serde_json::json!(0), serde_json::json!(3)]);
+    assert_eq!(last_history_warning(session), None);
+}
+
+/// A job refused in the step that closed the limits (here by a DDL job at
+/// the flashback timestamp, checked after the close) restores them too.
+#[test]
+fn flashback_refused_after_closing_the_pd_schedule_restores_it() {
+    let mut session = mock_store_session();
+    let session = &mut session;
+    exec(session, "use test");
+    exec(session, "create table t(a int)");
+    let domain = crate::domain::mock_store::domain_of(session).expect("a mock store session");
+    let running = Arc::new(Mutex::new(None));
+    let seen = running.clone();
+    let before = enable_call("beforeRunOneJobStep", move |job| {
+        assert_eq!(job.type_, ActionType::ACTION_ADD_COLUMN);
+        let mut seen = seen.lock().unwrap();
+        if seen.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            *seen = Some(get_timestamp(&mut domain.new_session().expect("a second session")));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
+    exec(session, "alter table t add column b int");
+    drop(before);
+    let ts = running.lock().unwrap().expect("the job ran a step");
+    let _mock = mock_flashback(session, ts);
+    let schedule = RecordedSchedule::install(2);
+    assert_eq!(error_of(session, &flashback_to(ts)).0, 1105);
+    assert_eq!(schedule.writes(), [serde_json::json!(0), serde_json::json!(2)]);
+}
+
+/// A job cancelled after it saved the limits and before it asked PD to
+/// close them writes nothing to PD: an operator's later setting stays.
+#[test]
+fn flashback_cancelled_before_closing_the_pd_schedule_writes_no_restore() {
+    let mut session = mock_store_session();
+    let session = &mut session;
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let ts = get_timestamp(session);
+    let _mock = mock_flashback(session, ts);
+
+    let schedule = RecordedSchedule::install(1);
+    let manager = schedule.0.clone();
+    let after = enable_call("afterRunOneJobStep", move |job| {
+        if job.schema_state == SchemaState::DELETE_ONLY && pd_schedule_state(job) == tidb_model::PD_SCHEDULE_SAVED {
+            // The operator raises the limit while the job waits.
+            manager.config.lock().unwrap().insert("merge-schedule-limit".to_owned(), serde_json::json!(5));
+            cancel(job);
+        }
+    });
+    assert_eq!(error_of(session, &flashback_to(ts)), (8214, "Cancelled DDL job".to_owned()));
+    drop(after);
+    assert!(schedule.writes().is_empty(), "{:?}", schedule.writes());
+    assert_eq!(schedule.limit(), serde_json::json!(5));
+    assert_eq!(last_history_warning(session), None);
+}
+
+/// The crash window: the intent to close is persisted and PD took the
+/// close, but the job stopped before it recorded the close. Ending there,
+/// the job cannot tell its close from an operator's: it leaves the limits
+/// and hands off, naming itself and the saved value.
+#[test]
+fn flashback_between_the_intent_and_the_recorded_close_hands_off_to_the_operator() {
+    let mut session = mock_store_session();
+    let session = &mut session;
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let ts = get_timestamp(session);
+    let _mock = mock_flashback(session, ts);
+
+    let schedule = RecordedSchedule::install(4);
+    let manager = schedule.0.clone();
+    let after = enable_call("afterRunOneJobStep", move |job| {
+        if job.schema_state == SchemaState::DELETE_ONLY && pd_schedule_state(job) == tidb_model::PD_SCHEDULE_CLOSING {
+            // The close that reached PD before the node went away.
+            manager.config.lock().unwrap().insert("merge-schedule-limit".to_owned(), serde_json::json!(0));
+            cancel(job);
+        }
+    });
+    assert_eq!(error_of(session, &flashback_to(ts)), (8214, "Cancelled DDL job".to_owned()));
+    drop(after);
+    assert!(schedule.writes().is_empty(), "no restore: {:?}", schedule.writes());
+    assert_eq!(schedule.limit(), serde_json::json!(0));
+    let warning = last_history_warning(session).expect("the handoff warning");
+    assert!(warning.contains("left as they are") && warning.contains(r#"\"merge-schedule-limit\":4"#), "{warning}");
+}
+
+/// A job whose arguments carry no record (a Go node's, or this port's before
+/// the record): past `DELETE_ONLY` it has closed the limits and restores
+/// them; in `DELETE_ONLY` nothing proves the close, so it hands off.
+#[test]
+fn flashback_without_a_pd_schedule_record_restores_only_past_delete_only() {
+    let mut session = mock_store_session();
+    let session = &mut session;
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let ts = get_timestamp(session);
+    let _mock = mock_flashback(session, ts);
+
+    let schedule = RecordedSchedule::install(6);
+    let after = enable_call("afterRunOneJobStep", |job| {
+        if job.schema_state == SchemaState::DELETE_ONLY && pd_schedule_state(job) == tidb_model::PD_SCHEDULE_SAVED {
+            forget_pd_schedule_state(job);
+            cancel(job);
+        }
+    });
+    assert_eq!(error_of(session, &flashback_to(ts)), (8214, "Cancelled DDL job".to_owned()));
+    drop(after);
+    assert!(schedule.writes().is_empty(), "{:?}", schedule.writes());
+    let warning = last_history_warning(session).expect("the handoff warning");
+    assert!(warning.contains(r#"\"merge-schedule-limit\":6"#), "{warning}");
+    drop(schedule);
+
+    let schedule = RecordedSchedule::install(7);
+    let after = enable_call("afterRunOneJobStep", |job| {
+        if job.schema_state == SchemaState::WRITE_REORGANIZATION {
+            forget_pd_schedule_state(job);
+            cancel(job);
+        }
+    });
+    let ts = get_timestamp(session);
+    assert_eq!(error_of(session, &flashback_to(ts)), (8214, "Cancelled DDL job".to_owned()));
+    drop(after);
+    assert_eq!(schedule.writes(), [serde_json::json!(0), serde_json::json!(7)]);
+}

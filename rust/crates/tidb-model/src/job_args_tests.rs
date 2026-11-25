@@ -1916,6 +1916,26 @@ fn flashback_cluster_args_encode_and_decode_as_go() {
     }
 }
 
+/// The port's own `pd_schedule_state` rides after Go's fields: a trailing
+/// v1 argument and an extra v2 key, both of which Go's decoders ignore, and
+/// both absent while it is empty (the Go bytes above).
+#[test]
+fn flashback_cluster_args_keep_the_pd_schedule_state() {
+    for version in [JobVersion::V1, JobVersion::V2] {
+        let args = FlashbackClusterArgs {
+            flashback_ts: 7,
+            pd_schedule_state: PD_SCHEDULE_CLOSING.to_owned(),
+            ..Default::default()
+        };
+        let mut job = encoded_job(version, ActionType::ACTION_FLASHBACK_CLUSTER, GoShared::new(args));
+        let raw = job.raw_args.as_ref().unwrap().get().to_owned();
+        assert!(raw.contains("\"closing\""), "{version:?}: {raw}");
+        let decoded = get_flashback_cluster_args(&mut job).unwrap().unwrap();
+        assert_eq!(decoded.read().pd_schedule_state, PD_SCHEDULE_CLOSING, "{version:?}");
+        assert_eq!(decoded.read().flashback_ts, 7, "{version:?}");
+    }
+}
+
 /// Go master `eca4674a6f`'s encoding of its materialized view job arguments
 /// (`job.FillArgs` + `job.Encode`, V1 and V2), captured from Go: each encodes
 /// to Go's raw args and decodes back from them.
