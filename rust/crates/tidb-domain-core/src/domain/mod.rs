@@ -2021,10 +2021,15 @@ impl Domain {
         ));
         // Go `ddl.Start`: `variable.RegisterStatistics(d)`, whose id is this
         // server's.
+        let mut id = syncer.get_local_server_info().static_info.id.clone();
         self.register_statistics(Arc::new(tidb_ddl::stat::DdlStatistics {
-            id: syncer.get_local_server_info().static_info.id.clone(),
+            id: id.clone(),
             catalog: Arc::clone(&self.catalog),
         }));
+        // A test's hold on a runtime's startup with its DDL statuses
+        // registered and its keyspace identity not yet bound; the argument
+        // is their `server_id`.
+        tidb_failpoint::inject_call("github.com/pingcap/tidb/pkg/domain/afterRegisterDDLStatistics", &mut id);
         self.server_info = Some(syncer);
         self
     }
@@ -2045,11 +2050,19 @@ impl Domain {
 
     /// Go `variable.RegisterStatistics`, kept for the domain's close.
     fn register_statistics(&self, statistics: Arc<dyn tidb_variable::statusvar::Statistics>) {
-        // Under the domain's keyspace once it is known (`bind_statistics`
-        // binds the ones registered before).
+        // Under the domain's keyspace from the first registration: its
+        // runtime's identity once bound, otherwise its store's, which a
+        // domain has from construction. A provider registered with no owner
+        // would be every keyspace's until its runtime bound it (design
+        // §6.8); only an API-V1 store, which names no keyspace, registers
+        // one.
         let keyspace = match self.keyspace.get().and_then(Option::as_ref) {
             Some(keyspace) => keyspace.name().to_owned(),
-            None => self.store_keyspace().to_owned(),
+            None => self
+                .store_keyspace
+                .get()
+                .cloned()
+                .unwrap_or_else(|| self.transactions.store_keyspace()),
         };
         if keyspace.is_empty() {
             tidb_variable::statusvar::register_statistics(Arc::clone(&statistics));

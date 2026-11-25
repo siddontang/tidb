@@ -1214,6 +1214,44 @@ fn a_resumed_flashback_without_a_pd_schedule_record_is_cancelled_on_a_multi_keys
     assert!(warning.contains("left as they are") && warning.contains("merge-schedule-limit"), "{warning}");
 }
 
+/// A keyspace runtime's DDL status provider is its keyspace's from its first
+/// registration: while the second keyspace's startup is held right after
+/// it registered its DDL statuses, before its keyspace identity is bound,
+/// the first keyspace still reads only its own `server_id`, and the opening
+/// keyspace reads its own.
+#[test]
+fn an_opening_keyspace_shows_its_ddl_statuses_to_no_other_keyspace() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set("ks_a", tidb_config_deploymode::get(), false);
+    let server_id = |keyspace: &str| {
+        tidb_variable::statusvar::get_keyspace_status_vars(None, Some(keyspace)).unwrap()["server_id"].value.clone()
+    };
+    let _a = MockStoreDomain::create_for_keyspace("ks_a").unwrap();
+    let a_id = server_id("ks_a");
+    let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = held.clone();
+    let hold = tidb_failpoint::enable_call_for_test(
+        "github.com/pingcap/tidb/pkg/domain/afterRegisterDDLStatistics",
+        move |id| {
+            let id = id.downcast_ref::<String>().expect("the provider's server_id").clone();
+            seen.lock().unwrap().push((id, server_id("ks_a"), server_id("ks_b")));
+        },
+    );
+    let _b = MockStoreDomain::create_for_keyspace("ks_b").unwrap();
+    drop(hold);
+    let held = held.lock().unwrap().clone();
+    assert!(!held.is_empty(), "the opening keyspace registered no DDL statuses");
+    for (b_id, a_sees, b_sees) in &held {
+        assert_ne!(b_id, &a_id);
+        assert_eq!(a_sees, &a_id, "ks_a read the opening keyspace's DDL statuses");
+        assert_eq!(b_sees, b_id, "the opening keyspace reads its own DDL statuses");
+    }
+    assert_eq!(server_id("ks_a"), a_id);
+}
+
 /// Design §6.8 (phase 3e): two keyspaces of one node read only their own
 /// diagnostics from the process-wide owners. Both run the same statement:
 /// each sees only its own statement-summary rows (current, history,

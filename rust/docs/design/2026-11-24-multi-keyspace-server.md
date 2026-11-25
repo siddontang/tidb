@@ -1397,7 +1397,10 @@ single-keyspace node.
   duration. `TIDB_TRX` and the processlist were per runtime already (§6.6).
 - **`SHOW STATUS`:** the provider list is keyed by keyspace (each domain's
   and GC worker's providers carry their keyspace); a session reads the
-  process providers and its keyspace's.
+  process providers and its keyspace's. A domain registers each provider
+  under its keyspace from the first registration (its store's keyspace
+  until its runtime binds its identity), so an opening runtime's DDL
+  statuses are never briefly every keyspace's.
 - **`CLUSTER_*` tables:** read this node only. Every keyspace's server info
   names the one status port, whose peer service answers for the configured
   keyspace and cannot tell which keyspace asks. That service, on a

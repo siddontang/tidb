@@ -6041,6 +6041,7 @@ dependencies = [
  "tidb-executor",
  "tidb-expensivequery",
  "tidb-exprctx",
+ "tidb-failpoint",
  "tidb-fastrand",
  "tidb-globalconn",
  "tidb-gocontext",
