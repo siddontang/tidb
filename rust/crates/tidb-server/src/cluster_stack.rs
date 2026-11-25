@@ -120,16 +120,23 @@ pub fn cluster_session_stack(
         store_config,
     )
     .map_err(|error| RunConfiguredNodeError::Engine(SqlQueryError::unknown(error)))?;
+    // Go `InfoSyncer`: this runtime's PD managers (design §6.2), which its
+    // domains (the bootstrap's and the serving one) and their DDL use. The
+    // configured keyspace's is also the process's, which a thread that
+    // entered none reads.
+    let info_syncer = Arc::new(tidb_domain_infosync::info_syncer::InfoSyncer::default());
+    if !global_vars.vardef().is_per_keyspace() {
+        tidb_domain_infosync::info_syncer::set_global_info_syncer(Arc::clone(&info_syncer));
+    }
     // Go `InfoSyncer.initResourceManagerClient(pdCli)`, which
     // `domain.Init` runs before `BootstrapSession` reaches `bootstrap`: the
     // resource-group jobs -- the bootstrap's own `ALTER RESOURCE GROUP
-    // default` among them -- write PD's resource manager through it.
-    tidb_domain_infosync::resource_manager_client::init_resource_manager_client(Some(Arc::new(
-        PdResourceManagerClient {
-            store: tikv_store.clone(),
-        },
-    )
-        as Arc<dyn tidb_domain_infosync::resource_manager_client::ResourceManagerClient>));
+    // default` among them -- write PD's resource manager through it, in the
+    // keyspace of the store's PD client.
+    info_syncer.init_resource_manager_client(Some(Arc::new(PdResourceManagerClient {
+        store: tikv_store.clone(),
+    })));
+    let _info_syncer = tidb_domain_infosync::info_syncer::enter(Arc::clone(&info_syncer));
     // Go `initDomainSysVars` and `LoadSysVarCacheLoop`: the domain owns the
     // sysvar cache from here, and the SetGlobal hooks run.
     global_vars.arm_domain_hooks();
@@ -195,6 +202,7 @@ pub fn cluster_session_stack(
         spill_storage,
         memory_arbitrator,
         process_id,
+        info_syncer,
     };
     // Go `bootstrapSessionImpl`: the DDL tables, then the bootstrap or the
     // upgrade in a bootstrap domain that is closed again, then the persisted
@@ -461,6 +469,8 @@ struct NodeProcess<'a> {
     memory_arbitrator: Option<Arc<tidb_memory::MemArbitrator>>,
     /// A multi-keyspace process's server ID and connection-ID allocator.
     process_id: Option<&'a crate::keyspace_runtime::ProcessServerId>,
+    /// The runtime's PD managers, which each domain installs.
+    info_syncer: Arc<tidb_domain_infosync::info_syncer::InfoSyncer>,
 }
 
 /// Go `domain.Domain` after `NewDomain`, `Init` and `Start(startMode)`, as
@@ -776,6 +786,7 @@ fn new_cluster_domain(
         spill_storage,
         memory_arbitrator,
         process_id,
+        info_syncer,
     } = process;
     let (startup, startup_lease_grant_ts) =
         load_catalog_from_cluster_at(&authority.transaction_opener(), COPROCESSOR_QUERY_TIMEOUT)
@@ -1073,14 +1084,14 @@ fn new_cluster_domain(
     }));
     // Go `InfoSyncer.initLabelRuleManager`: PD's region-label rules, which
     // the DDL job workers write and `information_schema.attributes` reads.
-    tidb_domain_infosync::label_manager::init_label_rule_manager(pd_http_client.as_ref().map(|client| {
+    info_syncer.init_label_rule_manager(pd_http_client.as_ref().map(|client| {
         Arc::new(tidb_domain_infosync::label_delivery::PdLabelManager::new(client))
             as Arc<dyn tidb_domain_infosync::label_manager::LabelRuleManager>
     }));
     // Go `GlobalInfoSyncerInit`'s `pdHTTPCli`.
-    tidb_domain_infosync::region::init_pd_http_cli(pd_http_client.as_ref());
+    info_syncer.init_pd_http_cli(tidb_domain_infosync::region::pd_http_cli_of(pd_http_client.as_ref()));
     // Go `InfoSyncer.initPlacementManager`: PD's placement rule bundles.
-    tidb_domain_infosync::placement_manager::init_placement_manager(pd_http_client.as_ref().map(|client| {
+    info_syncer.init_placement_manager(pd_http_client.as_ref().map(|client| {
         Arc::new(tidb_domain_infosync::placement_manager::PdPlacementManager::new(client))
             as Arc<dyn tidb_domain_infosync::placement_manager::PlacementManager>
     }));
@@ -1092,13 +1103,13 @@ fn new_cluster_domain(
     );
     // Go `InfoSyncer.initScheduleManager`: PD's schedule configuration, which
     // FLASHBACK CLUSTER closes and restores.
-    tidb_domain_infosync::schedule_manager::init_schedule_manager(pd_http_client.as_ref().map(|client| {
+    info_syncer.init_schedule_manager(pd_http_client.as_ref().map(|client| {
         Arc::new(tidb_domain_infosync::schedule_manager::PdScheduleManager::new(client))
             as Arc<dyn tidb_domain_infosync::schedule_manager::ScheduleManager>
     }));
     // Go `InfoSyncer.initTiFlashReplicaManager`: the TiFlash placement rules
     // DDL jobs set and the GC worker deletes.
-    tidb_domain_infosync::tiflash_manager::init_tiflash_replica_manager(pd_http_client.as_ref().map(|client| {
+    info_syncer.init_tiflash_replica_manager(pd_http_client.as_ref().map(|client| {
         Arc::new(tidb_domain_infosync::tiflash_manager::TiFlashReplicaManagerCtx::new(
             client,
             &config.cluster_security,
@@ -1187,6 +1198,7 @@ fn new_cluster_domain(
         None => factory,
     };
     factory.install_store_keyspace(authority.tikv_store().get_keyspace().to_owned());
+    factory.install_info_syncer(Arc::clone(info_syncer));
     // The keyspace this runtime serves (design §6.1): its configured name,
     // which is the process's on a single-keyspace node.
     factory.install_keyspace_context(runtime_keyspace_context(config, authority.tikv_store()));

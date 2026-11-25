@@ -562,6 +562,9 @@ impl Session {
         let retriever = tidb_executor::memtable_retrievers::CatalogTablesRetriever::new(
             self.schema_visibility(),
             self.sem_hides_cluster_metadata(),
+            // The statement's thread entered its domain's; the reader may
+            // run on another.
+            tidb_domain_infosync::info_syncer::get(),
         );
         if tidb_executor::mem_table_retrieval::MemTableRetriever::serves(&retriever, read) {
             return Some(std::sync::Arc::new(retriever));

@@ -17,7 +17,7 @@
 //! (`is.pdHTTPCli`), which a test replaces (`SetPDHttpCliForTest`).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use tikv_client::pd_http;
 
@@ -79,32 +79,31 @@ impl PdHttpClient for pd_http::Client {
     }
 }
 
-/// The info syncer's `pdHTTPCli`; `None` on a node without PD.
-static PD_HTTP_CLI: Mutex<Option<Arc<dyn PdHttpClient>>> = Mutex::new(None);
-
-/// Go `GlobalInfoSyncerInit`'s `pdHTTPCli`: the store's PD HTTP client as the
-/// info syncer derives it, or none.
-pub fn init_pd_http_cli(cli: Option<&pd_http::Client>) {
-    *PD_HTTP_CLI.lock().unwrap_or_else(PoisonError::into_inner) = cli.map(|cli| {
-        Arc::new(crate::pd_http::info_syncer_pd_http_client(cli)) as Arc<dyn PdHttpClient>
-    });
+/// The info syncer's `pdHTTPCli` derived from the store's PD HTTP client,
+/// or none.
+#[must_use]
+pub fn pd_http_cli_of(cli: Option<&pd_http::Client>) -> Option<Arc<dyn PdHttpClient>> {
+    cli.map(|cli| Arc::new(crate::pd_http::info_syncer_pd_http_client(cli)) as Arc<dyn PdHttpClient>)
 }
 
-/// Go `SetPDHttpCliForTest`: installs `cli` and answers the function that
-/// puts the previous client back.
+/// Go `GlobalInfoSyncerInit`'s `pdHTTPCli` on the process's info syncer:
+/// the store's PD HTTP client as the info syncer derives it, or none.
+pub fn init_pd_http_cli(cli: Option<&pd_http::Client>) {
+    crate::info_syncer::global_info_syncer().init_pd_http_cli(pd_http_cli_of(cli));
+}
+
+/// Go `SetPDHttpCliForTest` on the info syncer this thread reads: installs
+/// `cli` and answers the function that puts the previous client back.
 pub fn set_pd_http_cli_for_test(cli: Arc<dyn PdHttpClient>) -> impl FnOnce() {
-    let original = PD_HTTP_CLI
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .replace(cli);
-    move || *PD_HTTP_CLI.lock().unwrap_or_else(PoisonError::into_inner) = original
+    let syncer = crate::info_syncer::get();
+    let original = syncer.pd_http_cli();
+    syncer.init_pd_http_cli(Some(cli));
+    move || syncer.init_pd_http_cli(original)
 }
 
 fn pd_http_cli(name: &str) -> Result<Arc<dyn PdHttpClient>, String> {
-    PD_HTTP_CLI
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
+    crate::info_syncer::get()
+        .pd_http_cli()
         // PD client `errs.ErrClientGetLeader.FastGenByArgs(name)`.
         .ok_or_else(|| format!("[PD:client:ErrClientGetLeader]get leader failed, {name}"))
 }

@@ -1008,6 +1008,9 @@ pub fn run_persisted_ddl_job<S: StoreClient>(
     // it) -- reads its keyspace's vardef values (multi-keyspace design
     // §6.3).
     let _vardef = tidb_vardef::snapshot::enter(vardef.clone().unwrap_or_else(tidb_vardef::snapshot::process));
+    // Its PD calls -- label rules, placement, resource groups -- go to its
+    // keyspace's managers (design §6.2).
+    let _info_syncer = sess_pool.info_syncer().map(tidb_domain_infosync::info_syncer::enter);
     let worker = crate::cluster_ddl::DdlStepWorker {
         sess_pool,
         step_buffer: MutationBuffer::new(),

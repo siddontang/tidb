@@ -660,14 +660,15 @@ fn a_multi_keyspace_node_writes_no_label_rules_or_inherited_tiflash_rules() {
     let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
     let tenant_a = MockStoreDomain::create_with_mock_tiflash(1).unwrap();
     let tenant_b = MockStoreDomain::create().unwrap();
+    // PD's label rules, which both keyspaces reach.
     let labels = std::sync::Arc::new(CountingLabels::default());
-    let previous_labels = tidb_domain_infosync::label_manager::label_rule_manager();
-    tidb_domain_infosync::label_manager::init_label_rule_manager(Some(labels.clone()));
+    tenant_a.info_syncer().init_label_rule_manager(Some(labels.clone()));
+    tenant_b.info_syncer().init_label_rule_manager(Some(labels.clone()));
     let tiflash = std::sync::Arc::new(CountingTiFlash {
         calls: std::sync::atomic::AtomicUsize::new(0),
-        inner: tidb_domain_infosync::tiflash_manager::tiflash_replica_manager(),
+        inner: tenant_a.info_syncer().tiflash_replica_manager(),
     });
-    tidb_domain_infosync::tiflash_manager::init_tiflash_replica_manager(Some(tiflash.clone()));
+    tenant_a.info_syncer().init_tiflash_replica_manager(Some(tiflash.clone()));
 
     // Single-keyspace: the label rules and the TiFlash replica reach PD.
     let mut a = tenant_a.new_session().unwrap();
@@ -713,8 +714,6 @@ fn a_multi_keyspace_node_writes_no_label_rules_or_inherited_tiflash_rules() {
     assert_eq!(row_text(a.run("select count(*) from mysql.tidb_ddl_job")), [["0"]]);
 
     tidb_keyspace::set_multi_keyspace_mode(false);
-    tidb_domain_infosync::label_manager::init_label_rule_manager(Some(previous_labels));
-    tidb_domain_infosync::tiflash_manager::init_tiflash_replica_manager(Some(tiflash.inner.clone()));
 }
 
 /// A tenant of a multi-keyspace node sets its keyspace's GLOBAL variables
@@ -1509,4 +1508,43 @@ fn a_tenant_reads_only_its_own_diagnostics() {
     ] {
         assert!(row_text(b.run(&format!("select * from information_schema.{table}"))).is_empty(), "{table}");
     }
+}
+
+/// Each keyspace runtime keeps its own PD managers (Go's `InfoSyncer`,
+/// design §6.2): opening a second keyspace leaves the first one's label
+/// rules and placement where they were. Before, the second open replaced
+/// the process's managers, so the first keyspace's `ATTRIBUTES` lost its
+/// rule and its range placement no longer held its policy.
+#[test]
+fn each_keyspace_keeps_its_own_pd_managers() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
+    let a_store = MockStoreDomain::create_for_keyspace("ks_a").unwrap();
+    let mut a = a_store.new_session().unwrap();
+    for sql in [
+        "use test",
+        "create table t (a int)",
+        "alter table t attributes = 'merge_option=deny'",
+        "create placement policy p1 followers = 1",
+        "alter range global placement policy p1",
+    ] {
+        a.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let b_store = MockStoreDomain::create_for_keyspace("ks_b").unwrap();
+    let mut b = b_store.new_session().unwrap();
+
+    let attributes = "select attributes from information_schema.attributes where id like '%schema/test/t'";
+    assert_eq!(row_text(a.run(attributes)), [["\"merge_option=deny\""]]);
+    let (code, message) = refusal(&mut a, "drop placement policy p1").expect("the range uses p1");
+    assert_eq!(code, 8241, "{message}");
+    // The other keyspace sees neither.
+    assert!(row_text(b.run(attributes)).is_empty());
+    for sql in ["create placement policy p1 followers = 1", "drop placement policy p1"] {
+        assert_eq!(refusal(&mut b, sql), None, "{sql}");
+    }
+    assert_eq!(refusal(&mut a, "alter range global placement policy default"), None);
+    assert_eq!(refusal(&mut a, "drop placement policy p1"), None);
 }

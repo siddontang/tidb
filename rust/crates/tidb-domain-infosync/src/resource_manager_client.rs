@@ -20,7 +20,7 @@
 //! without PD gets (`InfoSyncer.initResourceManagerClient(nil)`).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use tidb_proto::resource_manager as rmpb;
 
@@ -143,23 +143,14 @@ impl ResourceManagerClient for MockResourceManagerClient {
     }
 }
 
-/// The `InfoSyncer`'s `resourceManagerClient`.
-static CLIENT: Mutex<Option<Arc<dyn ResourceManagerClient>>> = Mutex::new(None);
-
 fn client() -> Arc<dyn ResourceManagerClient> {
-    Arc::clone(
-        CLIENT
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_or_insert_with(|| Arc::new(MockResourceManagerClient::new())),
-    )
+    crate::info_syncer::get().resource_manager_client()
 }
 
-/// Go `InfoSyncer.initResourceManagerClient`: PD's client, or the mock when
-/// there is none.
+/// Go `InfoSyncer.initResourceManagerClient` on the process's info syncer:
+/// PD's client, or the mock when there is none.
 pub fn init_resource_manager_client(client: Option<Arc<dyn ResourceManagerClient>>) {
-    *CLIENT.lock().unwrap_or_else(PoisonError::into_inner) =
-        Some(client.unwrap_or_else(|| Arc::new(MockResourceManagerClient::new())));
+    crate::info_syncer::global_info_syncer().init_resource_manager_client(client);
 }
 
 /// Go `infosync.GetResourceGroup`.

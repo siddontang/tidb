@@ -150,24 +150,16 @@ fn check_bundles(bundles: &BTreeMap<String, Bundle>) -> Result<(), String> {
     bundles.values().try_for_each(check_bundle)
 }
 
-/// The `InfoSyncer`'s `placementManager`.
-static PLACEMENT_MANAGER: Mutex<Option<Arc<dyn PlacementManager>>> = Mutex::new(None);
-
-/// Go `InfoSyncer.initPlacementManager`: PD's manager, or a fresh mock when
-/// the node has no PD.
+/// Go `InfoSyncer.initPlacementManager` on the process's info syncer: PD's
+/// manager, or a fresh mock when the node has no PD.
 pub fn init_placement_manager(manager: Option<Arc<dyn PlacementManager>>) {
-    *PLACEMENT_MANAGER.lock().unwrap_or_else(PoisonError::into_inner) =
-        Some(manager.unwrap_or_else(|| Arc::new(MockPlacementManager::default())));
+    crate::info_syncer::global_info_syncer().init_placement_manager(manager);
 }
 
-/// The node's placement manager; a node that installed none gets a mock.
+/// The placement manager of the info syncer this thread reads
+/// ([`crate::info_syncer::get`]).
 pub fn placement_manager() -> Arc<dyn PlacementManager> {
-    Arc::clone(
-        PLACEMENT_MANAGER
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_or_insert_with(|| Arc::new(MockPlacementManager::default())),
-    )
+    crate::info_syncer::get().placement_manager()
 }
 
 /// Go `GetRuleBundle`.

@@ -557,17 +557,14 @@ pub fn unistore_cluster_session_stack_from_for_keyspace(
     // Go `affinity.InitManager(nil)`: unistore has no PD HTTP client, so the
     // affinity groups live in the mock manager.
     tidb_domain_affinity::init_manager(None);
-    // Go `initLabelRuleManager` without PD: a fresh `mockLabelManager`.
-    tidb_domain_infosync::label_manager::init_label_rule_manager(None);
-    // Go `initPlacementManager` without PD: a fresh `mockPlacementManager`.
-    tidb_domain_infosync::placement_manager::init_placement_manager(None);
-    // Go `GlobalInfoSyncerInit` without PD: no `pdHTTPCli`.
-    tidb_domain_infosync::region::init_pd_http_cli(None);
-    // Go `initScheduleManager` without PD: a fresh `mockScheduleManager`.
-    tidb_domain_infosync::schedule_manager::init_schedule_manager(None);
-    tidb_domain_infosync::tiflash_manager::init_tiflash_replica_manager(None);
-    // Go `initResourceManagerClient(nil)`: the mock resource manager.
-    tidb_domain_infosync::resource_manager_client::init_resource_manager_client(None);
+    // Go `GlobalInfoSyncerInit` without PD: the store's own info syncer,
+    // whose managers are the mocks (`mockLabelManager`,
+    // `mockPlacementManager`, `mockScheduleManager`, the mock resource
+    // manager) and which has no `pdHTTPCli`. The newest store's is also the
+    // process's; its domain keeps it (design §6.2).
+    let info_syncer = Arc::new(tidb_domain_infosync::info_syncer::InfoSyncer::default());
+    tidb_domain_infosync::info_syncer::set_global_info_syncer(Arc::clone(&info_syncer));
+    let _info_syncer = tidb_domain_infosync::info_syncer::enter(Arc::clone(&info_syncer));
     // Go `initDomainSysVars` and `LoadSysVarCacheLoop`: the domain owns the
     // sysvar cache from here, and the SetGlobal hooks run.
     users.global_vars().arm_domain_hooks();
@@ -578,9 +575,9 @@ pub fn unistore_cluster_session_stack_from_for_keyspace(
         controller: crate::domain::resource_groups_controller::start_resource_groups_controller_over(
             &tikv_store,
             0,
-            Arc::new(
-                tidb_unistore::embedded_resource_groups::EmbeddedResourceGroupProvider::default(),
-            ),
+            Arc::new(tidb_unistore::embedded_resource_groups::EmbeddedResourceGroupProvider::new(
+                Arc::clone(&info_syncer),
+            )),
         )?,
         store: Arc::clone(&tikv_store),
     };
@@ -831,6 +828,7 @@ pub fn unistore_cluster_session_stack_from_for_keyspace(
         None => factory,
     };
     factory.install_store_keyspace(opener.store().get_keyspace().to_owned());
+    factory.install_info_syncer(info_syncer);
     let factory = factory.shared();
     // Go `initResourceGroupsController`'s runaway manager over unistore's
     // mock PD client; `Domain.Start` runs its loops.

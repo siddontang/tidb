@@ -451,26 +451,16 @@ impl TiFlashReplicaManager for MockTiFlashReplicaManagerCtx {
     }
 }
 
-/// The info syncer's `tiflashReplicaManager`.
-static TIFLASH_REPLICA_MANAGER: Mutex<Option<Arc<dyn TiFlashReplicaManager>>> = Mutex::new(None);
-
-/// Go `InfoSyncer.initTiFlashReplicaManager`: PD's manager, or a mock when
-/// the node has no PD.
+/// Go `InfoSyncer.initTiFlashReplicaManager` on the process's info syncer:
+/// PD's manager, or a mock when the node has no PD.
 pub fn init_tiflash_replica_manager(manager: Option<Arc<dyn TiFlashReplicaManager>>) {
-    *TIFLASH_REPLICA_MANAGER
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) =
-        Some(manager.unwrap_or_else(|| Arc::new(MockTiFlashReplicaManagerCtx::default())));
+    crate::info_syncer::global_info_syncer().init_tiflash_replica_manager(manager);
 }
 
-/// The node's TiFlash replica manager; a node that installed none gets a mock.
+/// The TiFlash replica manager of the info syncer this thread reads
+/// ([`crate::info_syncer::get`]).
 pub fn tiflash_replica_manager() -> Arc<dyn TiFlashReplicaManager> {
-    Arc::clone(
-        TIFLASH_REPLICA_MANAGER
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_or_insert_with(|| Arc::new(MockTiFlashReplicaManagerCtx::default())),
-    )
+    crate::info_syncer::get().tiflash_replica_manager()
 }
 
 fn tiflash_enabled() -> bool {

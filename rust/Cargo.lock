@@ -6029,6 +6029,7 @@ dependencies = [
  "tidb-domain",
  "tidb-domain-crossks",
  "tidb-domain-globalconfigsync",
+ "tidb-domain-infosync",
  "tidb-domain-serverinfo",
  "tidb-domain-sqlsvrapi",
  "tidb-driver-error",

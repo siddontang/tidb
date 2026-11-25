@@ -1343,13 +1343,21 @@ pub struct CatalogTablesRetriever {
     /// Whether SEM hides the cluster metadata from the viewer
     /// (`sem_hides_cluster_metadata`).
     hides_cluster_metadata: bool,
+    /// The session's domain's PD managers (design §6.2), which `ATTRIBUTES`
+    /// reads on whichever thread pulls it.
+    info_syncer: std::sync::Arc<tidb_domain_infosync::info_syncer::InfoSyncer>,
 }
 
 impl CatalogTablesRetriever {
-    pub fn new(visibility: SchemaVisibility, hides_cluster_metadata: bool) -> Self {
+    pub fn new(
+        visibility: SchemaVisibility,
+        hides_cluster_metadata: bool,
+        info_syncer: std::sync::Arc<tidb_domain_infosync::info_syncer::InfoSyncer>,
+    ) -> Self {
         Self {
             visibility,
             hides_cluster_metadata,
+            info_syncer,
         }
     }
 }
@@ -1387,7 +1395,7 @@ impl crate::mem_table_retrieval::MemTableRetriever for CatalogTablesRetriever {
             return data_for_tikv_store_status(store.as_ref(), self.hides_cluster_metadata);
         }
         if table.go_lower_eq("ATTRIBUTES") {
-            return crate::infoschema_reader::set_data_for_attributes(catalog, &self.visibility);
+            return crate::infoschema_reader::set_data_for_attributes(catalog, &self.visibility, &self.info_syncer);
         }
         if table.go_lower_eq("PLACEMENT_POLICIES") {
             return Ok(set_data_from_placement_policies(catalog));

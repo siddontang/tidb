@@ -345,6 +345,10 @@ impl DdlSessionPool for NodeDdlSessionPool {
         self.domain.get().and_then(Weak::upgrade).map(|domain| domain.vardef())
     }
 
+    fn info_syncer(&self) -> Option<Arc<tidb_domain_infosync::info_syncer::InfoSyncer>> {
+        self.domain.get().and_then(Weak::upgrade).and_then(|domain| domain.info_syncer().cloned())
+    }
+
     fn ddl_event_ch(
         &self,
     ) -> Option<crossbeam_channel::Sender<tidb_ddl_notifier::SchemaChangeEvent>> {

@@ -1178,10 +1178,12 @@ fn information_schema_tables_rows(zone: &tidb_datatype::SessionTimeZone) -> Vec<
 
 /// Go `memtableRetriever.setDataForAttributes`: each label rule naming a
 /// table or partition that still exists, and whose table the session may
-/// SELECT from. A malformed rule is skipped (Go logs it).
+/// SELECT from. A malformed rule is skipped (Go logs it). The rules are
+/// those of the session's domain's `info_syncer` (design §6.2).
 pub fn set_data_for_attributes(
     catalog: &SessionExtendedInfoSchema,
     visibility: &SchemaVisibility,
+    info_syncer: &tidb_domain_infosync::info_syncer::InfoSyncer,
 ) -> Result<Vec<Vec<Datum>>, crate::DriverError> {
     use tidb_ddl_label as ddl_label;
     // A multi-keyspace node lists no label rules (design §10 phase 2, until
@@ -1190,8 +1192,9 @@ pub fn set_data_for_attributes(
     if tidb_keyspace::is_multi_keyspace_mode() {
         return Ok(Vec::new());
     }
-    // Go `infosync.GetAllLabelRules`: the node's label-rule manager.
-    let rules = tidb_domain_infosync::label_manager::label_rule_manager()
+    // Go `infosync.GetAllLabelRules`: the domain's label-rule manager.
+    let rules = info_syncer
+        .label_rule_manager()
         .get_all_label_rules(&ddl_label::CodecV1)
         .map_err(|error| {
             crate::DriverError::unsupported(format!("get the label rules failed: {error}"))

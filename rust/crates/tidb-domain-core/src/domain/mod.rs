@@ -679,6 +679,9 @@ pub struct Domain {
     /// its runtime bound, else its store's; see [`Self::keyspace_context`].
     keyspace: std::sync::OnceLock<Option<Arc<tidb_keyspace::KeyspaceContext>>>,
     cross_ks_runtimes: std::sync::OnceLock<cross_ks::CrossKsRuntimes>,
+    /// Go `Domain.info` (`infosync.InfoSyncer`): the PD managers this
+    /// domain's sessions and DDL use (multi-keyspace design §6.2).
+    info_syncer: std::sync::OnceLock<Arc<tidb_domain_infosync::info_syncer::InfoSyncer>>,
     /// Go `Domain.unprefixedEtcdCli`: cluster-wide metadata client.
     unprefixed_etcd_client: std::sync::OnceLock<Arc<tidb_pd_client::EtcdClient>>,
     /// The session package's opener of this domain's internal sessions.
@@ -1161,6 +1164,7 @@ impl Domain {
         Self {
             store_keyspace: std::sync::OnceLock::new(),
             keyspace: std::sync::OnceLock::new(),
+            info_syncer: std::sync::OnceLock::new(),
             cross_ks_runtimes: std::sync::OnceLock::new(),
             unprefixed_etcd_client: std::sync::OnceLock::new(),
             sys_session_opener,
@@ -1930,6 +1934,18 @@ impl Domain {
         self.keyspace
             .get_or_init(|| tidb_keyspace::KeyspaceContext::of_store(&*self.transactions.store_keyspace(), self.transactions.keyspace_id()).map(Arc::new))
             .as_ref()
+    }
+
+    /// Installs the domain's info syncer, once.
+    pub fn install_info_syncer(&self, syncer: Arc<tidb_domain_infosync::info_syncer::InfoSyncer>) {
+        let _ = self.info_syncer.set(syncer);
+    }
+
+    /// Go `Domain.InfoSyncer`: the info syncer its runtime installed. An
+    /// internal domain over a store (the DDL and system session pools, a
+    /// cross-keyspace domain) has none, and reads the process's.
+    pub fn info_syncer(&self) -> Option<&Arc<tidb_domain_infosync::info_syncer::InfoSyncer>> {
+        self.info_syncer.get()
     }
 
     /// Go `Domain.Init`: retains a handle without a keyspace namespace.

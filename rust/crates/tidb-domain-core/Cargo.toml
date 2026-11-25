@@ -18,6 +18,7 @@ tidb-metrics = { path = "../tidb-metrics" }
 tidb-timer = { path = "../tidb-timer" }
 tidb-ingestor-ingestctrl = { path = "../tidb-ingestor-ingestctrl" }
 tidb-keyspace = { path = "../tidb-keyspace" }
+tidb-domain-infosync = { path = "../tidb-domain-infosync" }
 tidb-failpoint = { path = "../tidb-failpoint" }
 tidb-domain-crossks = { path = "../tidb-domain-crossks" }
 tidb-dxf-metering = { path = "../tidb-dxf-metering" }

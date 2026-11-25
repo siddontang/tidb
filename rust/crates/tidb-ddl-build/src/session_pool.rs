@@ -127,6 +127,13 @@ pub trait DdlSessionPool: Send + Sync {
         None
     }
 
+    /// The PD managers of the keyspace the DDL serves (design §6.2): its
+    /// domain's info syncer. `None` where no node is bound, which reads the
+    /// process's.
+    fn info_syncer(&self) -> Option<std::sync::Arc<tidb_domain_infosync::info_syncer::InfoSyncer>> {
+        None
+    }
+
     /// Go `sessionctx.Context.GetAdvisoryLock`'s backend for the DDL
     /// worker's session (`w.sess`): each lock is an internal session of the
     /// domain. `None` where no node is bound.

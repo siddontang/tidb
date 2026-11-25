@@ -87,25 +87,14 @@ impl ScheduleManager for MockScheduleManager {
     }
 }
 
-/// The `InfoSyncer`'s `scheduleManager`.
-static SCHEDULE_MANAGER: Mutex<Option<Arc<dyn ScheduleManager>>> = Mutex::new(None);
-
-/// Go `InfoSyncer.initScheduleManager`: PD's manager, or a fresh mock when
-/// the node has no PD.
+/// Go `InfoSyncer.initScheduleManager` on the process's info syncer: PD's
+/// manager, or a fresh mock when the node has no PD.
 pub fn init_schedule_manager(manager: Option<Arc<dyn ScheduleManager>>) {
-    *SCHEDULE_MANAGER
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) =
-        Some(manager.unwrap_or_else(|| Arc::new(MockScheduleManager::default())));
+    crate::info_syncer::global_info_syncer().init_schedule_manager(manager);
 }
 
 fn schedule_manager() -> Arc<dyn ScheduleManager> {
-    Arc::clone(
-        SCHEDULE_MANAGER
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_or_insert_with(|| Arc::new(MockScheduleManager::default())),
-    )
+    crate::info_syncer::get().schedule_manager()
 }
 
 /// Go `GetPDScheduleConfig`: the schedule information from PD.

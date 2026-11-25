@@ -20,7 +20,7 @@
 //! client (`initResourceGroupsController`), which is what prices every
 //! request and response into the statement's `RUDetails`.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use prost::Message;
@@ -34,12 +34,36 @@ use tikv_client::proto::resource_manager::{
 };
 use tokio::sync::mpsc;
 
+use tidb_domain_infosync::info_syncer::InfoSyncer;
+use tidb_domain_infosync::resource_manager_client::ResourceManagerClient;
+
 /// See the module docs.
 #[derive(Default)]
 pub struct EmbeddedResourceGroupProvider {
     /// Go's mock answers the group-settings watch with a channel it keeps;
     /// the senders stay here so the controller's watch stays open.
     watches: Mutex<Vec<mpsc::Sender<WatchResponse>>>,
+    /// The store's info syncer, whose resource manager the controller's
+    /// tasks read; `None` reads the process's.
+    info_syncer: Option<Arc<InfoSyncer>>,
+}
+
+impl EmbeddedResourceGroupProvider {
+    /// The provider over the store's info syncer.
+    #[must_use]
+    pub fn new(info_syncer: Arc<InfoSyncer>) -> Self {
+        Self {
+            info_syncer: Some(info_syncer),
+            ..Self::default()
+        }
+    }
+
+    fn client(&self) -> Arc<dyn ResourceManagerClient> {
+        self.info_syncer
+            .clone()
+            .unwrap_or_else(tidb_domain_infosync::info_syncer::get)
+            .resource_manager_client()
+    }
 }
 
 /// The mock holds `tidb_proto` groups; the controller speaks client-rust's.
@@ -97,7 +121,8 @@ impl ResourceGroupProvider for EmbeddedResourceGroupProvider {
         resource_group_name: &str,
         _opts: &[GetResourceGroupOption],
     ) -> tikv_client::Result<Option<ResourceGroup>> {
-        tidb_domain_infosync::resource_manager_client::get_resource_group(resource_group_name)
+        self.client()
+            .get_resource_group(resource_group_name)
             .map(|group| Some(to_client_group(&group)))
             .map_err(mock_error)
     }
@@ -106,14 +131,15 @@ impl ResourceGroupProvider for EmbeddedResourceGroupProvider {
         &self,
         _opts: &[GetResourceGroupOption],
     ) -> tikv_client::Result<Vec<ResourceGroup>> {
-        tidb_domain_infosync::resource_manager_client::list_resource_groups()
+        self.client()
+            .list_resource_groups()
             .map(|groups| groups.iter().map(to_client_group).collect())
             .map_err(mock_error)
     }
 
     async fn add_resource_group(&self, meta_group: ResourceGroup) -> tikv_client::Result<String> {
-        tidb_domain_infosync::resource_manager_client::add_resource_group(to_mock_group(&meta_group))
-            .map(|()| "Success!".to_owned())
+        self.client()
+            .add_resource_group(to_mock_group(&meta_group))
             .map_err(mock_error)
     }
 
@@ -121,8 +147,8 @@ impl ResourceGroupProvider for EmbeddedResourceGroupProvider {
         &self,
         meta_group: ResourceGroup,
     ) -> tikv_client::Result<String> {
-        tidb_domain_infosync::resource_manager_client::modify_resource_group(to_mock_group(&meta_group))
-            .map(|()| "Success!".to_owned())
+        self.client()
+            .modify_resource_group(to_mock_group(&meta_group))
             .map_err(mock_error)
     }
 
@@ -130,8 +156,8 @@ impl ResourceGroupProvider for EmbeddedResourceGroupProvider {
         &self,
         resource_group_name: &str,
     ) -> tikv_client::Result<String> {
-        tidb_domain_infosync::resource_manager_client::delete_resource_group(resource_group_name)
-            .map(|()| "Success!".to_owned())
+        self.client()
+            .delete_resource_group(resource_group_name)
             .map_err(mock_error)
     }
 

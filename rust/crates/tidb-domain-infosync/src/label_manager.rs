@@ -110,26 +110,16 @@ impl LabelRuleManager for MockLabelManager {
     }
 }
 
-/// The `InfoSyncer`'s `labelRuleManager`.
-static LABEL_RULE_MANAGER: Mutex<Option<Arc<dyn LabelRuleManager>>> = Mutex::new(None);
-
-/// Go `InfoSyncer.initLabelRuleManager`: PD's manager, or a fresh mock when
-/// the node has no PD.
+/// Go `InfoSyncer.initLabelRuleManager` on the process's info syncer: PD's
+/// manager, or a fresh mock when the node has no PD.
 pub fn init_label_rule_manager(manager: Option<Arc<dyn LabelRuleManager>>) {
-    *LABEL_RULE_MANAGER
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) =
-        Some(manager.unwrap_or_else(|| Arc::new(MockLabelManager::default())));
+    crate::info_syncer::global_info_syncer().init_label_rule_manager(manager);
 }
 
-/// The node's label-rule manager; a node that installed none gets a mock.
+/// The label-rule manager of the info syncer this thread reads
+/// ([`crate::info_syncer::get`]).
 pub fn label_rule_manager() -> Arc<dyn LabelRuleManager> {
-    Arc::clone(
-        LABEL_RULE_MANAGER
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_or_insert_with(|| Arc::new(MockLabelManager::default())),
-    )
+    crate::info_syncer::get().label_rule_manager()
 }
 
 /// A job step's view of the label rules while its writes are still pending:

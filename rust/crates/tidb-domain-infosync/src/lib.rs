@@ -15,6 +15,7 @@
 //! Go `pkg/domain/infosync`: the PD-facing label, resource-manager, affinity
 //! and TiFlash replica clients.
 pub mod infosync_errors;
+pub mod info_syncer;
 pub mod pd_http;
 pub mod prometheus_addr;
 pub mod schedule_manager;

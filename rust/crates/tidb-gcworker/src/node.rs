@@ -85,7 +85,10 @@ pub fn gc_worker_deps<S: tidb_store_driver_txn::transaction::StoreClient + 'stat
                 .map_err(|error| error.to_string())
             }),
         )),
-        rules: Arc::new(NodeGcRules { pd_http_client }),
+        rules: Arc::new(NodeGcRules {
+            pd_http_client,
+            info_syncer: factory.info_syncer().cloned(),
+        }),
         // Go `extworkload.GetManagerFromStore(w.store)`.
         gcv2: tidb_extworkload::get_manager_from_store()
             .map(|manager| Arc::new(ExtWorkloadGcV2(manager)) as Arc<dyn crate::seams::GcV2Manager>),
@@ -308,12 +311,18 @@ impl GcSession for NodeGcSession<'_> {
 }
 
 /// `infosync`'s placement and label rule calls, over the store's PD HTTP
-/// client.
+/// client and the domain's info syncer.
 struct NodeGcRules {
     pd_http_client: Option<tikv_client::pd_http::Client>,
+    /// The domain's PD managers (design §6.2); `None` reads the process's.
+    info_syncer: Option<Arc<tidb_domain_infosync::info_syncer::InfoSyncer>>,
 }
 
 impl NodeGcRules {
+    fn info_syncer(&self) -> Arc<tidb_domain_infosync::info_syncer::InfoSyncer> {
+        self.info_syncer.clone().unwrap_or_else(tidb_domain_infosync::info_syncer::get)
+    }
+
     fn pd_http_client(&self) -> GcResult<&tikv_client::pd_http::Client> {
         self.pd_http_client
             .as_ref()
@@ -336,6 +345,7 @@ impl GcRuleClient for NodeGcRules {
         if skip_pd_rule_cleanup() {
             return Ok(());
         }
+        let _info_syncer = tidb_domain_infosync::info_syncer::enter(self.info_syncer());
         tidb_domain_infosync::tiflash_manager::delete_tiflash_placement_rules(physical_table_ids)
             .map_err(GcError::new)
     }
@@ -359,7 +369,8 @@ impl GcRuleClient for NodeGcRules {
         if skip_pd_rule_cleanup() {
             return Ok(HashMap::new());
         }
-        tidb_domain_infosync::label_manager::label_rule_manager()
+        self.info_syncer()
+            .label_rule_manager()
             .get_label_rules(rule_ids)
             .map(|rules| rules.into_iter().collect())
             .map_err(GcError::new)
@@ -369,7 +380,8 @@ impl GcRuleClient for NodeGcRules {
         if skip_pd_rule_cleanup() {
             return Ok(());
         }
-        tidb_domain_infosync::label_manager::label_rule_manager()
+        self.info_syncer()
+            .label_rule_manager()
             .update_label_rules(&tidb_ddl_label::new_rule_patch(
                 Vec::new(),
                 rule_ids,

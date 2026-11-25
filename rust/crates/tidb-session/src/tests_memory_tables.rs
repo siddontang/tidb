@@ -224,6 +224,7 @@ fn a_scan_has_at_most_one_retriever() {
             tidb_executor::memtable_retrievers::CatalogTablesRetriever::new(
                 session.schema_visibility(),
                 false,
+                tidb_domain_infosync::info_syncer::get(),
             ),
         ),
         Box::new(tidb_executor::account_state::AccountRetriever::new(

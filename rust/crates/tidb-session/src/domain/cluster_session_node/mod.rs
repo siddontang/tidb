@@ -398,6 +398,9 @@ pub struct ClusterServerSession<'s> {
     /// The session's vardef snapshot, entered on this thread while the store
     /// half is lent; leaving restores the caller's.
     _vardef: Option<tidb_vardef::snapshot::EnteredVardef>,
+    /// The domain's info syncer, entered beside the vardef snapshot: the
+    /// statement's PD calls go to its keyspace's managers (design §6.2).
+    _info_syncer: Option<tidb_domain_infosync::info_syncer::EnteredInfoSyncer>,
 }
 
 /// The store half a [`ClusterServerSession`] works on: taken from the
@@ -450,10 +453,16 @@ impl Session {
         // §6.3): the DDL it submits reads them on this thread, whichever
         // caller runs it (a connection, an internal or pooled session).
         let vardef = tidb_vardef::snapshot::enter(self.vars.vardef());
+        let info_syncer = node
+            .domain
+            .as_ref()
+            .and_then(|domain| domain.info_syncer())
+            .map(|syncer| tidb_domain_infosync::info_syncer::enter(Arc::clone(syncer)));
         ClusterServerSession {
             session: self,
             node: NodeLoan::Taken(Some(node)),
             _vardef: Some(vardef),
+            _info_syncer: info_syncer,
         }
     }
 
@@ -514,6 +523,7 @@ impl<'s> ClusterServerSession<'s> {
             session: &mut *self.session,
             node: NodeLoan::Borrowed(&mut self.node),
             _vardef: None,
+            _info_syncer: None,
         }
     }
 }

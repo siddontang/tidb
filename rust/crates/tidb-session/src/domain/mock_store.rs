@@ -65,6 +65,18 @@ impl MockStoreDomain {
 }
 
 impl MockStoreDomain {
+    /// Go `dom.InfoSyncer()`: the PD managers this store's sessions and DDL
+    /// use (design §6.2), which a test replaces with its own.
+    ///
+    /// # Panics
+    ///
+    /// Never: every mock store's domain has one.
+    pub fn info_syncer(&self) -> Arc<tidb_domain_infosync::info_syncer::InfoSyncer> {
+        Arc::clone(self.stack.factory.info_syncer().expect("a mock store's domain has an info syncer"))
+    }
+}
+
+impl MockStoreDomain {
     /// Boots a fresh store with Go testkit's settings: a 500ms schema lease
     /// (`vardef.SetSchemaLease(500 * time.Millisecond)`) and the bootstrap's
     /// passwordless `root`@`%`.
