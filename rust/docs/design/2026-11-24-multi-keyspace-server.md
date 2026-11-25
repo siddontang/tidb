@@ -1241,6 +1241,19 @@ Moving it into the `Domain` is preferred, because it closes with the tenant.
   held under the keyspace ID of the store they read. A statement result or
   cursor kept past its transaction does not know its store, so it holds a
   shared entry that every report reads (as a single-keyspace node does).
+- **Live GC gate** (`rust/scripts/multi-tenant-gc-gate.py`, passed on the
+  development playground). A read transaction held open in `keyspace1`
+  (start 14:31:17.610), with both tenants' rows overwritten and deleted
+  after it: `keyspace1`'s GC ran at 14:43:10, when its 10-minute life
+  time alone would have passed the reader, and set its safe point to the
+  reader's start TS exactly; `keyspace2`'s GC set 14:31:18.260, past the
+  reader; the reader still read its original rows after both. Before the
+  per-keyspace report, `keyspace2`'s safe point could not have passed the
+  reader. `keyspace2`'s did not advance further on that run: the
+  playground's own node (an older build) also serves it, and its report
+  stayed at `keyspace2`'s last DDL. That is the upstream stale-schema
+  report, fixed by `CatalogFollower` following the schema timestamp a
+  reload refreshes (not only its version); the GC gate needs no more.
 - `DEFAULT_RESOURCE_GROUP` (`tidb-meta/src/transaction.rs:59`) moves per runtime.
   **Not needed:** it only memoizes Go's `DefaultGroupMeta4Test`, an
   immutable value that is the same in every keyspace; each keyspace's own
@@ -1601,7 +1614,7 @@ in parallel once Phase 1 lands.
 | **3a** | Keyspace identity reads + resource tags + username policy (§6.1) | Unit and integration tests; no empty-keyspace assertions firing |
 | **3b** | PD/infosync singletons into `RuntimeServices` (§6.2), including a keyspace-qualified placement group ID | Resource-group, placement and label-rule SQL per tenant |
 | **3c** | `SET GLOBAL` / vardef split (§6.3), with the generated classification appendix | `SET GLOBAL` isolation tests for every global-scoped atomic |
-| **3d** | ID-keyed caches and DDL version state into the runtime (§6.4) and transaction/GC maps (§6.5). **In progress (development mode):** the min-start-ts inputs are per keyspace (§6.5), the table row-count cache and the sync-load flights per domain; open: the async-load demand map, `JOB_CTX_MAP`, the job version state | Stats and DDL concurrency in two tenants; GC safe point per tenant |
+| **3d** | ID-keyed caches and DDL version state into the runtime (§6.4) and transaction/GC maps (§6.5). **In progress (development mode):** the min-start-ts inputs are per keyspace (§6.5), the table row-count cache and the sync-load flights per domain; open: the async-load demand map, `JOB_CTX_MAP`, the job version state. The live GC gate passed (`rust/scripts/multi-tenant-gc-gate.py`, §6.5); the DDL concurrency gate is open | Stats and DDL concurrency in two tenants; GC safe point per tenant |
 | **3e** | Observability isolation (§6.8), including the `SHOW STATUS` providers. **Done in development mode**; the deferred items are listed in §6.8 | Processlist, KILL, statement summary and slow-query filtering tests |
 | **3f** | Status port multiplexing + AutoID service map + per-store globals, including the DXF task managers (§6.9, §6.10) | AUTO_ID_CACHE=1 tables in two tenants; IMPORT INTO per tenant |
 | **3g** | Session migration (§5.6): keyspace-bound session tokens, token logins through routing, tenant-scoped `SET SESSION_STATES`, parity check of the ported session-states code in multi-keyspace mode | §5.6 migration tests, including cross-tenant token replay rejection |
