@@ -1123,6 +1123,97 @@ fn a_multi_keyspace_node_refuses_flashback_cluster() {
     tidb_keyspace::set_multi_keyspace_mode(false);
 }
 
+/// A schedule manager that keeps its configuration and counts its writes.
+#[derive(Debug, Default)]
+struct CountingSchedule {
+    config: std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
+    writes: std::sync::atomic::AtomicUsize,
+}
+
+impl tidb_domain_infosync::schedule_manager::ScheduleManager for CountingSchedule {
+    fn get_schedule_config(&self) -> Result<std::collections::HashMap<String, serde_json::Value>, String> {
+        Ok(self.config.lock().unwrap().clone())
+    }
+
+    fn set_schedule_config(&self, config: &std::collections::HashMap<String, serde_json::Value>) -> Result<(), String> {
+        self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.config.lock().unwrap().extend(config.iter().map(|(key, value)| (key.clone(), value.clone())));
+        Ok(())
+    }
+}
+
+/// A FLASHBACK CLUSTER job saved PD's schedule limits in `DELETE_ONLY` and
+/// carries no record of its close (a Go node's job, or this port's before
+/// the record). Resumed on a node that cannot close the limits, it would
+/// run the flashback with PD scheduling on and then be taken for a job that
+/// closed them: it is cancelled in `DELETE_ONLY` instead, writes nothing to
+/// PD, and hands the saved value off to the operator.
+#[test]
+fn a_resumed_flashback_without_a_pd_schedule_record_is_cancelled_on_a_multi_keyspace_node() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
+    let store = MockStoreDomain::create().unwrap();
+    let mut session = store.new_session().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    session.run("begin").unwrap();
+    let ts: u64 = row_text(session.run("select @@tidb_current_ts"))[0][0].parse().unwrap();
+    session.run("rollback").unwrap();
+    let inject_safe_ts = (((ts >> 18) + 10_000) << 18).to_string();
+    let _mock = [
+        tidb_failpoint::enable_for_test("github.com/pingcap/tidb/pkg/ddl/mockFlashbackTest", "return(true)"),
+        tidb_failpoint::enable_for_test("github.com/pingcap/tidb/pkg/ddl/injectSafeTS", &format!("return({inject_safe_ts})")),
+    ];
+    let safe_point = (chrono::Local::now() - chrono::Duration::hours(48)).format("%Y%m%d-%H:%M:%S%.3f %z").to_string();
+    session.run("delete from mysql.tidb where variable_name in ('tikv_gc_safe_point', 'tikv_gc_enable')").unwrap();
+    session
+        .run(&format!("insert into mysql.tidb values ('tikv_gc_safe_point', '{safe_point}', '')"))
+        .unwrap();
+    let schedule = std::sync::Arc::new(CountingSchedule::default());
+    schedule.config.lock().unwrap().insert("merge-schedule-limit".to_owned(), serde_json::json!(9));
+    tidb_domain_infosync::schedule_manager::init_schedule_manager(Some(schedule.clone()));
+    let states = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = states.clone();
+    let _after = tidb_failpoint::enable_call_for_test("github.com/pingcap/tidb/pkg/ddl/afterRunOneJobStep", move |job| {
+        if let Some(job) = job.downcast_mut::<tidb_model::Job>() {
+            seen.lock().unwrap().push(job.schema_state);
+        }
+    });
+    let _resumed = before_resumed_step(
+        tidb_model::ActionType::ACTION_FLASHBACK_CLUSTER,
+        |job| job.schema_state == tidb_model::SchemaState::DELETE_ONLY,
+        |job| {
+            // The arguments as a node without the record left them.
+            let args = tidb_model::get_flashback_cluster_args(job).unwrap().unwrap();
+            assert_eq!(args.read().pd_schedule_state, tidb_model::PD_SCHEDULE_SAVED);
+            args.write().pd_schedule_state.clear();
+            job.fill_args(Some(args));
+            job.encode(true).unwrap();
+        },
+    );
+    let time = chrono::TimeZone::timestamp_millis_opt(&chrono::Local, (ts >> 18) as i64).unwrap();
+    let sql = format!("flashback cluster to timestamp '{}'", time.format("%Y-%m-%d %H:%M:%S%.6f"));
+    let refused = refusal(&mut session, &sql);
+    tidb_keyspace::set_multi_keyspace_mode(false);
+    tidb_domain_infosync::schedule_manager::init_schedule_manager(None);
+    let (code, message) = refused.expect("the resumed job was cancelled");
+    assert!(code == 1235 || code == 8214, "{code}: {message}");
+    let states = states.lock().unwrap().clone();
+    assert!(
+        !states.iter().any(|state| matches!(*state, tidb_model::SchemaState::WRITE_ONLY | tidb_model::SchemaState::WRITE_REORGANIZATION)),
+        "the job advanced: {states:?}"
+    );
+    assert_eq!(schedule.writes.load(std::sync::atomic::Ordering::SeqCst), 0, "PD's limits were written");
+    assert_eq!(schedule.config.lock().unwrap()["merge-schedule-limit"], serde_json::json!(9));
+    let meta = row_text(session.run("select job_meta from mysql.tidb_ddl_history order by job_id desc limit 1")).remove(0).remove(0);
+    let job: serde_json::Value = serde_json::from_str(&meta).unwrap();
+    assert_eq!(job["state"], serde_json::json!(tidb_model::JobState::CANCELLED.0), "{job}");
+    let warning = job["warning"].to_string();
+    assert!(warning.contains("left as they are") && warning.contains("merge-schedule-limit"), "{warning}");
+}
+
 /// Design §6.8 (phase 3e): two keyspaces of one node read only their own
 /// diagnostics from the process-wide owners. Both run the same statement:
 /// each sees only its own statement-summary rows (current, history,

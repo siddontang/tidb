@@ -569,3 +569,51 @@ fn flashback_without_a_pd_schedule_record_restores_only_past_delete_only() {
     drop(after);
     assert_eq!(schedule.writes(), [serde_json::json!(0), serde_json::json!(7)]);
 }
+
+/// A job with no record resumed in `DELETE_ONLY` (a Go node's, or this
+/// port's before the record) does not advance on the strength of its saved
+/// value: it records its intent, closes the limits and records the close
+/// before it leaves `DELETE_ONLY`, and only then restores at the end.
+#[test]
+fn flashback_resumed_without_a_pd_schedule_record_closes_before_it_advances() {
+    let mut session = mock_store_session();
+    let session = &mut session;
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let ts = get_timestamp(session);
+    let _mock = mock_flashback(session, ts);
+
+    let schedule = RecordedSchedule::install(8);
+    let manager = schedule.0.clone();
+    let steps = Arc::new(Mutex::new(Vec::new()));
+    let seen = steps.clone();
+    let forgotten = std::sync::atomic::AtomicBool::new(false);
+    let after = enable_call("afterRunOneJobStep", move |job| {
+        if job.schema_state == SchemaState::DELETE_ONLY
+            && pd_schedule_state(job) == tidb_model::PD_SCHEDULE_SAVED
+            && !forgotten.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            forget_pd_schedule_state(job);
+        }
+        let limit = manager.config.lock().unwrap()["merge-schedule-limit"].clone();
+        seen.lock().unwrap().push((job.schema_state, pd_schedule_state(job), limit));
+    });
+    exec(session, &flashback_to(ts));
+    drop(after);
+    let steps = steps.lock().unwrap().clone();
+    let first_past = steps
+        .iter()
+        .find(|(state, ..)| *state == SchemaState::WRITE_ONLY)
+        .expect("the job reached WRITE_ONLY");
+    assert_eq!(
+        (first_past.1.as_str(), &first_past.2),
+        (tidb_model::PD_SCHEDULE_CLOSED, &serde_json::json!(0)),
+        "{steps:?}"
+    );
+    assert!(
+        steps.iter().any(|(state, record, _)| *state == SchemaState::DELETE_ONLY && record == tidb_model::PD_SCHEDULE_CLOSING),
+        "{steps:?}"
+    );
+    assert_eq!(schedule.writes(), [serde_json::json!(0), serde_json::json!(8)]);
+    assert_eq!(schedule.limit(), serde_json::json!(8));
+    assert_eq!(last_history_warning(session), None);
+}

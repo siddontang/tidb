@@ -141,7 +141,9 @@ enum PdScheduleOwnership {
 /// record (started by a Go node or before the field) closed the limits in
 /// the step that left `DELETE_ONLY`, so a later state proves the close and
 /// `DELETE_ONLY` proves nothing; a current limit of zero does not tell the
-/// job's close from an operator's.
+/// job's close from an operator's. This port never advances such a job past
+/// `DELETE_ONLY` without recording its own close (`on_flashback_cluster`),
+/// so a later state with no record is still a Go node's close.
 fn pd_schedule_ownership(schema_state: SchemaState, args: &FlashbackClusterArgs) -> PdScheduleOwnership {
     match args.pd_schedule_state.as_str() {
         PD_SCHEDULE_CLOSED => PdScheduleOwnership::Closed,
@@ -668,10 +670,24 @@ pub(super) fn on_flashback_cluster(
             // The intent to close PD's schedule limits is persisted, in a
             // step of its own, before the close: a job that stops between
             // the two is then known to be ambiguous rather than untouched
-            // (`pd_schedule_ownership`).
-            if args.read().pd_schedule_state == PD_SCHEDULE_SAVED
-                && super::step_pd_write("FLASHBACK CLUSTER").map_err(|error| cancel_ddl_job(active, error))?
-            {
+            // (`pd_schedule_ownership`). A job with a saved value and no
+            // record (a Go node's, or from before the record) takes the same
+            // path, so it records its own close before it advances; one that
+            // advanced without it would later be taken for a job that closed
+            // the limits.
+            let unrecorded = {
+                let args = args.read();
+                args.pd_schedule_state.is_empty() && args.pd_schedule_value.as_ref().is_some_and(|value| !value.is_empty())
+            };
+            if args.read().pd_schedule_state == PD_SCHEDULE_SAVED || unrecorded {
+                if !super::step_pd_write("FLASHBACK CLUSTER").map_err(|error| cancel_ddl_job(active, error))? {
+                    // The saved limits cannot be closed here: the flashback
+                    // would run with PD scheduling on.
+                    return Err(cancel_ddl_job(
+                        active,
+                        unknown("FLASHBACK CLUSTER saved PD's schedule limits but cannot close them on this node".to_owned()),
+                    ));
+                }
                 validate_flashback_ts(pool, flashback_ts).map_err(|error| cancel_ddl_job(active, error))?;
                 PD_SCHEDULE_CLOSING.clone_into(&mut args.write().pd_schedule_state);
                 fill_args(&mut active.job, &args)?;
