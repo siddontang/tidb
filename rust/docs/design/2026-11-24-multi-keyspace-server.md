@@ -1321,10 +1321,26 @@ unknown ID), and `EXPLAIN FOR CONNECTION` answers `ER_NO_SUCH_THREAD`.
   candidates: both opening orders, and tenant and SYSTEM lease loss. The
   failpoint `github.com/pingcap/tidb/pkg/domain/forceServerIDCandidate`
   (`return(<id>)`, set at startup through `GO_FAILPOINTS` in a `failpoints`
-  build) forces a real node's first candidate. The two-node run has not been
-  done: it needs a `failpoints` nextgen build beside the regular ones. A
-  remote `KILL` into a multi-keyspace node is refused for now: the request
-  names no keyspace (§6.8).
+  build) forces a real node's first candidate. A remote `KILL` into a
+  multi-keyspace node is refused for now: the request names no keyspace
+  (§6.8).
+- The two-node run is `rust/scripts/mixed-fleet-server-id.py`, over a
+  `failpoints` + `nextgen` build and an existing TiDB X cluster. It passed
+  (32 checks) on the development playground, with `keyspace2` as the shared
+  tenant: whichever node opens the tenant second, the multi-keyspace node
+  refuses the tenant's logins with 1045 and publishes nothing there, and a
+  single-keyspace node moves off the ID (Go's collision retry); `KILL` and
+  `KILL QUERY` from the multi-keyspace node reach the single-keyspace node,
+  and from another tenant of the multi-keyspace node do not; the other
+  direction answers OK with the warning `KILL remote connection failed: ...
+  answers peer requests of its configured keyspace's users only` and kills
+  nothing (3f); every lease (SYSTEM, both tenants', the single-keyspace
+  node's) is renewed by its keeper's refresh; and revoking the
+  single-keyspace node's lease and the multi-keyspace node's tenant lease
+  drains both within one refresh interval (about 260s), while the
+  multi-keyspace node's other tenant keeps its connections, and both reserve
+  again within the 10s retry (the multi-keyspace node on the same ID). The
+  SYSTEM lease loss has not been run live (unit-tested only).
 
 **Mixed-fleet test.** One multi-keyspace node and one single-keyspace
 **nextgen** node serve the same tenant, with a failpoint that forces
@@ -1332,7 +1348,8 @@ overlapping candidate IDs. Check:
 
 - the second node to open the tenant fails with the collision error, and never
   publishes the ID;
-- remote `KILL` and `KILL QUERY` work in both directions;
+- remote `KILL` and `KILL QUERY` work in both directions (into a
+  multi-keyspace node: refused until 3f);
 - lease expiry and renewal on both nodes, including a tenant-lease loss on the
   multi-keyspace node that drains only that tenant.
 
