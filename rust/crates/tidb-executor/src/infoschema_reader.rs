@@ -1186,16 +1186,11 @@ pub fn set_data_for_attributes(
     info_syncer: &tidb_domain_infosync::info_syncer::InfoSyncer,
 ) -> Result<Vec<Vec<Datum>>, crate::DriverError> {
     use tidb_ddl_label as ddl_label;
-    // A multi-keyspace node lists no label rules (design §10 phase 2, until
-    // 3b): their IDs carry no keyspace, and the name and physical-ID checks
-    // below cannot tell this tenant's rules from another's.
-    if tidb_keyspace::is_multi_keyspace_mode() {
-        return Ok(Vec::new());
-    }
-    // Go `infosync.GetAllLabelRules`: the domain's label-rule manager.
+    // Go `infosync.GetAllLabelRules`: the domain's label-rule manager, whose
+    // rules of the domain's keyspace it lists.
     let rules = info_syncer
         .label_rule_manager()
-        .get_all_label_rules(&ddl_label::CodecV1)
+        .get_all_label_rules(info_syncer.label_codec())
         .map_err(|error| {
             crate::DriverError::unsupported(format!("get the label rules failed: {error}"))
         })?;

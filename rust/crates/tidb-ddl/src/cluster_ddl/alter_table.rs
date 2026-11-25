@@ -876,7 +876,9 @@ pub(crate) fn alter_table_attributes<S: MetaSnapshot>(
         };
         let (_, stored) = locate_table(catalog, schema, table)?;
         let stored = stored.read();
+        // Go `e.store.GetCodec()`: the session's keyspace.
         let rule = label_rules::table_attributes_rule(
+            tidb_domain_infosync::info_syncer::get().label_codec(),
             attributes,
             database.read().name.lowercase(),
             &LabelRuleTable::from_table_info(&stored),
@@ -931,6 +933,7 @@ pub(crate) fn alter_table_partition_attributes<S: MetaSnapshot>(
         let stored = stored.read();
         let partition_id = find_partition_id(&stored, partition)?;
         let rule = label_rules::partition_attributes_rule(
+            tidb_domain_infosync::info_syncer::get().label_codec(),
             attributes,
             database.read().name.lowercase(),
             stored.name.lowercase(),

@@ -372,6 +372,7 @@ fn rename_one(
     let old_table_name = table.name.clone();
     let old_rules = label_rules::get_old_label_rules(
         label_rules.manager(),
+        label_rules.codec(),
         &LabelRuleTable::from_table_info(&table),
         info.old_schema_name.lowercase(),
         old_table_name.lowercase(),
@@ -404,6 +405,7 @@ fn rename_one(
     label_rules
         .push(
             label_rules::update_label_rules(
+                label_rules.codec(),
                 new_database.read().name.lowercase(),
                 &LabelRuleTable::from_table_info(&table),
                 &old_rules,

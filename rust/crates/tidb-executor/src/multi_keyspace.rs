@@ -22,7 +22,7 @@
 //! queue, and the global external storage (phase 3f moves them into each
 //! keyspace runtime). Each statement checks here before it consults any of
 //! them. So do the DDL statements whose effect lives in PD (resource groups,
-//! placement, label rules, TiFlash replicas) or in the AutoID service
+//! placement, TiFlash replicas) or in the AutoID service
 //! (`AUTO_ID_CACHE=1`).
 
 use crate::DriverError;
@@ -44,7 +44,7 @@ pub fn refuse_on_multi_keyspace_node(feature: &str) -> Result<(), DriverError> {
 
 /// The PD-backed part of `ddl`, if any: the feature a multi-keyspace node
 /// refuses for it (design §10 phase 2). Resource groups, placement policies,
-/// label rules (`ATTRIBUTES`), TiFlash replicas and FLASHBACK CLUSTER's
+/// TiFlash replicas and FLASHBACK CLUSTER's
 /// schedule limits are written through the process's PD clients, which
 /// belong to whichever keyspace opened last (phase 3b); an `AUTO_ID_CACHE=1` table allocates through the AutoID
 /// service only the configured keyspace runs (phase 3f).
@@ -75,9 +75,7 @@ pub fn pd_backed_ddl_feature(ddl: &tidb_ast::DdlStmt) -> Option<&'static str> {
         DdlStmt::AlterTable(alter) => alter.actions.iter().find_map(|action| match action {
             AlterTableAction::SetTableOptions { options } => table_options_feature(options),
             AlterTableAction::SetTiFlashReplica { .. } => Some("SET TIFLASH REPLICA"),
-            AlterTableAction::SetAttributes(_) => Some("ATTRIBUTES"),
             AlterTableAction::Partition(partition) => match partition {
-                AlterPartitionAction::SetAttributes { .. } => Some("ATTRIBUTES"),
                 AlterPartitionAction::SetOptions { options, .. } => table_options_feature(options),
                 AlterPartitionAction::Add { spec: AddPartitionSpec::Definitions(definitions), .. }
                 | AlterPartitionAction::Reorganize { definitions, .. } => partition_definitions_feature(definitions),

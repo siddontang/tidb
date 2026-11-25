@@ -124,7 +124,9 @@ pub fn cluster_session_stack(
     // domains (the bootstrap's and the serving one) and their DDL use. The
     // configured keyspace's is also the process's, which a thread that
     // entered none reads.
-    let info_syncer = Arc::new(tidb_domain_infosync::info_syncer::InfoSyncer::default());
+    let info_syncer = Arc::new(tidb_domain_infosync::info_syncer::InfoSyncer::new(
+        tidb_keyspace::KeyspaceCodec::keyspace_id(&tikv_store),
+    ));
     if !global_vars.vardef().is_per_keyspace() {
         tidb_domain_infosync::info_syncer::set_global_info_syncer(Arc::clone(&info_syncer));
     }

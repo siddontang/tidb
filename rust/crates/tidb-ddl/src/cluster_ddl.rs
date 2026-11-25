@@ -4229,7 +4229,7 @@ fn plan_persisted_drop_schema_job_step(
             .map(LabelRuleTable::from_table_info)
             .collect::<Vec<_>>();
         label_rules.push(
-            label_rules::drop_schema_label_rules(&active.job.schema_name.to_string(), &tables),
+            label_rules::drop_schema_label_rules(label_rules.codec(), &active.job.schema_name.to_string(), &tables),
             None,
         )?;
     }
@@ -4512,7 +4512,9 @@ fn plan_persisted_drop_table_job_step(
         // Go `onDropTableOrView`'s `dropMaskingPoliciesOnTable`.
         masking_policy::drop_masking_policies_on_table(txn, table.id)?;
         let old_partition_ids = add_index::partition_ids(&table);
-        let codec = tidb_ddl_label::CodecV1;
+        // Go `jobCtx.store.GetCodec()`.
+        let info_syncer = tidb_domain_infosync::info_syncer::get();
+        let codec = info_syncer.label_codec();
         let schema_name = active.job.schema_name.to_string();
         let mut rule_ids: Vec<String> = table
             .partition
@@ -4525,7 +4527,7 @@ fn plan_persisted_drop_table_job_step(
                     .iter()
                     .map(|definition| {
                         tidb_ddl_label::new_rule_id(
-                            &codec,
+                            codec,
                             &schema_name,
                             table.name.lowercase(),
                             definition.name.lowercase(),
@@ -4535,7 +4537,7 @@ fn plan_persisted_drop_table_job_step(
             })
             .unwrap_or_default();
         rule_ids.push(tidb_ddl_label::new_rule_id(
-            &codec,
+            codec,
             &schema_name,
             table.name.lowercase(),
             "",
@@ -4669,40 +4671,6 @@ pub(crate) fn step_pd_write(feature: &str) -> Result<bool, DdlPlanError> {
         StepPdWrites::Allow => Ok(true),
         StepPdWrites::Skip => Ok(false),
         StepPdWrites::Refuse => Err(multi_keyspace_refusal(feature)),
-    }
-}
-
-/// The label rule manager a job step reads and writes. On a multi-keyspace
-/// node label operations are suppressed (phase 3b): the step builds its
-/// rule IDs with the keyspace-less codec, so two tenants with the same
-/// database and table names would share rules. The suppressed manager
-/// holds no rules and takes no writes.
-pub(crate) fn job_label_rule_manager() -> std::sync::Arc<dyn tidb_domain_infosync::label_manager::LabelRuleManager> {
-    if tidb_keyspace::is_multi_keyspace_mode() {
-        std::sync::Arc::new(SuppressedLabelRules)
-    } else {
-        tidb_domain_infosync::label_manager::label_rule_manager()
-    }
-}
-
-#[derive(Debug)]
-struct SuppressedLabelRules;
-
-impl tidb_domain_infosync::label_manager::LabelRuleManager for SuppressedLabelRules {
-    fn put_label_rule(&self, _rule: &tidb_ddl_label::Rule) -> Result<(), String> {
-        Ok(())
-    }
-    fn update_label_rules(&self, _patch: &tidb_ddl_label::LabelRulePatch) -> Result<(), String> {
-        Ok(())
-    }
-    fn get_all_label_rules(&self, _codec: &dyn tidb_ddl_label::LabelCodec) -> Result<Vec<tidb_ddl_label::Rule>, String> {
-        Ok(Vec::new())
-    }
-    fn get_label_rules(
-        &self,
-        _rule_ids: &[String],
-    ) -> Result<std::collections::BTreeMap<String, tidb_ddl_label::Rule>, String> {
-        Ok(std::collections::BTreeMap::new())
     }
 }
 
@@ -5156,9 +5124,8 @@ pub(super) fn record_ddl_action_error(job: &mut Job, error: &DdlPlanError) -> bo
 }
 
 /// The PD write a job step's resolved metadata would make, if any, that a
-/// multi-keyspace node refuses. Label rules are not among them: on such a
-/// node the step's label manager is [`job_label_rule_manager`], which
-/// suppresses them, so a step carries no label write to refuse.
+/// multi-keyspace node refuses. Label rules are not among them: their IDs
+/// and ranges carry the job's keyspace (Go `UseKeyspaceAwareRules`).
 fn pd_backed_write_feature(write: &DdlWrite) -> Option<&'static str> {
     if !write.placement_bundles.is_empty() {
         Some("PLACEMENT")
@@ -5439,18 +5406,23 @@ pub struct LabelRuleStep {
     pub error_context: Option<&'static str>,
 }
 
-/// The label-rule writes of one job step, staged over the node's manager so
-/// the step's later reads see its earlier writes, as Go's step, which writes
-/// PD call by call, does.
+/// The label-rule writes of one job step, staged over its keyspace's manager
+/// so the step's later reads see its earlier writes, as Go's step, which
+/// writes PD call by call, does.
 pub(crate) struct LabelRuleSteps {
     staged: tidb_domain_infosync::label_manager::StagedLabelRules,
+    /// The job's DDL's info syncer (design §6.2), whose codec is Go's
+    /// `jobCtx.store.GetCodec()`.
+    info_syncer: std::sync::Arc<tidb_domain_infosync::info_syncer::InfoSyncer>,
     steps: Vec<LabelRuleStep>,
 }
 
 impl LabelRuleSteps {
     fn new() -> Self {
+        let info_syncer = tidb_domain_infosync::info_syncer::get();
         Self {
-            staged: tidb_domain_infosync::label_manager::StagedLabelRules::new(job_label_rule_manager()),
+            staged: tidb_domain_infosync::label_manager::StagedLabelRules::new(info_syncer.label_rule_manager()),
+            info_syncer,
             steps: Vec::new(),
         }
     }
@@ -5458,6 +5430,12 @@ impl LabelRuleSteps {
     /// The rules as the step sees them.
     fn manager(&self) -> &dyn tidb_domain_infosync::label_manager::LabelRuleManager {
         &self.staged
+    }
+
+    /// Go `jobCtx.store.GetCodec()`: the keyspace the rule IDs and ranges
+    /// carry.
+    fn codec(&self) -> &dyn tidb_ddl_label::LabelCodec {
+        self.info_syncer.label_codec()
     }
 
     fn push(
@@ -5487,6 +5465,7 @@ impl LabelRuleSteps {
     ) -> Result<(), DdlPlanError> {
         let writes = label_rules::partition_label_writes(
             self.manager(),
+            self.codec(),
             &schema.go_to_lower(),
             &LabelRuleTable::from_table_info(before),
             &LabelRuleTable::from_table_info(after),
@@ -6178,6 +6157,7 @@ fn apply_truncate_table(
     let label_table = LabelRuleTable::from_table_info(&info);
     let old_rules = label_rules::get_old_label_rules(
         label_rules.manager(),
+        label_rules.codec(),
         &label_table,
         &schema.go_to_lower(),
         &label_table.name,
@@ -6185,6 +6165,7 @@ fn apply_truncate_table(
     .map_err(|error| pd_step_error(Some("failed to get old label rules from PD"), error))?;
     label_rules.push(
         label_rules::update_label_rules(
+            label_rules.codec(),
             &schema.go_to_lower(),
             &label_table,
             &old_rules,

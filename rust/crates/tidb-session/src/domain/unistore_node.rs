@@ -562,7 +562,9 @@ pub fn unistore_cluster_session_stack_from_for_keyspace(
     // `mockPlacementManager`, `mockScheduleManager`, the mock resource
     // manager) and which has no `pdHTTPCli`. The newest store's is also the
     // process's; its domain keeps it (design §6.2).
-    let info_syncer = Arc::new(tidb_domain_infosync::info_syncer::InfoSyncer::default());
+    let info_syncer = Arc::new(tidb_domain_infosync::info_syncer::InfoSyncer::new(
+        tidb_keyspace::KeyspaceCodec::keyspace_id(tikv_store.as_ref()),
+    ));
     tidb_domain_infosync::info_syncer::set_global_info_syncer(Arc::clone(&info_syncer));
     let _info_syncer = tidb_domain_infosync::info_syncer::enter(Arc::clone(&info_syncer));
     // Go `initDomainSysVars` and `LoadSysVarCacheLoop`: the domain owns the

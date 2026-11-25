@@ -388,8 +388,8 @@ impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for Co
 }
 
 /// A multi-keyspace node refuses the DDL whose effect lives in PD --
-/// resource groups, placement policies and options, label rules
-/// (`ATTRIBUTES`), TiFlash replicas -- and `AUTO_ID_CACHE=1` tables, whose
+/// resource groups, placement policies and options, TiFlash replicas --
+/// and `AUTO_ID_CACHE=1` tables, whose
 /// IDs come from the AutoID service only the configured keyspace runs, with
 /// `ER_NOT_SUPPORTED_YET` (1235) before any PD client is called (design §10
 /// phase 2, until 3b and 3f make them per keyspace). The counting placement
@@ -428,8 +428,6 @@ fn a_multi_keyspace_node_refuses_pd_backed_ddl() {
         "alter table t placement policy = default",
         "alter table t partition p0 placement policy = default",
         "alter table t set tiflash replica 1",
-        "alter table t attributes = 'merge_option=deny'",
-        "alter table t partition p0 attributes = 'merge_option=deny'",
         "create table t3 (a int primary key auto_increment) auto_id_cache = 1",
         "alter table t auto_id_cache = 1",
     ];
@@ -532,44 +530,6 @@ fn a_multi_keyspace_node_refuses_ddl_jobs_that_carry_placement() {
     tidb_domain_infosync::placement_manager::init_placement_manager(Some(placement));
 }
 
-/// A label rule manager that counts its calls over an in-memory one.
-#[derive(Debug, Default)]
-struct CountingLabels {
-    calls: std::sync::atomic::AtomicUsize,
-    inner: tidb_domain_infosync::label_manager::MockLabelManager,
-}
-
-impl CountingLabels {
-    fn calls(&self) -> usize {
-        self.calls.load(std::sync::atomic::Ordering::SeqCst)
-    }
-    fn count(&self) {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-impl tidb_domain_infosync::label_manager::LabelRuleManager for CountingLabels {
-    fn put_label_rule(&self, rule: &tidb_ddl_label::Rule) -> Result<(), String> {
-        self.count();
-        self.inner.put_label_rule(rule)
-    }
-    fn update_label_rules(&self, patch: &tidb_ddl_label::LabelRulePatch) -> Result<(), String> {
-        self.count();
-        self.inner.update_label_rules(patch)
-    }
-    fn get_all_label_rules(&self, codec: &dyn tidb_ddl_label::LabelCodec) -> Result<Vec<tidb_ddl_label::Rule>, String> {
-        self.count();
-        self.inner.get_all_label_rules(codec)
-    }
-    fn get_label_rules(
-        &self,
-        rule_ids: &[String],
-    ) -> Result<std::collections::BTreeMap<String, tidb_ddl_label::Rule>, String> {
-        self.count();
-        self.inner.get_label_rules(rule_ids)
-    }
-}
-
 /// A TiFlash replica manager that counts its PD calls over another one.
 struct CountingTiFlash {
     calls: std::sync::atomic::AtomicUsize,
@@ -641,69 +601,39 @@ impl tidb_domain_infosync::tiflash_manager::TiFlashReplicaManager for CountingTi
     }
 }
 
-/// Label rules and inherited TiFlash replicas on a multi-keyspace node
-/// (design §10 phase 2, until 3b). A DDL step builds label rule IDs with
-/// the keyspace-less codec (`schema/<db>/<table>`), so two tenants with the
-/// same names would share rules: label operations are suppressed, and the
-/// counting label manager sees no call while TRUNCATE, RENAME and partition
-/// DDL of same-named tables run in two keyspaces. A table whose TiFlash
-/// replica was set before keeps it in its TableInfo, and a partition change
-/// or TRUNCATE would configure its new IDs in PD inside the step: refused
+/// Inherited TiFlash replicas on a multi-keyspace node (design §10 phase
+/// 2): a table whose TiFlash replica was set before keeps it in its
+/// TableInfo, and a partition change or TRUNCATE would configure its new IDs
+/// in PD inside the step, under rule IDs that carry no keyspace: refused
 /// with 1235 before any TiFlash manager call. A single-keyspace node makes
-/// both kinds of calls as before.
+/// the calls as before.
 #[test]
-fn a_multi_keyspace_node_writes_no_label_rules_or_inherited_tiflash_rules() {
+fn a_multi_keyspace_node_writes_no_inherited_tiflash_rules() {
     if !tidb_config_kerneltype::is_next_gen() {
         // Multi-keyspace serving is nextgen only.
         return;
     }
     let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
-    let tenant_a = MockStoreDomain::create_with_mock_tiflash(1).unwrap();
-    let tenant_b = MockStoreDomain::create().unwrap();
-    // PD's label rules, which both keyspaces reach.
-    let labels = std::sync::Arc::new(CountingLabels::default());
-    tenant_a.info_syncer().init_label_rule_manager(Some(labels.clone()));
-    tenant_b.info_syncer().init_label_rule_manager(Some(labels.clone()));
+    let tenant = MockStoreDomain::create_with_mock_tiflash(1).unwrap();
     let tiflash = std::sync::Arc::new(CountingTiFlash {
         calls: std::sync::atomic::AtomicUsize::new(0),
-        inner: tenant_a.info_syncer().tiflash_replica_manager(),
+        inner: tenant.info_syncer().tiflash_replica_manager(),
     });
-    tenant_a.info_syncer().init_tiflash_replica_manager(Some(tiflash.clone()));
+    tenant.info_syncer().init_tiflash_replica_manager(Some(tiflash.clone()));
 
-    // Single-keyspace: the label rules and the TiFlash replica reach PD.
-    let mut a = tenant_a.new_session().unwrap();
+    // Single-keyspace: the TiFlash replica reaches PD.
+    let mut a = tenant.new_session().unwrap();
     for sql in [
         "use test",
-        "create table lt (a int) partition by range (a) (partition p0 values less than (10), partition p1 values less than (20))",
-        "alter table lt partition p0 attributes = 'merge_option=deny'",
-        "truncate table lt",
         "create table ft (a int) partition by range (a) (partition p0 values less than (10))",
         "alter table ft set tiflash replica 1",
     ] {
         a.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
     }
-    assert!(labels.calls() > 0);
     assert!(tiflash.calls() > 0);
-    let (label_calls, tiflash_calls) = (labels.calls(), tiflash.calls());
+    let tiflash_calls = tiflash.calls();
 
     tidb_keyspace::set_multi_keyspace_mode(true);
-    // The same names in both keyspaces: no label call from either.
-    let mut b = tenant_b.new_session().unwrap();
-    b.run("use test").unwrap();
-    b.run("create table lt (a int) partition by range (a) (partition p0 values less than (10), partition p1 values less than (20))")
-        .unwrap();
-    for session in [&mut a, &mut b] {
-        for sql in [
-            "truncate table lt",
-            "alter table lt truncate partition p0",
-            "alter table lt add partition (partition p2 values less than (30))",
-            "rename table lt to lt2",
-            "rename table lt2 to lt",
-        ] {
-            assert_eq!(refusal(session, sql), None, "{sql}");
-        }
-    }
-    assert_eq!(labels.calls(), label_calls, "no label call in multi-keyspace mode");
     // The inherited TiFlash replica: refused before the manager is called.
     for sql in ["alter table ft add partition (partition p1 values less than (20))", "truncate table ft"] {
         let (code, message) = refusal(&mut a, sql).unwrap_or_else(|| panic!("{sql} ran"));
@@ -1068,38 +998,6 @@ fn a_resumed_columnar_index_does_not_poll_progress_on_a_multi_keyspace_node() {
     );
     assert_eq!(row_text(session.run("select count(*) from mysql.tidb_ddl_job")), [["0"]]);
     tidb_keyspace::set_multi_keyspace_mode(false);
-}
-
-/// INFORMATION_SCHEMA.ATTRIBUTES lists label rules, whose IDs carry no
-/// keyspace: its name and physical-ID checks cannot tell one tenant's rules
-/// from another's. A multi-keyspace node lists none and does not ask the
-/// label manager (design §10 phase 2, until 3b); a single-keyspace node
-/// lists the table's rule as before.
-#[test]
-fn a_multi_keyspace_node_lists_no_label_rule_attributes() {
-    if !tidb_config_kerneltype::is_next_gen() {
-        // Multi-keyspace serving is nextgen only.
-        return;
-    }
-    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
-    let store = MockStoreDomain::create().unwrap();
-    let labels = std::sync::Arc::new(CountingLabels::default());
-    let previous_labels = tidb_domain_infosync::label_manager::label_rule_manager();
-    tidb_domain_infosync::label_manager::init_label_rule_manager(Some(labels.clone()));
-    let mut session = store.new_session().unwrap();
-    for sql in ["use test", "create table at (a int)", "alter table at attributes = 'merge_option=deny'"] {
-        session.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
-    }
-    let attributes = "select id, attributes from information_schema.attributes where id = 'schema/test/at'";
-    assert_eq!(row_text(session.run(attributes)), [["schema/test/at", "\"merge_option=deny\""]]);
-
-    tidb_keyspace::set_multi_keyspace_mode(true);
-    let calls = labels.calls();
-    assert!(row_text(session.run("select * from information_schema.attributes")).is_empty());
-    assert_eq!(labels.calls(), calls, "no label manager call in multi-keyspace mode");
-
-    tidb_keyspace::set_multi_keyspace_mode(false);
-    tidb_domain_infosync::label_manager::init_label_rule_manager(Some(previous_labels));
 }
 
 /// FLASHBACK CLUSTER closes and later restores PD's schedule limits, which
@@ -1547,4 +1445,106 @@ fn each_keyspace_keeps_its_own_pd_managers() {
     }
     assert_eq!(refusal(&mut a, "alter range global placement policy default"), None);
     assert_eq!(refusal(&mut a, "drop placement policy p1"), None);
+}
+
+/// The keyspace codec of a mock store's domain.
+fn keyspace_codec(store: &MockStoreDomain) -> tikv_client::request::ApiV2Codec {
+    *store.info_syncer().codec().expect("a keyspace store")
+}
+
+/// Go `hex.EncodeToString`.
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// `start_key`..`end_key` of a label rule's first range.
+fn label_rule_range(rule: &tidb_ddl_label::Rule) -> (String, String) {
+    let data = rule.data.as_ref().expect("a key-range rule").read().clone();
+    let range = &data[0];
+    (range["start_key"].as_str().unwrap().to_owned(), range["end_key"].as_str().unwrap().to_owned())
+}
+
+/// Label rules of two keyspaces on one node (design §6.2). A DDL step
+/// builds a rule's ID and range with its keyspace's codec (Go
+/// `jobCtx.store.GetCodec()`), so the same table name under the same table
+/// ID in two keyspaces gets two rules in PD, `keyspace/<id>/schema/test/t`,
+/// each over its own keyspace's keys. Each keyspace's ATTRIBUTES lists only
+/// its own rule, and RENAME and TRUNCATE in one keyspace move only its own.
+/// Before, a multi-keyspace node refused `ATTRIBUTES` (1235) and wrote no
+/// label rule.
+#[test]
+fn two_keyspaces_keep_their_own_label_rules() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
+    let stores = [
+        ("deny", MockStoreDomain::create_for_keyspace("ks_a").unwrap()),
+        ("allow", MockStoreDomain::create_for_keyspace("ks_b").unwrap()),
+    ];
+    tidb_keyspace::set_multi_keyspace_mode(true);
+    // PD's label rules, which both keyspaces reach.
+    let pd = std::sync::Arc::new(tidb_domain_infosync::label_manager::MockLabelManager::default());
+    let mut sessions = Vec::new();
+    for (option, store) in &stores {
+        store.info_syncer().init_label_rule_manager(Some(pd.clone()));
+        let mut session = store.new_session().unwrap();
+        for sql in [
+            "use test".to_owned(),
+            "create table t (a int)".to_owned(),
+            format!("alter table t attributes = 'merge_option={option}'"),
+        ] {
+            session.run(&sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        }
+        sessions.push(session);
+    }
+    let table_id = physical_id(&mut sessions[0], "t", None);
+    assert_eq!(physical_id(&mut sessions[1], "t", None), table_id, "the table IDs collide");
+
+    let rules = || {
+        tidb_domain_infosync::label_manager::LabelRuleManager::get_all_label_rules(&*pd, &tidb_ddl_label::CodecV1)
+            .unwrap()
+    };
+    let rule_id = |store: &MockStoreDomain, table: &str| {
+        format!("keyspace/{}/schema/test/{table}", keyspace_codec(store).keyspace_id())
+    };
+    let expected_range = |store: &MockStoreDomain, id: i64| {
+        let (start, end) = keyspace_codec(store).encode_region_range(
+            &tidb_tablecodec::table_key::gen_table_prefix(id),
+            &tidb_tablecodec::table_key::gen_table_prefix(id + 1),
+        );
+        (hex_lower(&start), hex_lower(&end))
+    };
+    let stored = rules();
+    assert_eq!(stored.len(), 2, "{stored:?}");
+    for (option, store) in &stores {
+        let rule = stored.iter().find(|rule| rule.id == rule_id(store, "t")).expect("the keyspace's rule");
+        assert_eq!(label_rule_range(rule), expected_range(store, table_id));
+        assert_eq!(
+            tidb_ddl_label::restore_region_labels(&rule.labels.snapshot()),
+            format!("\"merge_option={option}\"")
+        );
+    }
+    let attributes = "select id, attributes from information_schema.attributes";
+    for ((option, _), session) in stores.iter().zip(&mut sessions) {
+        assert_eq!(
+            row_text(session.run(attributes)),
+            [["schema/test/t".to_owned(), format!("\"merge_option={option}\"")]]
+        );
+    }
+
+    // One keyspace's RENAME and TRUNCATE move only its own rule.
+    assert_eq!(refusal(&mut sessions[0], "rename table t to t2"), None);
+    assert_eq!(refusal(&mut sessions[1], "truncate table t"), None);
+    let truncated = physical_id(&mut sessions[1], "t", None);
+    let stored = rules();
+    let ids = stored.iter().map(|rule| rule.id.clone()).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids, [rule_id(&stores[0].1, "t2"), rule_id(&stores[1].1, "t")].into_iter().collect());
+    for (store, table, id) in [(&stores[0].1, "t2", table_id), (&stores[1].1, "t", truncated)] {
+        let rule = stored.iter().find(|rule| rule.id == rule_id(store, table)).unwrap();
+        assert_eq!(label_rule_range(rule), expected_range(store, id), "{table}");
+    }
+    assert_eq!(row_text(sessions[0].run("select id from information_schema.attributes")), [["schema/test/t2"]]);
+    assert_eq!(row_text(sessions[1].run("select id from information_schema.attributes")), [["schema/test/t"]]);
 }

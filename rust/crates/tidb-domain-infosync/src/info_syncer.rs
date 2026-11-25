@@ -24,6 +24,9 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
+use tidb_ddl_label::{CodecV1, LabelCodec};
+use tikv_client::request::{ApiV2Codec, KeyMode};
+
 use crate::label_manager::{LabelRuleManager, MockLabelManager};
 use crate::placement_manager::{MockPlacementManager, PlacementManager};
 use crate::region::PdHttpClient;
@@ -34,6 +37,9 @@ use crate::tiflash_manager::{MockTiFlashReplicaManagerCtx, TiFlashReplicaManager
 /// Go `InfoSyncer`'s PD managers. A new one holds Go's managers for a node
 /// without PD (the mocks); the `init_*` methods install PD's.
 pub struct InfoSyncer {
+    /// Go `InfoSyncer.tikvCodec`: the codec of the domain's store, `None`
+    /// for an API-V1 store.
+    codec: Option<ApiV2Codec>,
     label_rule_manager: RwLock<Arc<dyn LabelRuleManager>>,
     placement_manager: RwLock<Arc<dyn PlacementManager>>,
     schedule_manager: RwLock<Arc<dyn ScheduleManager>>,
@@ -51,6 +57,7 @@ impl std::fmt::Debug for InfoSyncer {
 impl Default for InfoSyncer {
     fn default() -> Self {
         Self {
+            codec: None,
             label_rule_manager: RwLock::new(Arc::new(MockLabelManager::default())),
             placement_manager: RwLock::new(Arc::new(MockPlacementManager::default())),
             schedule_manager: RwLock::new(Arc::new(MockScheduleManager::default())),
@@ -70,6 +77,31 @@ fn write<T>(slot: &RwLock<T>, value: T) {
 }
 
 impl InfoSyncer {
+    /// The info syncer of a store whose keyspace ID is `keyspace_id` (Go
+    /// `tikv.Codec.GetKeyspaceID`, the null keyspace for an API-V1 store),
+    /// with Go's managers for a node without PD.
+    #[must_use]
+    pub fn new(keyspace_id: u32) -> Self {
+        Self {
+            codec: ApiV2Codec::new(KeyMode::Txn, keyspace_id).ok(),
+            ..Self::default()
+        }
+    }
+
+    /// Go `InfoSyncer.tikvCodec` when the store serves a keyspace.
+    pub fn codec(&self) -> Option<&ApiV2Codec> {
+        self.codec.as_ref()
+    }
+
+    /// Go `InfoSyncer.tikvCodec` as the label rules read it: the keyspace
+    /// codec, or the keyspace-less one of an API-V1 store.
+    pub fn label_codec(&self) -> &dyn LabelCodec {
+        match &self.codec {
+            Some(codec) => codec,
+            None => &CodecV1,
+        }
+    }
+
     /// Go `initLabelRuleManager`: PD's manager, or a fresh mock.
     pub fn init_label_rule_manager(&self, manager: Option<Arc<dyn LabelRuleManager>>) {
         write(

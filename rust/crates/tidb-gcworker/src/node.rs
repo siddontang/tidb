@@ -330,11 +330,11 @@ impl NodeGcRules {
     }
 }
 
-/// A multi-keyspace node leaves PD's rules alone when it GCs a tenant's
-/// dropped objects (design §10 phase 2): the PD clients are the process's,
-/// and placement group IDs (`TiDB_DDL_<id>`) carry no keyspace, so a
-/// tenant's cleanup could delete another keyspace's rules. Rules a table
-/// had before the node served several keyspaces stay until phase 3b.
+/// A multi-keyspace node leaves PD's placement and TiFlash rules alone when
+/// it GCs a tenant's dropped objects (design §10 phase 2): their IDs
+/// (`TiDB_DDL_<id>`, `table-<id>-r`) carry no keyspace, so a tenant's
+/// cleanup could delete another keyspace's rules. Label rules carry their
+/// keyspace and are cleaned up.
 fn skip_pd_rule_cleanup() -> bool {
     tidb_keyspace::is_multi_keyspace_mode()
 }
@@ -362,24 +362,29 @@ impl GcRuleClient for NodeGcRules {
         .map_err(gc_error)
     }
 
+    /// Go `infosync.GetLabelRules`, kept to the rules of the store's keyspace
+    /// (`filterRulesByKeyspace`): an ID a keyspace-less codec built (a job
+    /// an older node ran) names no keyspace, and another keyspace may hold
+    /// it, so the keyspace's GC leaves it alone.
     fn get_label_rules(
         &self,
         rule_ids: &[String],
     ) -> GcResult<HashMap<String, tidb_ddl_label::Rule>> {
-        if skip_pd_rule_cleanup() {
-            return Ok(HashMap::new());
-        }
-        self.info_syncer()
+        let info_syncer = self.info_syncer();
+        let rules = info_syncer
             .label_rule_manager()
             .get_label_rules(rule_ids)
-            .map(|rules| rules.into_iter().collect())
-            .map_err(GcError::new)
+            .map_err(GcError::new)?;
+        Ok(tidb_domain_infosync::label_manager::filter_rules_by_keyspace(
+            rules.into_values().collect(),
+            info_syncer.label_codec(),
+        )
+        .into_iter()
+        .map(|rule| (rule.id.clone(), rule))
+        .collect())
     }
 
     fn delete_label_rules(&self, rule_ids: Vec<String>) -> GcResult<()> {
-        if skip_pd_rule_cleanup() {
-            return Ok(());
-        }
         self.info_syncer()
             .label_rule_manager()
             .update_label_rules(&tidb_ddl_label::new_rule_patch(
@@ -387,6 +392,50 @@ impl GcRuleClient for NodeGcRules {
                 rule_ids,
             ))
             .map_err(GcError::new)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tidb_domain_infosync::info_syncer::InfoSyncer;
+    use tidb_domain_infosync::label_manager::{LabelRuleManager, MockLabelManager};
+
+    use super::*;
+
+    /// A keyspace's GC reads only its own keyspace's label rules (design
+    /// §6.2): the same table rule of another keyspace, and one whose ID
+    /// names no keyspace, stay for their own GC.
+    #[test]
+    fn gc_reads_only_its_keyspaces_label_rules() {
+        if !tidb_config_kerneltype::is_next_gen() {
+            // Keyspace-aware label rules are next-generation only.
+            return;
+        }
+        let pd = Arc::new(MockLabelManager::default());
+        let mut ids = Vec::new();
+        for keyspace_id in [1, 2, u32::MAX] {
+            let syncer = InfoSyncer::new(keyspace_id);
+            let mut rule = tidb_ddl_label::Rule::new();
+            rule.reset(syncer.label_codec(), "d", "t", "", &[100]);
+            pd.put_label_rule(&rule).unwrap();
+            ids.push(rule.id);
+        }
+        let own = InfoSyncer::new(1);
+        own.init_label_rule_manager(Some(pd.clone()));
+        let rules = NodeGcRules {
+            pd_http_client: None,
+            info_syncer: Some(Arc::new(own)),
+        };
+        let found = GcRuleClient::get_label_rules(&rules, &ids).unwrap();
+        assert_eq!(found.keys().cloned().collect::<Vec<_>>(), ["keyspace/1/schema/d/t"]);
+        GcRuleClient::delete_label_rules(&rules, found.into_keys().collect()).unwrap();
+        let left = pd.get_all_label_rules(&tidb_ddl_label::CodecV1).unwrap();
+        assert_eq!(
+            left.into_iter().map(|rule| rule.id).collect::<Vec<_>>(),
+            ["keyspace/2/schema/d/t", "schema/d/t"]
+        );
     }
 }
 

@@ -768,6 +768,7 @@ fn recover_table(
     let label_table = LabelRuleTable::from_table_info(&table.read());
     let old_rules = label_rules::get_old_label_rules(
         label_rules.manager(),
+        label_rules.codec(),
         &label_table,
         &old_schema_name,
         &old_table_name,
@@ -810,6 +811,7 @@ fn recover_table(
     label_rules
         .push(
             label_rules::update_label_rules(
+                label_rules.codec(),
                 &active.job.schema_name.to_string(),
                 &label_table,
                 &old_rules,

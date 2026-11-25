@@ -539,22 +539,30 @@ fn enum_set_binary_literal_members_decode_in_the_column_charset() {
 /// table prefix, up to the next ID's).
 #[test]
 fn attributes_label_rules_follow_go() {
-    fn key_range(id: i64) -> String {
-        let prefix = |id: i64| {
+    // Go `Rule.Reset`'s ranges: the store's keyspace codec encodes them on
+    // a next-generation kernel (`UseKeyspaceAwareRules`).
+    fn key_range(codec: &dyn tidb_ddl_label::LabelCodec, id: i64) -> String {
+        let hex = |key: &[u8]| key.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let (start, end) = (
+            tidb_tablecodec::table_key::gen_table_prefix(id),
+            tidb_tablecodec::table_key::gen_table_prefix(id + 1),
+        );
+        if tidb_ddl_label::use_keyspace_aware_rules(codec) {
+            let (start, end) = codec.encode_region_range(&start, &end);
+            return format!("[{}, {}]", hex(&start), hex(&end));
+        }
+        let encode = |key: &[u8]| {
             let mut encoded = Vec::new();
-            tidb_codec::encode_bytes(&mut encoded, &tidb_tablecodec::table_key::gen_table_prefix(id));
-            encoded
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
+            tidb_codec::encode_bytes(&mut encoded, key);
+            hex(&encoded)
         };
-        format!("[{}, {}]", prefix(id), prefix(id + 1))
+        format!("[{}, {}]", encode(&start), encode(&end))
     }
-    fn ranges(ids: &[i64]) -> String {
+    fn ranges(codec: &dyn tidb_ddl_label::LabelCodec, ids: &[i64]) -> String {
         let mut ids = ids.to_vec();
         ids.sort_unstable();
         ids.iter()
-            .map(|id| key_range(*id))
+            .map(|id| key_range(codec, *id))
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -577,16 +585,18 @@ fn attributes_label_rules_follow_go() {
         .map(|row| (row[0].clone(), row[1].parse().unwrap()))
         .collect()
     }
-    fn row(id: &str, labels: &str, ids: &[i64]) -> Vec<String> {
+    fn row(codec: &dyn tidb_ddl_label::LabelCodec, id: &str, labels: &str, ids: &[i64]) -> Vec<String> {
         vec![
             id.to_owned(),
             "key-range".to_owned(),
             labels.to_owned(),
-            ranges(ids),
+            ranges(codec, ids),
         ]
     }
 
     let mut session = Session::new();
+    let info_syncer = crate::domain::mock_store::domain_of(&session).expect("a mock-store session").info_syncer();
+    let codec = info_syncer.label_codec();
     session.run("use test").unwrap();
     session
         .run(
@@ -606,8 +616,8 @@ fn attributes_label_rules_follow_go() {
     assert_eq!(
         attributes(&mut session),
         [
-            row("schema/test/t", "\"key=value\"", &[t, p0, p1]),
-            row("schema/test/t/p0", "\"key1=value1\"", &[p0]),
+            row(codec, "schema/test/t", "\"key=value\"", &[t, p0, p1]),
+            row(codec, "schema/test/t/p0", "\"key1=value1\"", &[p0]),
         ]
     );
 
@@ -616,8 +626,8 @@ fn attributes_label_rules_follow_go() {
     assert_eq!(
         attributes(&mut session),
         [
-            row("schema/test/t2", "\"key=value\"", &[t, p0, p1]),
-            row("schema/test/t2/p0", "\"key1=value1\"", &[p0]),
+            row(codec, "schema/test/t2", "\"key=value\"", &[t, p0, p1]),
+            row(codec, "schema/test/t2/p0", "\"key1=value1\"", &[p0]),
         ]
     );
 
@@ -627,8 +637,8 @@ fn attributes_label_rules_follow_go() {
     assert_eq!(
         attributes(&mut session),
         [
-            row("schema/test/t2", "\"key=value\"", &[t, p0, p1]),
-            row("schema/test/t2/p0", "\"key1=value1\"", &[p0]),
+            row(codec, "schema/test/t2", "\"key=value\"", &[t, p0, p1]),
+            row(codec, "schema/test/t2/p0", "\"key1=value1\"", &[p0]),
         ]
     );
 
@@ -640,7 +650,7 @@ fn attributes_label_rules_follow_go() {
     session.run("alter table t2 drop partition p0").unwrap();
     assert_eq!(
         attributes(&mut session),
-        [row("schema/test/t2", "\"key=value\"", &[t, p1, p2])]
+        [row(codec, "schema/test/t2", "\"key=value\"", &[t, p1, p2])]
     );
 
     // REORGANIZE spans the reorganized partition as well as its successors.
@@ -655,6 +665,7 @@ fn attributes_label_rules_follow_go() {
     assert_eq!(
         attributes(&mut session),
         [row(
+            codec,
             "schema/test/t2",
             "\"key=value\"",
             &[t, p1, p2, p1a, p1b]
@@ -688,6 +699,7 @@ fn attributes_label_rules_follow_go() {
     assert_eq!(
         attributes(&mut session),
         [row(
+            codec,
             "schema/test/t2",
             "\"key=value\",\"key2=value2\"",
             &[t, p1a, p1b, p2]
@@ -749,8 +761,8 @@ fn attributes_label_rules_follow_go() {
     assert_eq!(
         attributes(&mut session),
         [
-            row("schema/test/nt", "\"p=two\"", &[nt]),
-            row("schema/test/t2/p2", "\"n=t\"", &[p2]),
+            row(codec, "schema/test/nt", "\"p=two\"", &[nt]),
+            row(codec, "schema/test/t2/p2", "\"n=t\"", &[p2]),
         ]
     );
 
@@ -765,8 +777,8 @@ fn attributes_label_rules_follow_go() {
     assert_eq!(
         attributes(&mut session),
         [
-            row("schema/adb/a2", "\"k=v\"", &[a2]),
-            row("schema/test/t2/p2", "\"n=t\"", &[p2]),
+            row(codec, "schema/adb/a2", "\"k=v\"", &[a2]),
+            row(codec, "schema/test/t2/p2", "\"n=t\"", &[p2]),
         ]
     );
     session.run("drop database adb").unwrap();
@@ -774,7 +786,7 @@ fn attributes_label_rules_follow_go() {
     session.run("create table adb.a2 (c int)").unwrap();
     assert_eq!(
         attributes(&mut session),
-        [row("schema/test/t2/p2", "\"n=t\"", &[p2])]
+        [row(codec, "schema/test/t2/p2", "\"n=t\"", &[p2])]
     );
 }
 

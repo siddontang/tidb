@@ -536,7 +536,7 @@ pub(super) fn on_exchange_table_partition(
         standalone_id: original_partition_id,
     };
     let label_write = swap
-        .label_write(label_rules.manager())
+        .label_write(label_rules.manager(), label_rules.codec())
         .map_err(|error| pd_step_error(Some("failed to get PD the label rules"), error))?;
     label_rules.push(label_write, Some(LABEL_RULES_NOTIFY_ERROR))?;
     active.job.schema_state = SchemaState::PUBLIC;
