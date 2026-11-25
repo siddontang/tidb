@@ -1272,7 +1272,12 @@ Moving it into the `Domain` is preferred, because it closes with the tenant.
      life time), past the reader; observed (not logged) before the run's
      log file was last written, at 16:22:32.
   The script now logs every observed time, so a future run records each
-  step's.
+  step's. Its assertions are stricter than when it ran: B's PD safe point
+  must pass both the reader and its own point at the reader's start, and A's
+  must reach the reader's TSO exactly while the reader is open. The run
+  satisfies them: `--replay` of its saved output passes, and `--self-test`
+  replays it beside a trace that must fail (B above the reader from the
+  start and never moving, A rising only to 20s below the reader).
 - `DEFAULT_RESOURCE_GROUP` (`tidb-meta/src/transaction.rs:59`) moves per runtime.
   **Not needed:** it only memoizes Go's `DefaultGroupMeta4Test`, an
   immutable value that is the same in every keyspace; each keyspace's own

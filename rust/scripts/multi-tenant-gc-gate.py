@@ -16,16 +16,18 @@ are written before a job runs, so they prove nothing.
    back before the reader.
 3. While the reader is open, on every poll A's PD safe point must not pass
    the reader's TSO. The gate waits until:
-   - B's PD safe point moved past the reader's TSO (a B job completed);
-   - A's PD safe point moved in a poll that began after A's TSO minus its
-     configured `tidb_gc_life_time` (plus a margin) had passed the reader:
-     a job completed when the life time alone would have passed the reader,
-     so only the reader held A back.
+   - B's PD safe point exceeds both its own PD point at the reader's start
+     and the reader's TSO (a B job completed past the reader);
+   - A's PD safe point equals the reader's TSO exactly: a completed A job
+     stopped at the reader and nowhere else (a point merely below it could
+     come from a job that picked its target earlier).
    Then the reader must still read its original rows.
 4. The reader rolls back; A's PD safe point must pass the same TSO within
    `tidb_gc_run_interval` plus a margin.
 
-Each wait fails the gate with the step that timed out. Run with PyMySQL
+Each wait fails the gate with the step that timed out. `Judge` holds these
+assertions; `--replay <log>` feeds a saved run's output through it, and
+`--self-test` replays the recorded passing run and a trace that must fail. Run with PyMySQL
 against a multi-keyspace node serving both tenants. Environment:
 TIDB_MULTI_KEYSPACE_DEV_ROOT_PASSWORD (required, never printed);
 TIDB_TEST_HOST / TIDB_TEST_PORT (default 127.0.0.1:4002);
@@ -53,10 +55,6 @@ TENANT_B = os.getenv("TIDB_TEST_TENANT_B", "keyspace2")
 PD = os.getenv("PD_ADDR", "127.0.0.1:2379")
 POLL = 30
 DDL_EVERY = 120
-# A GC job computes its safe point at its start and publishes it at its
-# end; a poll that began this long after the life time passed the reader
-# only sees jobs that computed after it.
-JOB_MARGIN_MS = 60_000
 
 
 class GateFailed(Exception):
@@ -100,14 +98,6 @@ def one(cursor, sql):
     return row[0] if row else None
 
 
-def current_tso(cursor):
-    cursor.execute("BEGIN")
-    try:
-        return int(one(cursor, "SELECT @@tidb_current_ts"))
-    finally:
-        cursor.execute("ROLLBACK")
-
-
 def ms(ts):
     return ts >> 18
 
@@ -125,6 +115,108 @@ def observed():
     """The local time an event is OBSERVED at."""
     now = time.time()
     return time.strftime("%H:%M:%S", time.localtime(now)) + ".%03d" % (int(now * 1000) % 1000)
+
+
+class Judge:
+    """The gate's assertions over the PD safe points it observes, shared by
+    a live run and a replay."""
+
+    def __init__(self, start, initial_a, initial_b):
+        self.start, self.initial_b = start, initial_b
+        self.a_prev = initial_a
+        self.b_done = self.a_done = None
+
+    def hold_poll(self, a, b, seen):
+        """One poll while the reader is open; True once both hold."""
+        if a > self.start:
+            raise GateFailed("A's PD safe point %d passed its open reader %d" % (a, self.start))
+        if self.b_done is None and b > self.start and b > self.initial_b:
+            self.b_done = (b, seen)
+            print("  B's PD safe point %s passed the reader and its own start %d; observed at %s"
+                  % (value(b), self.initial_b, seen), flush=True)
+        if a != self.a_prev:
+            print("  A's PD safe point moved %d -> %s; observed at %s" % (self.a_prev, value(a), seen), flush=True)
+        if self.a_done is None and a == self.start:
+            self.a_done = (a, seen)
+        self.a_prev = a
+        return bool(self.b_done and self.a_done)
+
+    def hold_missing(self):
+        return [what for what, done in (("B's GC completing past the reader and its own start", self.b_done),
+                                        ("A's GC stopping exactly at the reader", self.a_done)) if not done]
+
+    def released(self, a):
+        """One poll after the reader rolled back; True once A passed it."""
+        return a > self.start
+
+
+def replay(path):
+    """Feeds a saved run's output through `Judge`: the reader's TSO, the
+    PD safe points at its start, every move the run printed (each a poll),
+    and A's point after the rollback. Raises GateFailed as a live run would."""
+    with open(path) as source:
+        text = source.read()
+    start = int(re.search(r"reader start TSO (\d+)", text).group(1))
+    initial = re.search(r"PD safe points at the reader's start: A (\d+)[^,]*, B (\d+)", text)
+    judge = Judge(start, int(initial.group(1)), int(initial.group(2)))
+    a, b = judge.a_prev, judge.initial_b
+    done = False
+    for line in text.splitlines():
+        moved = re.search(r"A's PD safe point moved \d+ -> (\d+)", line)
+        passed = re.search(r"^  B's PD safe point (\d+)", line)
+        if moved:
+            a = int(moved.group(1))
+        elif passed:
+            b = int(passed.group(1))
+        else:
+            continue
+        done = judge.hold_poll(a, b, "replayed")
+        if done:
+            break
+    if not done:
+        raise GateFailed("the trace ended before " + " and ".join(judge.hold_missing()))
+    after = re.search(r"after the reader rolled back, A's PD safe point (\d+)", text)
+    if not (after and judge.released(int(after.group(1)))):
+        raise GateFailed("the trace shows no A safe point past the released reader")
+    return judge
+
+
+RECORDED_RUN = """A's reader start TSO 470704065376157703 (15:58:31.109), reads ((1, 'original'), (2, 'original'))
+PD safe points at the reader's start: A 470703262919557125, B 470703263470059528
+  A's PD safe point moved 470703262919557125 -> 470703937528791040 (15:50:23.410); life time passed the reader before this poll: False
+  B's PD safe point 470704097214857216 (16:00:32.564) passed the reader
+  A's PD safe point moved 470703937528791040 -> 470704065376157703 (15:58:31.109); life time passed the reader before this poll: True
+PASS after the reader rolled back, A's PD safe point 470704252523642880 (16:10:25.020) > reader 470704065376157703
+"""
+
+
+def self_test():
+    """The recorded live run (2026-11-25, the design's §6.5 record) passes;
+    a review's trace in which B started above the reader and never moved,
+    and A rose only to 20s below the reader, fails."""
+    import tempfile
+    reader = 470704065376157703
+    scale = 1 << 18
+    false_pass = "\n".join([
+        "A's reader start TSO %d" % reader,
+        "PD safe points at the reader's start: A %d, B %d" % (reader - 90000 * scale, reader + 10 * scale),
+        "  B's PD safe point %d passed the reader" % (reader + 10 * scale),
+        "  A's PD safe point moved %d -> %d" % (reader - 90000 * scale, reader - 20000 * scale),
+        "PASS after the reader rolled back, A's PD safe point %d > reader %d" % (reader + 10000 * scale, reader),
+    ]) + "\n"
+    with tempfile.TemporaryDirectory() as directory:
+        for name, text, passes in (("recorded", RECORDED_RUN, True), ("false-pass", false_pass, False)):
+            path = os.path.join(directory, name)
+            with open(path, "w") as out:
+                out.write(text)
+            try:
+                replay(path)
+                outcome = True
+            except GateFailed as failure:
+                outcome = False
+                print("  %s trace fails: %s" % (name, failure))
+            assert outcome == passes, "%s trace: expected %s" % (name, "PASS" if passes else "FAIL")
+    print("self-test passed")
 
 
 class Gate:
@@ -173,40 +265,16 @@ class Gate:
         points = self.safe_points()
         print("PD safe points at the reader's start: A %s, B %s; observed at %s"
               % (value(points[TENANT_A]), value(points[TENANT_B]), observed()), flush=True)
-        a_prev, b_done, a_done = points[TENANT_A], None, None
-        poll_started = current_tso(self.admin[TENANT_A])
+        judge = Judge(self.start, points[TENANT_A], points[TENANT_B])
         while time.time() < deadline:
             time.sleep(POLL)
             self.reader.execute("SELECT 1")
             self.reader.fetchall()
             self.ddl_tick()
             points = self.safe_points()
-            a_now = current_tso(self.admin[TENANT_A])
-            a, b = points[TENANT_A], points[TENANT_B]
-            if a > self.start:
-                raise GateFailed("A's PD safe point %d passed its open reader %d" % (a, self.start))
-            if b > self.start and b_done is None:
-                b_done = (b, observed())
-                print("  B's PD safe point %s passed the reader; observed at %s" % (value(b), b_done[1]), flush=True)
-            # The poll began after A's TSO minus its life time passed the
-            # reader by the job margin: a job seen completing now computed
-            # its safe point when the life time alone would have passed
-            # the reader.
-            life_passed = ms(poll_started) - self.life_ms - JOB_MARGIN_MS > ms(self.start)
-            if a != a_prev:
-                seen = observed()
-                print("  A's PD safe point moved %d -> %s; observed at %s, in a poll that began at A's TSO %s; "
-                      "life time passed the reader before this poll: %s"
-                      % (a_prev, value(a), seen, value(poll_started), life_passed), flush=True)
-                if life_passed and a_done is None:
-                    a_done = (a, poll_started, seen)
-            a_prev = a
-            if b_done and a_done:
-                return b_done, a_done
-            poll_started = a_now
-        missing = [what for what, done in (("B's GC completing past the reader", b_done),
-                                           ("A's GC completing after its life time passed the reader", a_done)) if not done]
-        raise GateFailed("timed out waiting for " + " and ".join(missing))
+            if judge.hold_poll(points[TENANT_A], points[TENANT_B], observed()):
+                return judge
+        raise GateFailed("timed out waiting for " + " and ".join(judge.hold_missing()))
 
     def release(self):
         """Phase 4: after the reader rolls back, A's PD safe point passes it."""
@@ -218,7 +286,7 @@ class Gate:
             time.sleep(POLL)
             self.ddl_tick()
             a = self.safe_points()[TENANT_A]
-            if a > self.start:
+            if Judge(self.start, a, a).released(a):
                 return a, observed()
         raise GateFailed("A's PD safe point did not pass the released reader within the run interval")
 
@@ -236,6 +304,17 @@ class Gate:
 
 
 def main():
+    if sys.argv[1:2] == ["--self-test"]:
+        self_test()
+        return
+    if sys.argv[1:2] == ["--replay"] and len(sys.argv) == 3:
+        try:
+            replay(sys.argv[2])
+        except GateFailed as failure:
+            print("FAIL " + str(failure))
+            sys.exit(1)
+        print("PASS")
+        return
     if not os.getenv("TIDB_MULTI_KEYSPACE_DEV_ROOT_PASSWORD"):
         sys.exit("TIDB_MULTI_KEYSPACE_DEV_ROOT_PASSWORD is required")
     gate = Gate()
@@ -245,12 +324,12 @@ def main():
         gate.setup()
         print("A's reader start TSO %s, reads %s; observed at %s" % (value(gate.start), gate.original, observed()),
               flush=True)
-        (b, b_seen), (a, a_poll, a_seen) = gate.hold()
-        print("PASS B's PD safe point %s > reader %d; observed at %s" % (value(b), gate.start, b_seen))
-        print("PASS A's PD safe point %s <= reader %d; observed at %s, in a poll that began at A's TSO %s, when "
-              "that TSO minus A's %dms life time was already %dms past the reader"
-              % (value(a), gate.start, a_seen, value(a_poll), gate.life_ms,
-                 ms(a_poll) - gate.life_ms - ms(gate.start)))
+        judge = gate.hold()
+        (b, b_seen), (a, a_seen) = judge.b_done, judge.a_done
+        print("PASS B's PD safe point %s > reader %d and > its own start %d; observed at %s"
+              % (value(b), gate.start, judge.initial_b, b_seen))
+        print("PASS A's PD safe point %s == reader %d while the reader was open; observed at %s"
+              % (value(a), gate.start, a_seen))
         gate.reader.execute("SELECT id, v FROM %s.t ORDER BY id" % gate.schema)
         still = gate.reader.fetchall()
         if still != gate.original:
