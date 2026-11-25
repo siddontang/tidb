@@ -1246,21 +1246,33 @@ Moving it into the `Domain` is preferred, because it closes with the tenant.
   each keyspace (keyspace-level GC: `/pd/<cluster>/keyspaces/gc_safe_point/
   <keyspace id>`, what a completed GC job's `AdvanceGCSafePoint`
   publishes), against the reader's full start TSO; the `mysql.tidb` GC rows
-  are written before a job runs and prove nothing. A read transaction held
-  open in `keyspace1` started at TSO 470704065376157703 (15:58:31.109),
-  after which both tenants' rows were overwritten and deleted, and each
-  tenant ran a DDL every two minutes (so the playground's older node,
-  which also serves both keyspaces and reports its keyspace's last DDL,
-  holds neither keyspace back before the reader). Then:
-  - `keyspace2`'s PD safe point moved to 470704097214857216 (16:00:32.564),
-    past the reader;
-  - `keyspace1`'s PD safe point moved to 470704065376157703, the reader's
-    TSO exactly, in a poll that began at 16:11:46.316, when `keyspace1`'s
-    TSO minus its 10m life time was already 195s past the reader: only the
-    reader held it back; it never passed the reader while it was open;
-  - the reader still read its original rows after both;
-  - after the reader rolled back, `keyspace1`'s PD safe point moved to
-    470704252523642880 (16:10:25.020), past it.
+  are written before a job runs and prove nothing. Times below are labelled:
+  a TSO's *physical time* is its value, decoded; an *observed* time is when
+  the script saw the event (local clock). Both tenants' rows were
+  overwritten and deleted after the reader began, and each tenant ran a DDL
+  every two minutes (so the playground's older node, which also serves both
+  keyspaces and reports its keyspace's last DDL, holds neither keyspace back
+  before the reader). In event order:
+  1. `keyspace1`'s reader began at TSO 470704065376157703 (physical time
+     15:58:31.109).
+  2. `keyspace2`'s PD safe point moved to 470704097214857216 (physical time
+     16:00:32.564), past the reader; observed in a poll before step 3's
+     (that run did not log the observed time).
+  3. `keyspace1`'s PD safe point moved to 470704065376157703 (physical time
+     15:58:31.109), the reader's TSO exactly; observed in the poll that
+     began at `keyspace1` TSO 470704273834901505 (physical time
+     16:11:46.316), when that TSO minus the 10m life time was already 195s
+     past the reader. Only the reader held it back, and it never passed the
+     reader while the reader was open.
+  4. The reader still read its original rows; it then rolled back, right
+     after step 3's poll (not logged; estimated at about 16:12:16, the
+     poll's 30s sleep after it began).
+  5. `keyspace1`'s PD safe point moved to 470704252523642880 (physical time
+     16:10:25.020, consistent with a job at about 16:20:25 minus the 10m
+     life time), past the reader; observed (not logged) before the run's
+     log file was last written, at 16:22:32.
+  The script now logs every observed time, so a future run records each
+  step's.
 - `DEFAULT_RESOURCE_GROUP` (`tidb-meta/src/transaction.rs:59`) moves per runtime.
   **Not needed:** it only memoizes Go's `DefaultGroupMeta4Test`, an
   immutable value that is the same in every keyspace; each keyspace's own

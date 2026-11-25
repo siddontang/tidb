@@ -113,7 +113,18 @@ def ms(ts):
 
 
 def clock(ts):
+    """A TSO's physical part as a local time: a timestamp's VALUE."""
     return time.strftime("%H:%M:%S", time.localtime(ms(ts) / 1000)) + ".%03d" % (ms(ts) % 1000)
+
+
+def value(ts):
+    return "%d (physical time %s)" % (ts, clock(ts))
+
+
+def observed():
+    """The local time an event is OBSERVED at."""
+    now = time.time()
+    return time.strftime("%H:%M:%S", time.localtime(now)) + ".%03d" % (int(now * 1000) % 1000)
 
 
 class Gate:
@@ -160,7 +171,8 @@ class Gate:
         """Phase 3: the reader is open; returns the evidence for both."""
         deadline = time.time() + (self.life_ms + 2 * self.interval_ms) / 1000 + 300
         points = self.safe_points()
-        print("PD safe points at the reader's start: A %d, B %d" % (points[TENANT_A], points[TENANT_B]), flush=True)
+        print("PD safe points at the reader's start: A %s, B %s; observed at %s"
+              % (value(points[TENANT_A]), value(points[TENANT_B]), observed()), flush=True)
         a_prev, b_done, a_done = points[TENANT_A], None, None
         poll_started = current_tso(self.admin[TENANT_A])
         while time.time() < deadline:
@@ -174,18 +186,20 @@ class Gate:
             if a > self.start:
                 raise GateFailed("A's PD safe point %d passed its open reader %d" % (a, self.start))
             if b > self.start and b_done is None:
-                b_done = (b, a_now)
-                print("  B's PD safe point %d (%s) passed the reader" % (b, clock(b)), flush=True)
+                b_done = (b, observed())
+                print("  B's PD safe point %s passed the reader; observed at %s" % (value(b), b_done[1]), flush=True)
             # The poll began after A's TSO minus its life time passed the
             # reader by the job margin: a job seen completing now computed
             # its safe point when the life time alone would have passed
             # the reader.
             life_passed = ms(poll_started) - self.life_ms - JOB_MARGIN_MS > ms(self.start)
             if a != a_prev:
-                print("  A's PD safe point moved %d -> %d (%s); life time passed the reader before this poll: %s"
-                      % (a_prev, a, clock(a), life_passed), flush=True)
+                seen = observed()
+                print("  A's PD safe point moved %d -> %s; observed at %s, in a poll that began at A's TSO %s; "
+                      "life time passed the reader before this poll: %s"
+                      % (a_prev, value(a), seen, value(poll_started), life_passed), flush=True)
                 if life_passed and a_done is None:
-                    a_done = (a, poll_started)
+                    a_done = (a, poll_started, seen)
             a_prev = a
             if b_done and a_done:
                 return b_done, a_done
@@ -198,13 +212,14 @@ class Gate:
         """Phase 4: after the reader rolls back, A's PD safe point passes it."""
         self.reader.execute("ROLLBACK")
         self.reader = None
+        print("A's reader rolled back; observed at %s" % observed(), flush=True)
         deadline = time.time() + self.interval_ms / 1000 + 300
         while time.time() < deadline:
             time.sleep(POLL)
             self.ddl_tick()
             a = self.safe_points()[TENANT_A]
             if a > self.start:
-                return a
+                return a, observed()
         raise GateFailed("A's PD safe point did not pass the released reader within the run interval")
 
     def cleanup(self):
@@ -228,21 +243,22 @@ def main():
           % (TENANT_A, gate.ids[TENANT_A], TENANT_B, gate.ids[TENANT_B], gate.life_ms, gate.interval_ms), flush=True)
     try:
         gate.setup()
-        print("A's reader start TSO %d (%s), reads %s" % (gate.start, clock(gate.start), gate.original), flush=True)
-        (b, b_seen), (a, a_seen) = gate.hold()
-        print("PASS B's PD safe point %d (%s) > reader %d" % (b, clock(b), gate.start))
-        print("PASS A's PD safe point %d (%s) <= reader %d, set by a job that completed after A's TSO %d (%s) minus "
-              "its %dms life time was already %dms past the reader"
-              % (a, clock(a), gate.start, a_seen, clock(a_seen), gate.life_ms,
-                 ms(a_seen) - gate.life_ms - ms(gate.start)))
+        print("A's reader start TSO %s, reads %s; observed at %s" % (value(gate.start), gate.original, observed()),
+              flush=True)
+        (b, b_seen), (a, a_poll, a_seen) = gate.hold()
+        print("PASS B's PD safe point %s > reader %d; observed at %s" % (value(b), gate.start, b_seen))
+        print("PASS A's PD safe point %s <= reader %d; observed at %s, in a poll that began at A's TSO %s, when "
+              "that TSO minus A's %dms life time was already %dms past the reader"
+              % (value(a), gate.start, a_seen, value(a_poll), gate.life_ms,
+                 ms(a_poll) - gate.life_ms - ms(gate.start)))
         gate.reader.execute("SELECT id, v FROM %s.t ORDER BY id" % gate.schema)
         still = gate.reader.fetchall()
         if still != gate.original:
             raise GateFailed("A's reader lost its rows after both GCs: %s" % (still,))
-        print("PASS A's reader still reads %s after both GCs" % (still,))
-        released = gate.release()
-        print("PASS after the reader rolled back, A's PD safe point %d (%s) > reader %d"
-              % (released, clock(released), gate.start))
+        print("PASS A's reader still reads %s after both GCs; observed at %s" % (still, observed()))
+        released, released_seen = gate.release()
+        print("PASS after the reader rolled back, A's PD safe point %s > reader %d; observed at %s"
+              % (value(released), gate.start, released_seen))
     except GateFailed as failure:
         print("FAIL " + str(failure))
         print("FAILED")
