@@ -215,34 +215,44 @@ impl TableStorageStatsProvider for ClusterTableStorageStatsProvider {
         &self,
         physical_ids: &[i64],
     ) -> Result<tidb_stats_handle_cache::table_size_stats::TableRowStatsSnapshot, String> {
-        let cache = &*tidb_stats_handle_cache::TABLE_ROW_STATS_CACHE;
-        // Go `updateStatsCacheIfNeed` + `TableRowStatsCache.UpdateByID`
-        // (`executor/infoschema_reader.go:671`): refresh the cache for every
-        // physical ID the statement's schema holds first. A failed read only
-        // warns -- the reader then serves the cache's previous values.
-        let domain = self.domain.upgrade();
-        let pool = domain.as_ref().map(|domain| domain.advanced_sys_session_pool());
+        Ok(self
+            .domain
+            .upgrade()
+            .map(|domain| domain.load_table_row_stats(physical_ids))
+            .unwrap_or_default())
+    }
+}
+
+impl Domain {
+    /// Go `updateStatsCacheIfNeed` + `TableRowStatsCache.UpdateByID`
+    /// (`executor/infoschema_reader.go:671`) over this domain's cache:
+    /// refresh every physical ID the statement's schema holds first, then
+    /// read the cache. A failed read only warns -- the reader then serves
+    /// the cache's previous values.
+    fn load_table_row_stats(
+        self: &Arc<Self>,
+        physical_ids: &[i64],
+    ) -> tidb_stats_handle_cache::table_size_stats::TableRowStatsSnapshot {
+        let pool = Some(self.advanced_sys_session_pool());
         let source = SessionSizeReads {
             pool: &crate::sys_session::StatsPool {
                 session_pool: pool.as_ref(),
             },
         };
-        if let Err(error) = cache.update_by_id(&source, physical_ids) {
+        if let Err(error) = self.table_row_stats.update_by_id(&source, physical_ids) {
             // Go `updateStatsCacheIfNeed`.
             tidb_logutil::bg_logger().warn(
                 "cannot update stats cache for tables",
                 &[tidb_logutil::zap_error(error)],
             );
         }
-        let (rows, lengths) = cache.snapshot();
-        Ok(tidb_stats_handle_cache::table_size_stats::TableRowStatsSnapshot {
+        let (rows, lengths) = self.table_row_stats.snapshot();
+        tidb_stats_handle_cache::table_size_stats::TableRowStatsSnapshot {
             table_rows: rows.into_iter().collect(),
             column_lengths: lengths.into_iter().collect(),
-        })
+        }
     }
-}
 
-impl Domain {
     /// Pins snapshot timestamp `ts` against this domain's keyspace's GC
     /// (its min-start-ts report) until the guard drops (design §6.5).
     #[must_use]
@@ -666,6 +676,10 @@ pub struct Domain {
     /// The `SHOW STATUS` providers this domain registered as it started its
     /// DDL and binding handle, unregistered when it closes.
     statistics: std::sync::Mutex<Vec<Arc<dyn tidb_variable::statusvar::Statistics>>>,
+    /// Go's package-level `TableRowStatsCache`, kept per domain: it is keyed
+    /// by physical table ID, which collides across the keyspaces of a node
+    /// serving several (design §6.4).
+    table_row_stats: tidb_stats_handle_cache::StatsTableRowCache,
     /// The write/read capability every connection's statements open their
     /// snapshots and publish their commits through.
     pub transactions: Arc<dyn ClusterTransactions>,
@@ -1135,6 +1149,7 @@ impl Domain {
             transactions,
             bindings: BindingHandleSlot::default(),
             statistics: std::sync::Mutex::default(),
+            table_row_stats: tidb_stats_handle_cache::StatsTableRowCache::new(),
             global_config_syncer: None,
             binding_session_factory: Weak::new(),
             schema_builder_domain,

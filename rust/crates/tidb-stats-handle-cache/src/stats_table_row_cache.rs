@@ -37,8 +37,10 @@ struct State {
     col_length: HashMap<TableHistId, u64>,
 }
 
-/// Go `StatsTableRowCache`, including the package-level `TableRowStatsCache`
-/// instance's role: the cache of table row counts.
+/// Go `StatsTableRowCache`: the cache of table row counts. Go's
+/// package-level `TableRowStatsCache` instance is one per domain here
+/// (`Domain::table_row_stats`): its keys are physical table IDs, which
+/// collide across the keyspaces of a node serving several.
 ///
 /// Go guards both maps with one `syncutil.RWMutex`; this port keeps the same
 /// shape by locking both maps as one state. The estimated-size helpers
@@ -55,11 +57,6 @@ impl Default for StatsTableRowCache {
         Self::new()
     }
 }
-
-/// Go `cache.TableRowStatsCache`: the process-wide instance the
-/// information-schema readers refresh and serve from.
-pub static TABLE_ROW_STATS_CACHE: std::sync::LazyLock<StatsTableRowCache> =
-    std::sync::LazyLock::new(StatsTableRowCache::new);
 
 /// One consistent view of both maps: `(row counts, column lengths)`, feeding
 /// the shared `TableSizeStats` estimators on the consumer side.

@@ -1252,6 +1252,41 @@ fn an_opening_keyspace_shows_its_ddl_statuses_to_no_other_keyspace() {
     assert_eq!(server_id("ks_a"), a_id);
 }
 
+/// Design §6.4: the information-schema row counts come from each domain's
+/// own cache. Two keyspaces hold a table under the same physical ID; one
+/// has its row count in `mysql.stats_meta`, the other none: the other reads
+/// zero rows, not the first keyspace's count (the cache keeps entries a
+/// refresh does not mention).
+#[test]
+fn a_keyspace_reads_only_its_own_table_row_counts() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set("ks_a", tidb_config_deploymode::get(), false);
+    let a_store = MockStoreDomain::create_for_keyspace("ks_a").unwrap();
+    let b_store = MockStoreDomain::create_for_keyspace("ks_b").unwrap();
+    let (mut a, mut b) = (a_store.new_session().unwrap(), b_store.new_session().unwrap());
+    for session in [&mut a, &mut b] {
+        session.run("create table test.row_count_probe (id int primary key)").unwrap();
+    }
+    let id = |session: &mut Session| physical_id(session, "row_count_probe", None);
+    assert_eq!(id(&mut a), id(&mut b), "the keyspaces' DDL histories differ");
+    let table_id = id(&mut a);
+    b.run("insert into test.row_count_probe values (1), (2), (3)").unwrap();
+    b.run(&format!("insert into mysql.stats_meta (version, table_id, count, modify_count) values (1, {table_id}, 3, 0) on duplicate key update count = 3")).unwrap();
+    a.run(&format!("delete from mysql.stats_meta where table_id = {table_id}")).unwrap();
+    tidb_keyspace::set_multi_keyspace_mode(true);
+    let rows = |session: &mut Session| {
+        row_text(session.run(
+            "select table_rows from information_schema.tables where table_schema = 'test' and table_name = 'row_count_probe'",
+        ))
+    };
+    assert_eq!(rows(&mut b), [["3"]]);
+    assert_eq!(rows(&mut a), [["0"]], "ks_a read ks_b's row count");
+    tidb_keyspace::set_multi_keyspace_mode(false);
+}
+
 /// Design §6.8 (phase 3e): two keyspaces of one node read only their own
 /// diagnostics from the process-wide owners. Both run the same statement:
 /// each sees only its own statement-summary rows (current, history,
