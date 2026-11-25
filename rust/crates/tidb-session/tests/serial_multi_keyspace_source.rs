@@ -348,53 +348,11 @@ fn a_multi_keyspace_node_refuses_import_br_and_plan_replayer() {
     tidb_dxf_importinto::set_import_store(None);
 }
 
-/// A PD client that counts the calls it gets.
-#[derive(Debug, Default)]
-struct CountingPd(std::sync::atomic::AtomicUsize);
-
-impl CountingPd {
-    fn calls(&self) -> usize {
-        self.0.load(std::sync::atomic::Ordering::SeqCst)
-    }
-    fn count(&self) {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-impl tidb_domain_infosync::placement_manager::PlacementManager for CountingPd {
-    fn get_rule_bundle(&self, name: &str) -> Result<tidb_placement::Bundle, String> {
-        self.count();
-        Ok(tidb_placement::Bundle { id: name.to_owned(), ..Default::default() })
-    }
-    fn put_rule_bundles(&self, _bundles: &[tidb_placement::Bundle]) -> Result<(), String> {
-        self.count();
-        Ok(())
-    }
-}
-
-impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for CountingPd {
-    fn add_resource_group(&self, _group: tidb_proto::resource_manager::ResourceGroup) -> Result<String, String> {
-        self.count();
-        Ok("Success!".to_owned())
-    }
-    fn modify_resource_group(&self, _group: tidb_proto::resource_manager::ResourceGroup) -> Result<String, String> {
-        self.count();
-        Ok("Success!".to_owned())
-    }
-    fn delete_resource_group(&self, _name: &str) -> Result<String, String> {
-        self.count();
-        Ok("Success!".to_owned())
-    }
-}
-
-/// A multi-keyspace node refuses the DDL whose effect lives in PD --
-/// resource groups, TiFlash replicas -- and `AUTO_ID_CACHE=1` tables, whose
+/// A multi-keyspace node refuses the DDL whose effect PD keeps by bare
+/// object IDs -- TiFlash replicas -- and `AUTO_ID_CACHE=1` tables, whose
 /// IDs come from the AutoID service only the configured keyspace runs, with
 /// `ER_NOT_SUPPORTED_YET` (1235) before any PD client is called (design §10
-/// phase 2, until 3b and 3f make them per keyspace). The counting placement
-/// manager and resource-manager client see no call, and no table, policy
-/// or group is created. A single-keyspace node runs the same statements:
-/// the resource-group DDL reaches its client.
+/// phase 2; 3f for the AutoID service). No table is created.
 #[test]
 fn a_multi_keyspace_node_refuses_pd_backed_ddl() {
     if !tidb_config_kerneltype::is_next_gen() {
@@ -407,15 +365,8 @@ fn a_multi_keyspace_node_refuses_pd_backed_ddl() {
     for sql in ["use test", "create table t (a int) partition by range (a) (partition p0 values less than (10))"] {
         session.run(sql).unwrap();
     }
-    let pd = std::sync::Arc::new(CountingPd::default());
-    let placement = tidb_domain_infosync::placement_manager::placement_manager();
-    tidb_domain_infosync::placement_manager::init_placement_manager(Some(pd.clone()));
-    tidb_domain_infosync::resource_manager_client::init_resource_manager_client(Some(pd.clone()));
 
     let statements = [
-        "create resource group rg1 ru_per_sec = 100",
-        "alter resource group default ru_per_sec = 100",
-        "drop resource group if exists rg1",
         "alter database test set tiflash replica 1",
         "alter table t set tiflash replica 1",
         "create table t3 (a int primary key auto_increment) auto_id_cache = 1",
@@ -427,25 +378,14 @@ fn a_multi_keyspace_node_refuses_pd_backed_ddl() {
         assert_eq!(code, 1235, "{sql}: {message}");
         assert!(message.ends_with("on a multi-keyspace node'"), "{sql}: {message}");
     }
-    assert_eq!(pd.calls(), 0);
     let created = row_text(session.run(
-        "select count(*) from information_schema.tables where table_schema in ('test', 'd1') and table_name in ('t1', 't2', 't3')",
+        "select count(*) from information_schema.tables where table_schema = 'test' and table_name = 't3'",
     ));
     assert_eq!(created, [["0"]]);
     // The tenant's other DDL runs.
     assert_eq!(refusal(&mut session, "create table t4 (a int) auto_id_cache = 100"), None);
     assert_eq!(refusal(&mut session, "alter table t4 add column b int"), None);
-
-    // A single-keyspace node runs them as before.
     tidb_keyspace::set_multi_keyspace_mode(false);
-    for sql in ["create resource group rg1 ru_per_sec = 100", "drop resource group rg1"] {
-        assert_eq!(refusal(&mut session, sql), None, "{sql}");
-    }
-    assert!(pd.calls() > 0);
-    tidb_domain_infosync::placement_manager::init_placement_manager(Some(placement));
-    tidb_domain_infosync::resource_manager_client::init_resource_manager_client(Some(std::sync::Arc::new(
-        tidb_domain_infosync::resource_manager_client::MockResourceManagerClient::new(),
-    )));
 }
 
 /// A TiFlash replica manager that counts its PD calls over another one.
@@ -1557,4 +1497,98 @@ fn two_keyspaces_keep_their_own_placement() {
         (bundle.rules[0].start_key_hex.clone(), bundle.rules[0].end_key_hex.clone()),
         table_range(&stores[1].1, truncated)
     );
+}
+
+/// PD's resource manager as the node's keyspaces reach it: one store of
+/// groups keyed by keyspace ID, which each runtime's client names (Go's
+/// `ResourceGroup.KeyspaceId`, which the store's PD client fills in).
+#[derive(Default)]
+struct KeyspacedResourceManager(std::sync::Mutex<std::collections::BTreeMap<(u32, String), tidb_proto::resource_manager::ResourceGroup>>);
+
+/// One keyspace's view of [`KeyspacedResourceManager`].
+struct KeyspaceResourceClient {
+    pd: std::sync::Arc<KeyspacedResourceManager>,
+    keyspace_id: u32,
+}
+
+impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for KeyspaceResourceClient {
+    fn add_resource_group(&self, group: tidb_proto::resource_manager::ResourceGroup) -> Result<String, String> {
+        let mut groups = self.pd.0.lock().unwrap();
+        let key = (self.keyspace_id, group.name.clone());
+        if groups.contains_key(&key) {
+            return Err(format!("the group {} already exists", group.name));
+        }
+        groups.insert(key, group);
+        Ok("Success!".to_owned())
+    }
+    fn modify_resource_group(&self, group: tidb_proto::resource_manager::ResourceGroup) -> Result<String, String> {
+        self.pd.0.lock().unwrap().insert((self.keyspace_id, group.name.clone()), group);
+        Ok("Success!".to_owned())
+    }
+    fn delete_resource_group(&self, name: &str) -> Result<String, String> {
+        self.pd.0.lock().unwrap().remove(&(self.keyspace_id, name.to_owned()));
+        Ok("Success!".to_owned())
+    }
+    fn get_resource_group(&self, name: &str) -> Result<tidb_proto::resource_manager::ResourceGroup, String> {
+        self.pd.0.lock().unwrap().get(&(self.keyspace_id, name.to_owned())).cloned()
+            .ok_or_else(|| format!("the group {name} does not exist"))
+    }
+    fn list_resource_groups(&self) -> Result<Vec<tidb_proto::resource_manager::ResourceGroup>, String> {
+        Ok(self.pd.0.lock().unwrap().iter()
+            .filter(|((keyspace_id, _), _)| *keyspace_id == self.keyspace_id)
+            .map(|(_, group)| group.clone())
+            .collect())
+    }
+}
+
+/// Resource groups of two keyspaces on one node (design §6.2). Each
+/// runtime's resource-group jobs write PD's resource manager through its own
+/// client, which names its keyspace, so two keyspaces create, alter and
+/// drop groups of the same name independently: PD holds one group per
+/// keyspace, and each keyspace's RESOURCE_GROUPS lists only its own. Before,
+/// a multi-keyspace node refused resource-group DDL (1235).
+#[test]
+fn two_keyspaces_keep_their_own_resource_groups() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), true);
+    let stores = [
+        (100, MockStoreDomain::create_for_keyspace("ks_a").unwrap()),
+        (200, MockStoreDomain::create_for_keyspace("ks_b").unwrap()),
+    ];
+    let pd = std::sync::Arc::new(KeyspacedResourceManager::default());
+    let mut sessions = Vec::new();
+    for (ru, store) in &stores {
+        let keyspace_id = keyspace_codec(store).keyspace_id();
+        // The keyspace's bootstrapped `default` group moves along.
+        let default = store.info_syncer().resource_manager_client().get_resource_group("default").unwrap();
+        pd.0.lock().unwrap().insert((keyspace_id, "default".to_owned()), default);
+        let client = KeyspaceResourceClient { pd: pd.clone(), keyspace_id };
+        store.info_syncer().init_resource_manager_client(Some(std::sync::Arc::new(client)));
+        let mut session = store.new_session().unwrap();
+        for sql in [format!("create resource group rg1 ru_per_sec = {ru}"), "create resource group rg2 ru_per_sec = 10".to_owned()] {
+            session.run(&sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        }
+        sessions.push(session);
+    }
+    assert_eq!(refusal(&mut sessions[0], "alter resource group rg1 ru_per_sec = 150"), None);
+    assert_eq!(refusal(&mut sessions[1], "drop resource group rg2"), None);
+
+    let held = pd.0.lock().unwrap().keys().filter(|(_, name)| name != "default").cloned().collect::<Vec<_>>();
+    let [a_id, b_id] = [&stores[0].1, &stores[1].1].map(|store| keyspace_codec(store).keyspace_id());
+    let mut expected = vec![(a_id, "rg1".to_owned()), (a_id, "rg2".to_owned()), (b_id, "rg1".to_owned())];
+    expected.sort();
+    assert_eq!(held, expected);
+    let ru_of = |keyspace_id: u32| {
+        let groups = pd.0.lock().unwrap();
+        let group = &groups[&(keyspace_id, "rg1".to_owned())];
+        group.r_u_settings.as_ref().unwrap().r_u.as_ref().unwrap().settings.as_ref().unwrap().fill_rate
+    };
+    assert_eq!((ru_of(a_id), ru_of(b_id)), (150, 200));
+
+    let groups = "select name, ru_per_sec from information_schema.resource_groups where name != 'default' order by name";
+    assert_eq!(row_text(sessions[0].run(groups)), [["rg1", "150"], ["rg2", "10"]]);
+    assert_eq!(row_text(sessions[1].run(groups)), [["rg1", "200"]]);
 }

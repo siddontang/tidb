@@ -5125,14 +5125,12 @@ pub(super) fn record_ddl_action_error(job: &mut Job, error: &DdlPlanError) -> bo
 }
 
 /// The PD write a job step's resolved metadata would make, if any, that a
-/// multi-keyspace node refuses. Label rules and placement bundles are not
-/// among them: their IDs and ranges carry the job's keyspace where they
-/// meet PD.
+/// multi-keyspace node refuses. Label rules, placement bundles and resource
+/// groups are not among them: they carry the job's keyspace where they
+/// meet PD (the resource manager client is the keyspace's store's).
 fn pd_backed_write_feature(write: &DdlWrite) -> Option<&'static str> {
     if !write.affinity_groups.is_empty() {
         Some("AFFINITY")
-    } else if write.resource_group_update.is_some() {
-        Some("RESOURCE GROUP DDL")
     } else {
         None
     }
@@ -5141,7 +5139,6 @@ fn pd_backed_write_feature(write: &DdlWrite) -> Option<&'static str> {
 /// Drops the PD writes [`pd_backed_write_feature`] refuses.
 fn strip_pd_writes(write: &mut DdlWrite) {
     write.affinity_groups = Default::default();
-    write.resource_group_update = None;
 }
 
 /// Outcome of an action that could not complete its staged work.

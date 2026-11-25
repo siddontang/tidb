@@ -21,8 +21,9 @@
 //! last: the import store and the DXF task managers, the BRIE node and job
 //! queue, and the global external storage (phase 3f moves them into each
 //! keyspace runtime). Each statement checks here before it consults any of
-//! them. So do the DDL statements whose effect lives in PD (resource groups,
-//! TiFlash replicas) or in the AutoID service
+//! them. So do the DDL statements whose effect PD keeps by bare object IDs
+//! (TiFlash replicas, FLASHBACK CLUSTER's schedule limits) or that live in
+//! the AutoID service
 //! (`AUTO_ID_CACHE=1`).
 
 use crate::DriverError;
@@ -43,8 +44,8 @@ pub fn refuse_on_multi_keyspace_node(feature: &str) -> Result<(), DriverError> {
 }
 
 /// The PD-backed part of `ddl`, if any: the feature a multi-keyspace node
-/// refuses for it (design §10 phase 2). Resource groups, TiFlash replicas
-/// and FLASHBACK CLUSTER's
+/// refuses for it (design §10 phase 2). TiFlash replicas and FLASHBACK
+/// CLUSTER's
 /// schedule limits are written through the process's PD clients, which
 /// belong to whichever keyspace opened last (phase 3b); an `AUTO_ID_CACHE=1` table allocates through the AutoID
 /// service only the configured keyspace runs (phase 3f).
@@ -58,9 +59,6 @@ pub fn pd_backed_ddl_feature(ddl: &tidb_ast::DdlStmt) -> Option<&'static str> {
         })
     };
     match ddl {
-        DdlStmt::CreateResourceGroup(_) | DdlStmt::AlterResourceGroup(_) | DdlStmt::DropResourceGroup(_) => {
-            Some("RESOURCE GROUP DDL")
-        }
         // Closes and restores PD's schedule limits for the whole cluster.
         DdlStmt::FlashbackToTimestamp(flashback) if flashback.tables.is_empty() && flashback.database_name.is_empty() => {
             Some("FLASHBACK CLUSTER")
