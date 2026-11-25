@@ -53,6 +53,7 @@ pub mod ddl_delete_range;
 pub mod ddl_job_scheduler;
 pub mod ddl_reorg_table;
 pub mod foreign_key_build;
+mod external_delivery;
 pub mod placement_delivery;
 pub mod real_tikv_ddl;
 pub mod tiflash_replica_manager;

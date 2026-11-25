@@ -43,6 +43,15 @@ pub trait ResourceManagerClient: Send + Sync {
             "the group {name} cannot be read through this client"
         ))
     }
+    /// The group `name`, `None` when PD holds none (a client that answers
+    /// "does not exist" holds none).
+    fn lookup_resource_group(&self, name: &str) -> Result<Option<rmpb::ResourceGroup>, String> {
+        match self.get_resource_group(name) {
+            Ok(group) => Ok(Some(group)),
+            Err(error) if error.contains("does not exist") => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
     /// Go `ListResourceGroups`, as [`Self::get_resource_group`].
     fn list_resource_groups(&self) -> Result<Vec<rmpb::ResourceGroup>, String> {
         Err("resource groups cannot be listed through this client".to_owned())

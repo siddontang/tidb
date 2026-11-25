@@ -1361,6 +1361,17 @@ impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for Pd
             .block_on(async move { pd.delete_resource_group(&name).await })
             .map_err(|error| error.to_string())
     }
+
+    fn lookup_resource_group(
+        &self,
+        name: &str,
+    ) -> Result<Option<tidb_proto::resource_manager::ResourceGroup>, String> {
+        let pd = self.store.store().pd_client();
+        let name = name.to_owned();
+        self.store
+            .block_on(async move { pd.get_resource_group(&name, false).await })
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Go `copr.MPPClient` over the node's `KVStore`.

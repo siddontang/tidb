@@ -105,10 +105,50 @@ pub fn put_rule_bundles(
         .map(|bundle| serde_json::to_value(bundle).and_then(serde_json::from_value))
         .collect::<Result<Vec<pd_http::GroupBundle>, _>>()
         .map_err(|error| PlacementDeliveryError::Encode(error.to_string()))?;
+    put_group_bundles(pd_http_client, &rule_bundles, timeout)
+}
+
+/// POSTs `bundles` as PD keeps them (`SetPlacementRuleBundles(ctx, bundles,
+/// true)`): a bundle without rules removes its group's rules.
+///
+/// # Errors
+///
+/// As [`put_rule_bundles`].
+pub fn put_group_bundles(
+    pd_http_client: &pd_http::Client,
+    bundles: &[pd_http::GroupBundle],
+    timeout: Duration,
+) -> Result<(), PlacementDeliveryError> {
+    if bundles.is_empty() {
+        return Ok(());
+    }
     let pd_http_client = tidb_domain_infosync::pd_http::info_syncer_pd_http_client(pd_http_client);
-    request_pd(
-        timeout,
-        pd_http_client.set_placement_rule_bundles(&rule_bundles, true),
-    )
+    request_pd(timeout, pd_http_client.set_placement_rule_bundles(bundles, true))
+}
+
+/// The bundles PD keeps under `group_ids` (Go
+/// `GetPlacementRuleBundleByGroup`), as PD keeps them; a group PD does not
+/// know (404) is an empty bundle of that ID.
+///
+/// # Errors
+///
+/// The request cannot be sent, or PD answers with a status other than
+/// success or 404.
+pub fn get_group_bundles(
+    pd_http_client: &pd_http::Client,
+    group_ids: &[String],
+    timeout: Duration,
+) -> Result<Vec<pd_http::GroupBundle>, PlacementDeliveryError> {
+    let pd_http_client = tidb_domain_infosync::pd_http::info_syncer_pd_http_client(pd_http_client);
+    group_ids
+        .iter()
+        .map(|group_id| {
+            let mut bundle = request_pd(timeout, pd_http_client.get_placement_rule_bundle_by_group(group_id))?;
+            if bundle.id.is_empty() {
+                bundle.id.clone_from(group_id);
+            }
+            Ok(bundle)
+        })
+        .collect()
 }
 

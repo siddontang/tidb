@@ -377,6 +377,11 @@ pub fn get_resource_group(name: &str) -> Result<rmpb::ResourceGroup, String> {
     resource_manager().get_resource_group(name)
 }
 
+/// The group `name` of this keyspace, `None` when PD holds none.
+pub fn lookup_resource_group(name: &str) -> Result<Option<rmpb::ResourceGroup>, String> {
+    resource_manager().lookup_resource_group(name)
+}
+
 /// Go `infosync.ListResourceGroups`.
 pub fn list_resource_groups() -> Result<Vec<rmpb::ResourceGroup>, String> {
     resource_manager().list_resource_groups()
