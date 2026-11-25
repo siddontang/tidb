@@ -442,6 +442,7 @@ pub fn show_table_distributions(
     partitions: &[String],
 ) -> Result<Vec<Vec<Datum>>, DriverError> {
     let target = resolve(catalog, database, table_name, "show table distributions")?;
+    crate::multi_keyspace::refuse_on_multi_keyspace_node("SHOW TABLE DISTRIBUTIONS")?;
     let (physical_ids, _) = physical_ids(&target, partitions)?;
     // Go: the named partitions (lowercased) or every definition, else the
     // table's own lowercased name.

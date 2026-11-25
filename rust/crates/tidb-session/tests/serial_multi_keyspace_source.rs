@@ -1592,3 +1592,44 @@ fn two_keyspaces_keep_their_own_resource_groups() {
     assert_eq!(row_text(sessions[0].run(groups)), [["rg1", "150"], ["rg2", "10"]]);
     assert_eq!(row_text(sessions[1].run(groups)), [["rg1", "200"]]);
 }
+
+/// The statements that read or change PD's cluster-wide schedulers and
+/// affinity groups by keyspace-less key ranges and bare table IDs are
+/// refused (1235) on a multi-keyspace node (design §6.2): DISTRIBUTE TABLE
+/// creates a scheduler job over keyspace-less ranges, its job statements
+/// list and cancel every keyspace's jobs, SHOW TABLE DISTRIBUTIONS reads
+/// keyspace-less ranges, and SHOW AFFINITY reads groups another keyspace's
+/// table of the same ID may own. A single-keyspace node runs them (here
+/// they fail without a PD HTTP client, as in Go).
+#[test]
+fn a_multi_keyspace_node_refuses_cluster_wide_pd_statements() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
+    let store = MockStoreDomain::create().unwrap();
+    let mut session = store.new_session().unwrap();
+    for sql in ["use test", "create table t (a int)"] {
+        session.run(sql).unwrap();
+    }
+    let statements = [
+        "distribute table t rule = 'leader-scatter' engine = 'tikv'",
+        "show distribution jobs",
+        "cancel distribution job 1",
+        "show table t distributions",
+        "show affinity",
+    ];
+    for sql in statements {
+        if let Some((code, message)) = refusal(&mut session, sql) {
+            assert_ne!(code, 1235, "{sql}: {message}");
+        }
+    }
+    tidb_keyspace::set_multi_keyspace_mode(true);
+    for sql in statements {
+        let (code, message) = refusal(&mut session, sql).unwrap_or_else(|| panic!("{sql} ran"));
+        assert_eq!(code, 1235, "{sql}: {message}");
+        assert!(message.ends_with("on a multi-keyspace node'"), "{sql}: {message}");
+    }
+    tidb_keyspace::set_multi_keyspace_mode(false);
+}

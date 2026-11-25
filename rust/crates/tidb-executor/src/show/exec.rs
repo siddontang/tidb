@@ -262,6 +262,7 @@ pub trait ShowExec: crate::simple::account_password::AccountPasswordExec {
                 .cmp(&left.db_lower)
                 .then(right.table_id.cmp(&left.table_id))
         });
+        crate::multi_keyspace::refuse_on_multi_keyspace_node("SHOW AFFINITY")?;
         let states = tidb_domain_affinity::get_all_group_states().map_err(|error| {
             DriverError::Mysql(crate::MysqlError::unknown(error.to_string()))
         })?;

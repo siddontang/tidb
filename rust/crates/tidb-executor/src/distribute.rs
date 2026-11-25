@@ -44,6 +44,7 @@ impl DistributeTableExec {
     /// # Errors
     /// A partition the table does not have.
     pub fn open(mut p: DistributeTable) -> Result<Self, DriverError> {
+        crate::multi_keyspace::refuse_on_multi_keyspace_node("DISTRIBUTE TABLE")?;
         let key_ranges = get_key_ranges(&p)?;
         p.partition_names.sort_by(|i, j| i.lowercase().cmp(j.lowercase()));
         Ok(Self { p, key_ranges })
@@ -188,6 +189,7 @@ fn get_key_ranges(p: &DistributeTable) -> Result<Vec<pd_http::KeyRange>, DriverE
 /// # Errors
 /// PD's.
 pub fn cancel_distribution_job(job_id: u64) -> Result<(), DriverError> {
+    crate::multi_keyspace::refuse_on_multi_keyspace_node("CANCEL DISTRIBUTION JOB")?;
     tidb_domain_infosync::region::cancel_scheduler_job(SCHEDULER_NAME, job_id).map_err(unknown)
 }
 
@@ -197,6 +199,7 @@ pub fn cancel_distribution_job(job_id: u64) -> Result<(), DriverError> {
 /// # Errors
 /// PD's, or a job PD answered in another shape.
 pub fn fetch_show_distribution_jobs(job_id: Option<i64>) -> Result<Vec<Vec<Datum>>, DriverError> {
+    crate::multi_keyspace::refuse_on_multi_keyspace_node("SHOW DISTRIBUTION JOBS")?;
     let config = tidb_domain_infosync::region::get_scheduler_config(SCHEDULER_NAME).map_err(unknown)?;
     let Some(configs) = config.as_array() else {
         // it means that no any jobs

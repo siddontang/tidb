@@ -23,8 +23,10 @@
 //! keyspace runtime). Each statement checks here before it consults any of
 //! them. So do the DDL statements whose effect PD keeps by bare object IDs
 //! (TiFlash replicas, FLASHBACK CLUSTER's schedule limits) or that live in
-//! the AutoID service
-//! (`AUTO_ID_CACHE=1`).
+//! the AutoID service (`AUTO_ID_CACHE=1`), and the statements that read or
+//! change PD's cluster-wide schedulers and affinity groups by keyspace-less
+//! ranges and bare table IDs (DISTRIBUTE TABLE and its jobs, SHOW TABLE
+//! DISTRIBUTIONS, SHOW AFFINITY).
 
 use crate::DriverError;
 
