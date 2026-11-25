@@ -1287,6 +1287,30 @@ fn a_keyspace_reads_only_its_own_table_row_counts() {
     tidb_keyspace::set_multi_keyspace_mode(false);
 }
 
+/// Design §6.4: the DDL job version and the global index V1 flag are not a
+/// tenant's. Only the classic kernel's DDL detects them from its peers'
+/// versions; a multi-keyspace node is next-generation, where no DDL writes
+/// them, so opening keyspaces and running their DDL leaves the process's
+/// one value as it was.
+#[test]
+fn opening_keyspaces_leaves_the_job_version_alone() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set("ks_a", tidb_config_deploymode::get(), false);
+    let version = tidb_model::get_job_ver_in_use();
+    let global_index_v1 = tidb_model::index::get_global_index_v_1_supported();
+    let a_store = MockStoreDomain::create_for_keyspace("ks_a").unwrap();
+    let b_store = MockStoreDomain::create_for_keyspace("ks_b").unwrap();
+    for store in [&a_store, &b_store] {
+        let mut session = store.new_session().unwrap();
+        session.run("create table test.job_version_probe (a int, key i (a))").unwrap();
+    }
+    assert_eq!(tidb_model::get_job_ver_in_use(), version);
+    assert_eq!(tidb_model::index::get_global_index_v_1_supported(), global_index_v1);
+}
+
 /// Design §6.8 (phase 3e): two keyspaces of one node read only their own
 /// diagnostics from the process-wide owners. Both run the same statement:
 /// each sees only its own statement-summary rows (current, history,

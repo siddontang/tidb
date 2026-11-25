@@ -748,7 +748,7 @@ operator listener exists, Op means node config.
 | Infoschema cache, schema lease, schema-version sync | RT | SQL (DDL) | Isolated: one loader per runtime; schema sync on the tenant's etcd; the validator keeps its keyspace's `tidb_max_delta_schema_count` of deltas. | `cluster_stack.rs:799,970` | — |
 | DDL job queue and history, DDL owner | TS + tenant etcd | SQL | Isolated: owner managers are keyed by keyspace. A job's reorganization reads its keyspace's vardef values on every thread it spawns. | `tidb-ddl/src/owner_mgr.rs:16`; `tidb-ddl/src/real_tikv_ddl.rs` (job scope) | — |
 | `JOB_CTX_MAP` (reorg contexts by job ID) | P | — | Isolated: keyed by keyspace and job ID (`JobKey`). | `tidb-ddl/src/job_ctx.rs` | — |
-| `JOB_VER_IN_USE`, `GLOBAL_INDEX_V1_SUPPORTED` | P | Each tenant's DDL version check | Shared: the last tenant's DDL worker sets the value for every tenant. | `tidb-model/src/job_enums.rs:210`; `tidb-model/src/index.rs:84`; `tidb-ddl/src/worker.rs:700,784` | 3d (§6.4) |
+| `JOB_VER_IN_USE`, `GLOBAL_INDEX_V1_SUPPORTED` | P | Classic DDL's version check only | Not per tenant: only the classic kernel's DDL writes them; on next-generation (every multi-keyspace node) they are one constant process value (§6.4). | `tidb-model/src/job_enums.rs:210`; `tidb-model/src/index.rs:84`; `tidb-ddl/src/worker.rs:1664` | — |
 | MDL (`mysql.tidb_mdl_info`, schema pins) | TS + RT | — | Isolated: pins per domain. Next-generation kernels always lock, so `ENABLE_MDL` is an instance setting. | vardef appendix | — |
 | Accounts (`mysql.user`, `db`, `tables_priv`, roles, `global_priv`, password history) | TS | SQL | Isolated: privileges per domain, privilege watch on the tenant's etcd, username policy per runtime. Users without a prefix route to the configured keyspace. | `tidb-server/src/keyspace_registry.rs` (`route`) | Prefix-less users: Phase 2 (Q2) |
 | `mysql.global_variables` and the sysvar cache | TS + RT | SQL (keyspace variables); Op (process variables) | 54 of 55 global statics are kept per keyspace (the cloud storage URI is a process variable); a tenant's `SET GLOBAL` of a process variable is refused. | `tidb-server/src/keyspace_runtime.rs`; §6.3 appendices | — |
@@ -794,8 +794,6 @@ operator listener exists, Op means node config.
 
 - GC: a statement result or cursor kept past its transaction holds back
   every tenant's reported min-start-ts (conservative, §6.5).
-- DDL: a peer on an old version in one tenant's fleet sets the job version
-  for every tenant on the node (3d).
 - Diagnostics (§6.8): what has no keyspace-correct source is refused or
   empty; Top SQL reports still name one keyspace (not SQL-readable).
 - Exhaustion: one tenant's prepared statements count against another tenant's
@@ -1223,11 +1221,16 @@ Table and job IDs are per keyspace, so these caches collide across tenants:
   (`DdlSessionPool::keyspace_id`, through `DdlStepWorker::job_key` and
   `JobTxn::job_key`) or the reorganization's transaction opener.
 - `JOB_VER_IN_USE` and `GLOBAL_INDEX_V1_SUPPORTED` (`tidb-model/src/job_enums.rs:210`,
-  `tidb-model/src/index.rs:84`): derived from each tenant's server-info
-  versions, so they belong to the tenant's DDL, not the process. **Open:**
-  the job builders read them without their DDL; until they move, the safe
-  interim is the conservative vote (version 2 only while every running
-  DDL's detection allows it).
+  `tidb-model/src/index.rs:84`). **Not per tenant:** only the classic
+  kernel's DDL detects them from its peers' server-info versions
+  (`worker.rs`, `detect_and_update_job_version`, Go's `ddl.Start` behind
+  `kerneltype.IsClassic()`). A multi-keyspace node is next-generation,
+  where no DDL writes them, so every tenant reads the process's one value
+  (a test opens two keyspaces and runs their DDL and finds it unchanged).
+  Go's next-generation kernel fixes them at version 2 and V1 supported in
+  its packages' `init`; this port's stay at the classic initial values
+  (version 1, not supported) on next-generation, a Go-parity gap to close
+  outside this phase.
 
 Each moves into the runtime's `Domain`, or is re-keyed by `(keyspace_id, id)`.
 Moving it into the `Domain` is preferred, because it closes with the tenant.
