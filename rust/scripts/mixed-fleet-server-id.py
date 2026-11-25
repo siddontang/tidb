@@ -16,6 +16,11 @@ first server-ID candidate. The script checks:
 4. Unless --skip-lease: every lease is renewed by its keeper's refresh;
    S's lease expiry drains S and S reserves an ID again; M's tenant-lease
    loss drains only that tenant, which then reserves the same ID again.
+   It revokes only the test nodes' own server-ID leases, checked right
+   before the revoke (exact key, lease, the lease's keys, the node's
+   server info); otherwise it fails and revokes nothing.
+
+`--self-test` checks the lease lookup and that guard offline.
 
 Environment:
   TIDB_SERVER   the failpoints + nextgen tidb-server binary (required)
@@ -100,9 +105,20 @@ def id_key(ks, server_id):
     return "/keyspaces/tidb/%d/tidb/server_id/%d" % (ks, server_id)
 
 
+def etcd_get(key):
+    """The one key `key` (no range end), as (value, lease), or None. The
+    answer is matched against `key` too, so no other key can stand in."""
+    resp = etcd("kv/range", {"key": b64(key)})
+    for kv in resp.get("kvs", []):
+        if base64.b64decode(kv["key"]).decode() == key:
+            return base64.b64decode(kv.get("value", "")), int(kv.get("lease", "0"))
+    return None
+
+
 def id_lease(ks, server_id):
-    found = etcd_range(id_key(ks, server_id))
-    return found[0][2] if found else None
+    """The lease of server ID `server_id`'s exact key, or None."""
+    found = etcd_get(id_key(ks, server_id))
+    return found[1] if found else None
 
 
 def server_infos(ks):
@@ -120,8 +136,27 @@ def lease_ttl(lease):
     return int(etcd("lease/timetolive", {"ID": str(lease)}).get("TTL", "-1"))
 
 
-def revoke(lease):
+def lease_keys(lease):
+    resp = etcd("lease/timetolive", {"ID": str(lease), "keys": True})
+    return sorted(base64.b64decode(key).decode() for key in resp.get("keys", []))
+
+
+def revoke_own(ks, server_id, lease, port):
+    """Revokes `lease` only if it is still the test node's claim on
+    `server_id` in keyspace `ks`: the exact key holds that lease, the lease
+    holds no other key, and the namespace's server info for the node's port
+    publishes that ID. Otherwise nothing is revoked; returns the reason."""
+    key = id_key(ks, server_id)
+    found = etcd_get(key)
+    if found is None or found[1] != lease:
+        return "key %s now has lease %s, not %s" % (key, found and found[1], lease)
+    attached = lease_keys(lease)
+    if attached != [key]:
+        return "lease %s holds %s, not only %s" % (lease, attached, key)
+    if (server_id, port) not in server_infos(ks):
+        return "no server info for port %d publishes server ID %d" % (port, server_id)
     etcd("lease/revoke", {"ID": str(lease)})
+    return None
 
 
 # --- nodes ---------------------------------------------------------------
@@ -230,13 +265,17 @@ def alive(db):
 
 
 def run(db, sql):
+    return query(db, sql)[0]
+
+
+def query(db, sql):
+    """("ok", rows) or ("error <code>", None)."""
     try:
         with db.cursor() as cursor:
             cursor.execute(sql)
-            cursor.fetchall()
-        return "ok"
+            return "ok", cursor.fetchall()
     except pymysql.err.MySQLError as error:
-        return "error %s" % (error.args[0],)
+        return "error %s" % (error.args[0],), None
 
 
 def run_warned(db, sql):
@@ -251,22 +290,42 @@ def run_warned(db, sql):
     return "ok" + ("; warnings: " + " | ".join(warnings) if warnings else "")
 
 
+REFUSED_KILL = "1105 KILL remote connection failed:"
+REFUSED_REASON = "answers peer requests of its configured keyspace's users only"
+# What an interrupted SLEEP answers: the 1317 error, or SLEEP's 1 (MySQL's
+# "interrupted" result).
+INTERRUPTED = ("error 1317", ((1,),))
+
+
 def kill_query_takes(source, target, statement):
     """Runs SELECT SLEEP(8) on `target` and `statement` (with the target's ID)
-    from `source` after a second; returns (statement result, sleep seconds)."""
+    from `source` after 1.5s. Returns the statement's result (with its
+    warnings), the sleep's outcome ("ok", rows) or ("error <code>", None), and
+    when the sleep ended relative to the KILL being sent (seconds; negative
+    if it ended first)."""
     out = {}
 
     def sleeper():
-        start = time.time()
-        out["sleep"] = run(target, "SELECT SLEEP(8)")
-        out["elapsed"] = time.time() - start
+        out["sleep"] = query(target, "SELECT SLEEP(8)")
+        out["ended"] = time.time()
 
     thread = threading.Thread(target=sleeper)
     thread.start()
     time.sleep(1.5)
+    sent = time.time()
     out["kill"] = run_warned(source, statement % conn_id_cache[id(target)])
     thread.join()
-    return out["kill"], out["elapsed"]
+    return out["kill"], out["sleep"], out["ended"] - sent
+
+
+def interrupted(sleep):
+    status, rows = sleep
+    return status == INTERRUPTED[0] or (status == "ok" and tuple(rows) == INTERRUPTED[1])
+
+
+def kill_refused(result):
+    """A remote KILL into a multi-keyspace node: OK with the refusal warning."""
+    return result.startswith("ok; warnings: ") and REFUSED_KILL in result and REFUSED_REASON in result
 
 
 conn_id_cache = {}
@@ -345,20 +404,22 @@ def multi_first(multi, single, ids, skip_lease):
     print("== remote KILL between M (%d) and S (%d)" % (candidate, s_id), flush=True)
     m2b = tracked(connect(multi, TENANT))
     m1 = tracked(connect(multi, PRIMARY))
-    result, elapsed = kill_query_takes(m2b, s, "KILL QUERY %d")
-    check("KILL QUERY from M into S stops the query", result == "ok" and elapsed < 6,
-          "%s, the query ran %.1fs" % (result, elapsed))
+    result, sleep, ended = kill_query_takes(m2b, s, "KILL QUERY %d")
+    check("KILL QUERY from M into S interrupts the query",
+          result == "ok" and interrupted(sleep) and 0 <= ended < 5,
+          "KILL %s; the sleep answered %s, %.1fs after the KILL was sent" % (result, sleep, ended))
     check("S's connection survives KILL QUERY", alive(s))
     result = run_warned(m1, "KILL %d" % conn_id_cache[id(s)])
     check("KILL from M's other tenant does not reach S", alive(s) and not dead_within(s, 3), result)
     result = run_warned(m2b, "KILL %d" % conn_id_cache[id(s)])
     check("KILL from M into S closes the connection", result == "ok" and dead_within(s, 10), result)
     s = tracked(connect(single, TENANT))
-    result, elapsed = kill_query_takes(s, m2, "KILL QUERY %d")
-    check("KILL QUERY from S into M is refused (design 6.8, until 3f)", elapsed > 7,
-          "%s, the query ran %.1fs" % (result, elapsed))
+    result, sleep, ended = kill_query_takes(s, m2, "KILL QUERY %d")
+    check("KILL QUERY from S into M is refused (design 6.8, until 3f)",
+          kill_refused(result) and sleep == ("ok", ((0,),)) and ended > 5 and alive(m2),
+          "KILL %s; the sleep answered %s, %.1fs after the KILL was sent" % (result, sleep, ended))
     result = run_warned(s, "KILL %d" % conn_id_cache[id(m2)])
-    check("KILL from S into M is refused (design 6.8, until 3f)", not dead_within(m2, 5), result)
+    check("KILL from S into M is refused (design 6.8, until 3f)", kill_refused(result) and not dead_within(m2, 5), result)
     for db in (m2b,):
         db.close()
     if skip_lease:
@@ -375,8 +436,12 @@ def multi_first(multi, single, ids, skip_lease):
 
     print("== lease expiry: revoking S's and M's %s leases" % TENANT, flush=True)
     s, m1, m2 = tracked(connect(single, TENANT)), tracked(connect(multi, PRIMARY)), tracked(connect(multi, TENANT))
-    revoke(leases["S %s" % TENANT])
-    revoke(leases["M %s" % TENANT])
+    # Only the test nodes' own claims, checked again right before the revoke.
+    for name, server_id, port in (("S", s_id, SINGLE_PORT), ("M", candidate, MULTI_PORT)):
+        refused = revoke_own(ids["tenant"], server_id, leases["%s %s" % (name, TENANT)], port)
+        if not check("%s's %s lease is still its own claim" % (name, TENANT), refused is None, refused or ""):
+            print("   not revoking anything else; skipping the expiry checks", flush=True)
+            return
     revoked = time.time()
     seen = {"s_dead": None, "m2_dead": None, "m1_dead": None, "m2_refused": None, "m2_back": None, "s_back": None}
     while time.time() - revoked < REFRESH + 90:
@@ -415,10 +480,60 @@ def multi_first(multi, single, ids, skip_lease):
     check("M's ID is not S's after S's reacquisition", server_id_of(conn_id_cache[id(s)]) != candidate)
 
 
+def self_test():
+    """Offline checks of the lease lookup and the revoke guard over a fake
+    etcd that answers every range with keys sharing a decimal prefix."""
+    global etcd
+    real = etcd
+    keys = {id_key(1, 123): (b"0", 7), id_key(1, 12): (b"0", 5)}
+    attached = {5: [id_key(1, 12)], 7: [id_key(1, 123)]}
+    revoked = []
+
+    def fake(path, body):
+        if path == "kv/range":
+            assert "range_end" not in body, "a server-ID lookup asked for a range: %s" % body
+            prefix = base64.b64decode(body["key"]).decode()
+            return {"kvs": [{"key": b64(key), "value": base64.b64encode(value).decode(), "lease": str(lease)}
+                            for key, (value, lease) in sorted(keys.items()) if key.startswith(prefix)]}
+        if path == "lease/timetolive":
+            return {"keys": [b64(key) for key in attached[int(body["ID"])]]}
+        if path == "lease/revoke":
+            revoked.append(int(body["ID"]))
+            return {}
+        raise AssertionError(path)
+
+    etcd = fake
+    global server_infos
+    real_infos = server_infos
+    server_infos = lambda ks: [(12, MULTI_PORT)]
+    try:
+        assert id_lease(1, 12) == 5
+        assert id_lease(1, 1) is None, "a prefix of 12 and 123 found a lease"
+        assert id_lease(1, 124) is None
+        # 1 is absent: its revoke must not fall on 12's or 123's lease.
+        assert revoke_own(1, 1, 5, MULTI_PORT) is not None and revoked == []
+        # The lease changed hands since it was recorded.
+        assert revoke_own(1, 12, 9, MULTI_PORT) is not None and revoked == []
+        # The lease holds another key too.
+        attached[5] = [id_key(1, 12), "/elsewhere"]
+        assert revoke_own(1, 12, 5, MULTI_PORT) is not None and revoked == []
+        attached[5] = [id_key(1, 12)]
+        # Another node publishes the ID.
+        assert revoke_own(1, 12, 5, SINGLE_PORT) is not None and revoked == []
+        assert revoke_own(1, 12, 5, MULTI_PORT) is None and revoked == [5]
+    finally:
+        etcd, server_infos = real, real_infos
+    print("self-test passed")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--skip-lease", action="store_true", help="skip the renewal and expiry checks (about 11 minutes)")
+    parser.add_argument("--self-test", action="store_true", help="check the lease lookup and revoke guard offline, then exit")
     args = parser.parse_args()
+    if args.self_test:
+        self_test()
+        return
     for name in ("TIDB_SERVER", "TIDB_MULTI_KEYSPACE_DEV_ROOT_PASSWORD"):
         if not os.getenv(name):
             sys.exit("%s is required" % name)
