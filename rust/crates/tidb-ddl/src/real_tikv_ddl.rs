@@ -64,18 +64,21 @@ struct LabelDeliveryReceipt {
 
 struct PlacementDeliveryReceipt {
     pd_http_client: tikv_client::pd_http::Client,
+    /// Go `jobCtx.store.GetCodec()`: the keyspace the bundles are keyed by.
+    codec: Option<tikv_client::request::ApiV2Codec>,
     rollback: Vec<tidb_placement::Bundle>,
 }
 
 fn deliver_placement_bundles(
     pd_http_client: &tikv_client::pd_http::Client,
+    codec: Option<tikv_client::request::ApiV2Codec>,
     bundles: &[tidb_placement::Bundle],
     timeout: Duration,
 ) -> Result<Option<PlacementDeliveryReceipt>, ClusterDdlError> {
     if bundles.is_empty() {
         return Ok(None);
     }
-    crate::placement_delivery::put_rule_bundles(pd_http_client, bundles, timeout).map_err(
+    crate::placement_delivery::put_rule_bundles(pd_http_client, codec.as_ref(), bundles, timeout).map_err(
         |error| {
             ClusterDdlError::NotCommitted(format!(
                 "failed to notify PD the placement rules: {error}"
@@ -93,6 +96,7 @@ fn deliver_placement_bundles(
         .collect();
     Ok(Some(PlacementDeliveryReceipt {
         pd_http_client: pd_http_client.clone(),
+        codec,
         rollback,
     }))
 }
@@ -163,7 +167,12 @@ fn restore_placement(
     receipt: &PlacementDeliveryReceipt,
     timeout: Duration,
 ) -> Result<(), crate::placement_delivery::PlacementDeliveryError> {
-    crate::placement_delivery::put_rule_bundles(&receipt.pd_http_client, &receipt.rollback, timeout)
+    crate::placement_delivery::put_rule_bundles(
+        &receipt.pd_http_client,
+        receipt.codec.as_ref(),
+        &receipt.rollback,
+        timeout,
+    )
 }
 
 fn compensate_external_delivery(
@@ -1764,7 +1773,8 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
         }
     }
     let placement_receipt = if let Some(pd_http_client) = opener.store().pd_http_client() {
-        match deliver_placement_bundles(&pd_http_client, &write.placement_bundles, timeout) {
+        let codec = tidb_domain_infosync::info_syncer::store_codec(sess_pool.keyspace_id());
+        match deliver_placement_bundles(&pd_http_client, codec, &write.placement_bundles, timeout) {
             Ok(receipt) => receipt,
             Err(error) => {
                 let _ = transaction.rollback();

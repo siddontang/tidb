@@ -3226,11 +3226,12 @@ fn plan_persisted_ddl_job_with<S: MetaSnapshot>(
     let cancelling = active.job.is_cancelling();
     let was_rollingback = active.job.is_rollingback();
     let previous_schema_version = active.job.last_schema_version;
-    // A multi-keyspace node writes no PD state for a tenant until the PD
-    // clients are per keyspace (design §10 phase 2). The check is on the
-    // step's resolved write, so it covers what the statement did not spell
-    // out: a TRUNCATE or partition change of a table that already carries
-    // placement, a job queued before the restart.
+    // A multi-keyspace node writes no PD state for a tenant that PD keeps by
+    // bare object IDs (design §10 phase 2; label rules and placement
+    // bundles carry their keyspace, §6.2). The check is on the step's
+    // resolved write, so it covers what the statement did not spell out: a
+    // TRUNCATE or partition change of a table that already carries such
+    // state, a job queued before the restart.
     let multi_keyspace = tidb_keyspace::is_multi_keyspace_mode();
     let refused_pd_write = std::cell::Cell::new(false);
     let outcome = recover_ddl_action(|| {
@@ -3240,8 +3241,8 @@ fn plan_persisted_ddl_job_with<S: MetaSnapshot>(
             })
             .map(|mut step| {
                 // A rollback puts back the PD state its job changed; a job
-                // refused here changed none, and an older job's state stays
-                // until phase 3b.
+                // refused here changed none, and an older job's ID-named
+                // state stays for the operator.
                 if multi_keyspace {
                     strip_pd_writes(&mut step.write);
                 }
@@ -3285,8 +3286,8 @@ fn plan_persisted_ddl_job_with<S: MetaSnapshot>(
                 (Some(feature), None, Ok(mut step)) if multi_keyspace => {
                     // Past the point a job can be cancelled (a job queued
                     // before the restart, or a later step of one): it
-                    // finishes without touching PD, whose rules for the
-                    // object stay until phase 3b.
+                    // finishes without touching PD, whose ID-named rules
+                    // for the object stay for the operator.
                     tidb_ddl_logutil::ddl_logger().warn(
                         "multi-keyspace node skips a DDL step's PD writes",
                         &[
@@ -5124,12 +5125,11 @@ pub(super) fn record_ddl_action_error(job: &mut Job, error: &DdlPlanError) -> bo
 }
 
 /// The PD write a job step's resolved metadata would make, if any, that a
-/// multi-keyspace node refuses. Label rules are not among them: their IDs
-/// and ranges carry the job's keyspace (Go `UseKeyspaceAwareRules`).
+/// multi-keyspace node refuses. Label rules and placement bundles are not
+/// among them: their IDs and ranges carry the job's keyspace where they
+/// meet PD.
 fn pd_backed_write_feature(write: &DdlWrite) -> Option<&'static str> {
-    if !write.placement_bundles.is_empty() {
-        Some("PLACEMENT")
-    } else if !write.affinity_groups.is_empty() {
+    if !write.affinity_groups.is_empty() {
         Some("AFFINITY")
     } else if write.resource_group_update.is_some() {
         Some("RESOURCE GROUP DDL")
@@ -5140,7 +5140,6 @@ fn pd_backed_write_feature(write: &DdlWrite) -> Option<&'static str> {
 
 /// Drops the PD writes [`pd_backed_write_feature`] refuses.
 fn strip_pd_writes(write: &mut DdlWrite) {
-    write.placement_bundles.clear();
     write.affinity_groups = Default::default();
     write.resource_group_update = None;
 }

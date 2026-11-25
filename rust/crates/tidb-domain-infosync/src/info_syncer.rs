@@ -83,7 +83,7 @@ impl InfoSyncer {
     #[must_use]
     pub fn new(keyspace_id: u32) -> Self {
         Self {
-            codec: ApiV2Codec::new(KeyMode::Txn, keyspace_id).ok(),
+            codec: store_codec(keyspace_id),
             ..Self::default()
         }
     }
@@ -176,6 +176,14 @@ impl InfoSyncer {
     pub fn pd_http_cli(&self) -> Option<Arc<dyn PdHttpClient>> {
         read(&self.pd_http_cli)
     }
+}
+
+/// Go `store.GetCodec()` as a keyspace codec: the transaction codec of a store
+/// whose keyspace ID is `keyspace_id`, `None` for an API-V1 store (the null
+/// keyspace).
+#[must_use]
+pub fn store_codec(keyspace_id: u32) -> Option<ApiV2Codec> {
+    ApiV2Codec::new(KeyMode::Txn, keyspace_id).ok()
 }
 
 /// Go `globalInfoSyncer`: the process's, which a thread that entered no

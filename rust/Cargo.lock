@@ -6147,6 +6147,7 @@ dependencies = [
 name = "tidb-domain-infosync"
 version = "0.0.0"
 dependencies = [
+ "hex",
  "serde_json",
  "tidb-ast",
  "tidb-codec",

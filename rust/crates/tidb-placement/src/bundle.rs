@@ -624,6 +624,27 @@ pub fn get_range_start_and_end_key_hex(range_bundle_id: &str) -> (String, String
 }
 
 impl Bundle {
+    /// The bundle as the group `id` names after its own ID: each rule joins
+    /// the group, and its hex key range is `range` of the old one. A
+    /// keyspace keys and ranges its bundles so where they meet PD
+    /// (multi-keyspace design §6.2).
+    ///
+    /// # Errors
+    /// `range`'s.
+    pub fn regroup(
+        &self,
+        id: impl FnOnce(&str) -> String,
+        range: impl Fn(&str, &str) -> Result<(String, String), String>,
+    ) -> Result<Self, String> {
+        let mut regrouped = self.clone();
+        regrouped.id = id(&self.id);
+        for rule in &mut regrouped.rules {
+            (rule.start_key_hex, rule.end_key_hex) = range(&rule.start_key_hex, &rule.end_key_hex)?;
+            rule.group_id.clone_from(&regrouped.id);
+        }
+        Ok(regrouped)
+    }
+
     /// Go `(*Bundle).Tidy`: post-optimizes the rules, trying to generate rules
     /// that suit PD.
     ///

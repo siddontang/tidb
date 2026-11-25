@@ -32,6 +32,7 @@ tidb-ddl-label = { path = "../tidb-ddl-label" }
 tidb-placement = { path = "../tidb-placement" }
 tidb-tablecodec = { path = "../tidb-tablecodec" }
 tidb-codec = { path = "../tidb-codec" }
+hex = "0.4"
 tidb-config = { path = "../tidb-config" }
 tidb-pd-client = { path = "../tidb-pd-client" }
 

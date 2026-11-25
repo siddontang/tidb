@@ -330,11 +330,11 @@ impl NodeGcRules {
     }
 }
 
-/// A multi-keyspace node leaves PD's placement and TiFlash rules alone when
-/// it GCs a tenant's dropped objects (design §10 phase 2): their IDs
-/// (`TiDB_DDL_<id>`, `table-<id>-r`) carry no keyspace, so a tenant's
-/// cleanup could delete another keyspace's rules. Label rules carry their
-/// keyspace and are cleaned up.
+/// A multi-keyspace node leaves PD's TiFlash rules alone when it GCs a
+/// tenant's dropped objects (design §10 phase 2): their IDs (`table-<id>-r`)
+/// carry no keyspace, so a tenant's cleanup could delete another keyspace's
+/// rules. Label rules and placement bundles carry their keyspace and are
+/// cleaned up.
 fn skip_pd_rule_cleanup() -> bool {
     tidb_keyspace::is_multi_keyspace_mode()
 }
@@ -351,11 +351,9 @@ impl GcRuleClient for NodeGcRules {
     }
 
     fn put_rule_bundles(&self, bundles: Vec<tidb_placement::Bundle>) -> GcResult<()> {
-        if skip_pd_rule_cleanup() {
-            return Ok(());
-        }
         tidb_ddl::placement_delivery::put_rule_bundles(
             self.pd_http_client()?,
+            self.info_syncer().codec(),
             &bundles,
             GC_RPC_TIMEOUT,
         )

@@ -388,8 +388,7 @@ impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for Co
 }
 
 /// A multi-keyspace node refuses the DDL whose effect lives in PD --
-/// resource groups, placement policies and options, TiFlash replicas --
-/// and `AUTO_ID_CACHE=1` tables, whose
+/// resource groups, TiFlash replicas -- and `AUTO_ID_CACHE=1` tables, whose
 /// IDs come from the AutoID service only the configured keyspace runs, with
 /// `ER_NOT_SUPPORTED_YET` (1235) before any PD client is called (design §10
 /// phase 2, until 3b and 3f make them per keyspace). The counting placement
@@ -417,16 +416,7 @@ fn a_multi_keyspace_node_refuses_pd_backed_ddl() {
         "create resource group rg1 ru_per_sec = 100",
         "alter resource group default ru_per_sec = 100",
         "drop resource group if exists rg1",
-        "create placement policy p1 followers = 1",
-        "alter placement policy p1 followers = 2",
-        "drop placement policy if exists p1",
-        "create database d1 placement policy = p1",
-        "alter database test placement policy = default",
         "alter database test set tiflash replica 1",
-        "create table t1 (a int) placement policy = p1",
-        "create table t2 (a int) partition by range (a) (partition p0 values less than (10) placement policy = p1)",
-        "alter table t placement policy = default",
-        "alter table t partition p0 placement policy = default",
         "alter table t set tiflash replica 1",
         "create table t3 (a int primary key auto_increment) auto_id_cache = 1",
         "alter table t auto_id_cache = 1",
@@ -456,78 +446,6 @@ fn a_multi_keyspace_node_refuses_pd_backed_ddl() {
     tidb_domain_infosync::resource_manager_client::init_resource_manager_client(Some(std::sync::Arc::new(
         tidb_domain_infosync::resource_manager_client::MockResourceManagerClient::new(),
     )));
-}
-
-/// The PD restriction holds for the metadata a DDL job resolves, not only
-/// the statement's text (design §10 phase 2): a table that got placement
-/// before the node served several keyspaces carries it in its TableInfo,
-/// and a TRUNCATE or partition change of it would re-put its bundles
-/// through the process's PD client. In multi-keyspace mode such a job
-/// step is refused with 1235 before any PD call and the job is cancelled:
-/// the counting placement manager sees no call and the rows stay. DDL that
-/// writes no PD state still runs.
-#[test]
-fn a_multi_keyspace_node_refuses_ddl_jobs_that_carry_placement() {
-    if !tidb_config_kerneltype::is_next_gen() {
-        // Multi-keyspace serving is nextgen only.
-        return;
-    }
-    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
-    let store = MockStoreDomain::create().unwrap();
-    let mut session = store.new_session().unwrap();
-    let pd = std::sync::Arc::new(CountingPd::default());
-    let placement = tidb_domain_infosync::placement_manager::placement_manager();
-    tidb_domain_infosync::placement_manager::init_placement_manager(Some(pd.clone()));
-    // Created by a single-keyspace node: the tables carry placement.
-    for sql in [
-        "use test",
-        "create placement policy p1 followers = 1",
-        "create table tp (a int) placement policy = p1",
-        "insert into tp values (1), (2)",
-        "create table pp (a int) partition by range (a) (partition p0 values less than (10) placement policy = p1, partition p9 values less than (100))",
-        "insert into pp values (1)",
-        "create table plain (a int)",
-    ] {
-        session.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
-    }
-    assert!(pd.calls() > 0, "the single-keyspace DDL put its bundles");
-    let before = pd.calls();
-
-    tidb_keyspace::set_multi_keyspace_mode(true);
-    for sql in [
-        "truncate table tp",
-        "alter table pp truncate partition p0",
-        "alter table pp add partition (partition p10 values less than (200))",
-        "alter table pp reorganize partition p9 into (partition p90 values less than (50), partition p91 values less than (100))",
-    ] {
-        let (code, message) = refusal(&mut session, sql).unwrap_or_else(|| panic!("{sql} ran"));
-        assert_eq!(code, 1235, "{sql}: {message}");
-        assert!(message.ends_with("PLACEMENT on a multi-keyspace node'"), "{sql}: {message}");
-    }
-    assert_eq!(pd.calls(), before, "no PD call in multi-keyspace mode");
-    assert_eq!(row_text(session.run("select count(*) from tp")), [["2"]]);
-    assert_eq!(row_text(session.run("select count(*) from pp")), [["1"]]);
-    // DROP PARTITION puts its bundles past the point the job can be
-    // cancelled: it finishes without the PD write (the dropped partition's
-    // rules stay until phase 3b).
-    assert_eq!(refusal(&mut session, "alter table pp drop partition p0"), None);
-    assert_eq!(pd.calls(), before);
-    assert_eq!(row_text(session.run("select count(*) from pp")), [["0"]]);
-    // Jobs without PD state run, and the refused jobs left none queued.
-    for sql in ["truncate table plain", "alter table tp add column b int"] {
-        assert_eq!(refusal(&mut session, sql), None, "{sql}");
-    }
-    assert_eq!(pd.calls(), before);
-    assert_eq!(
-        row_text(session.run("select count(*) from mysql.tidb_ddl_job")),
-        [["0"]]
-    );
-
-    tidb_keyspace::set_multi_keyspace_mode(false);
-    for sql in ["drop table tp, pp, plain", "drop placement policy p1"] {
-        session.run(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
-    }
-    tidb_domain_infosync::placement_manager::init_placement_manager(Some(placement));
 }
 
 /// A TiFlash replica manager that counts its PD calls over another one.
@@ -1547,4 +1465,96 @@ fn two_keyspaces_keep_their_own_label_rules() {
     }
     assert_eq!(row_text(sessions[0].run("select id from information_schema.attributes")), [["schema/test/t2"]]);
     assert_eq!(row_text(sessions[1].run("select id from information_schema.attributes")), [["schema/test/t"]]);
+}
+
+/// Placement of two keyspaces on one node (design §6.2). PD keeps one
+/// namespace of rule groups, so a keyspace's bundle is keyed and ranged by
+/// its keyspace where it meets PD: two keyspaces whose tables share a table
+/// ID put two bundles, `keyspace-<id>-TiDB_DDL_<table ID>`, each over its
+/// own keyspace's keys and with its own policy, and a keyspace's `ALTER
+/// RANGE global` covers only its keyspace. Each keyspace's policies and its
+/// range placement are its own, and TRUNCATE in one keyspace moves only its
+/// own bundle. Before, a multi-keyspace node refused placement DDL (1235).
+#[test]
+fn two_keyspaces_keep_their_own_placement() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set(tidb_keyspace::SYSTEM, tidb_config_deploymode::get(), false);
+    let stores = [
+        (1_i64, MockStoreDomain::create_for_keyspace("ks_a").unwrap()),
+        (2, MockStoreDomain::create_for_keyspace("ks_b").unwrap()),
+    ];
+    tidb_keyspace::set_multi_keyspace_mode(true);
+    // PD's placement rules, which both keyspaces reach.
+    let pd = std::sync::Arc::new(tidb_domain_infosync::placement_manager::MockPlacementManager::default());
+    let mut sessions = Vec::new();
+    for (followers, store) in &stores {
+        store.info_syncer().init_placement_manager(Some(pd.clone()));
+        let mut session = store.new_session().unwrap();
+        for sql in [
+            "use test".to_owned(),
+            format!("create placement policy p1 followers = {followers}"),
+            "create table t (a int) placement policy = p1".to_owned(),
+        ] {
+            session.run(&sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        }
+        sessions.push(session);
+    }
+    let table_id = physical_id(&mut sessions[0], "t", None);
+    assert_eq!(physical_id(&mut sessions[1], "t", None), table_id, "the table IDs collide");
+
+    let stored = |store: &MockStoreDomain, id: &str| {
+        let group = format!("keyspace-{}-{id}", keyspace_codec(store).keyspace_id());
+        tidb_domain_infosync::placement_manager::PlacementManager::get_rule_bundle(&*pd, &group).unwrap()
+    };
+    let table_range = |store: &MockStoreDomain, id: i64| {
+        let (start, end) = keyspace_codec(store).encode_region_range(
+            &tidb_tablecodec::table_key::gen_table_prefix(id),
+            &tidb_tablecodec::table_key::gen_table_prefix(id + 1),
+        );
+        (hex_lower(&start), hex_lower(&end))
+    };
+    for (followers, store) in &stores {
+        let bundle = stored(store, &tidb_placement::group_id(table_id));
+        let group = format!("keyspace-{}-TiDB_DDL_{table_id}", keyspace_codec(store).keyspace_id());
+        assert_eq!(bundle.id, group);
+        assert!(!bundle.rules.is_empty());
+        for rule in &bundle.rules {
+            assert_eq!(rule.group_id, group);
+            assert_eq!((rule.start_key_hex.clone(), rule.end_key_hex.clone()), table_range(store, table_id));
+        }
+        // The keyspace's own policy: a leader and its followers.
+        assert_eq!(bundle.rules.iter().map(|rule| rule.count).sum::<i64>(), followers + 1);
+    }
+    let policies = "select policy_name, followers from information_schema.placement_policies";
+    for ((followers, _), session) in stores.iter().zip(&mut sessions) {
+        assert_eq!(row_text(session.run(policies)), [["p1".to_owned(), followers.to_string()]]);
+    }
+
+    // A keyspace's global range is its keyspace's keys.
+    assert_eq!(refusal(&mut sessions[0], "alter range global placement policy p1"), None);
+    let global = stored(&stores[0].1, tidb_placement::TIDB_BUNDLE_RANGE_PREFIX_FOR_GLOBAL);
+    let (start, end) = keyspace_codec(&stores[0].1).encode_region_range(&[], &[]);
+    assert_eq!(
+        (global.rules[0].start_key_hex.clone(), global.rules[0].end_key_hex.clone()),
+        (hex_lower(&start), hex_lower(&end))
+    );
+    assert!(stored(&stores[1].1, tidb_placement::TIDB_BUNDLE_RANGE_PREFIX_FOR_GLOBAL).rules.is_empty());
+    let (code, message) = refusal(&mut sessions[0], "drop placement policy p1").expect("the range uses p1");
+    assert_eq!(code, 8241, "{message}");
+    assert_eq!(refusal(&mut sessions[0], "alter range global placement policy default"), None);
+
+    // One keyspace's TRUNCATE puts only its own bundle (the old one stays
+    // until GC, as in Go).
+    let before = stored(&stores[0].1, &tidb_placement::group_id(table_id));
+    assert_eq!(refusal(&mut sessions[1], "truncate table t"), None);
+    let truncated = physical_id(&mut sessions[1], "t", None);
+    assert_eq!(stored(&stores[0].1, &tidb_placement::group_id(table_id)), before);
+    let bundle = stored(&stores[1].1, &tidb_placement::group_id(truncated));
+    assert_eq!(
+        (bundle.rules[0].start_key_hex.clone(), bundle.rules[0].end_key_hex.clone()),
+        table_range(&stores[1].1, truncated)
+    );
 }

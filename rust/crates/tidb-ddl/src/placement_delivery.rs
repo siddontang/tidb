@@ -70,7 +70,9 @@ fn request_pd<T: Send>(
 
 /// Go `PDPlacementManager.PutRuleBundles`: POSTs every bundle to PD through
 /// `SetPlacementRuleBundles(ctx, bundles, true)`, on the info syncer's
-/// derivation of the store's PD HTTP client `pd_http_client`.
+/// derivation of the store's PD HTTP client `pd_http_client`, keyed and
+/// ranged by the keyspace of the store's `codec`
+/// ([`tidb_domain_infosync::placement_manager::encode_bundle`]).
 ///
 /// Go sends `partial=true`, which means the named groups are replaced and
 /// groups this request does not mention are left alone. `partial=false` would
@@ -85,12 +87,18 @@ fn request_pd<T: Send>(
 /// request cannot be sent, or PD answers with a non-success status.
 pub fn put_rule_bundles(
     pd_http_client: &pd_http::Client,
+    codec: Option<&tikv_client::request::ApiV2Codec>,
     bundles: &[Bundle],
     timeout: Duration,
 ) -> Result<(), PlacementDeliveryError> {
     if bundles.is_empty() {
         return Ok(());
     }
+    let bundles = bundles
+        .iter()
+        .map(|bundle| tidb_domain_infosync::placement_manager::encode_bundle(codec, bundle))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(PlacementDeliveryError::Encode)?;
     // Go's `(*pd.GroupBundle)(bundle)` cast.
     let rule_bundles = bundles
         .iter()

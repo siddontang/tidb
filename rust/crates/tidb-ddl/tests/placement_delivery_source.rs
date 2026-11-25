@@ -67,6 +67,7 @@ fn a_bundle_delivery_is_gos_post_with_partial_true() {
     bundle.r#override = true;
     put_rule_bundles(
         &pd_http_client(&endpoint),
+        None,
         &[bundle],
         Duration::from_secs(5),
     )
@@ -113,7 +114,7 @@ fn an_empty_bundle_list_is_not_sent_at_all() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
     let endpoint = format!("http://{}", listener.local_addr().expect("an address"));
     // No server thread: if a request were sent, this would hang or fail.
-    put_rule_bundles(&pd_http_client(&endpoint), &[], Duration::from_secs(5))
+    put_rule_bundles(&pd_http_client(&endpoint), None, &[], Duration::from_secs(5))
         .expect("nothing to send");
     drop(listener);
 }
@@ -127,6 +128,7 @@ fn a_pd_rejection_is_reported_with_its_status() {
     let bundle = new_bundle(9);
     let error = put_rule_bundles(
         &pd_http_client(&endpoint),
+        None,
         &[bundle],
         Duration::from_secs(5),
     )
