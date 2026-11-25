@@ -373,6 +373,41 @@ class TenantSQLTests(unittest.TestCase):
         self.assertGreater(deadlock(a), 0, "the tenant sees its own deadlock")
         self.assertEqual(deadlock(b), 0)
 
+    def test_concurrent_ddl_keeps_each_tenants_schema(self):
+        """Phase 3d's gate, live: both tenants alter their same-named table
+        at once and plan with asynchronous statistics loads (job-ID and
+        table-ID keyed state on a node), and each keeps only its own
+        schema, rows and job history. ADD INDEX and ANALYZE are left to the
+        serial test `two_keyspaces_run_ddl_with_colliding_ids_at_once`: a
+        tenant's DDL owner and peers may be other nodes of the fleet (an
+        older playground build runs neither this node's reorganization nor
+        its ANALYZE broadcast)."""
+        def alter(index):
+            cursor = self.connect(self.tenants[index]).cursor()
+            cursor.execute("USE " + self.schema)
+            cursor.execute("SET tidb_stats_load_sync_wait = 0")
+            cursor.execute("INSERT INTO t VALUES " + ", ".join("(%d, %d)" % (10 + i, index + 1) for i in range(index + 2)))
+            for round_ in range(2):
+                cursor.execute("ALTER TABLE t ADD COLUMN c_t%d_%d INT" % (index, round_))
+                cursor.execute("SELECT * FROM t WHERE marker = %d AND id > 0" % (index + 1))
+                cursor.fetchall()
+
+        with ThreadPoolExecutor(2) as pool:
+            list(pool.map(alter, (0, 1)))
+        for index, cursor in enumerate(self.clients):
+            other = 1 - index
+            cursor.execute("SHOW COLUMNS FROM t")
+            columns = [row[0] for row in cursor.fetchall()]
+            self.assertEqual(columns, ["id", "marker", "c_t%d_0" % index, "c_t%d_1" % index])
+            rows = 1 + index + 2
+            self.assertEqual(self.scalar(cursor, "SELECT COUNT(*) FROM t"), rows)
+            cursor.execute("SELECT query FROM information_schema.ddl_jobs WHERE db_name = %s AND table_name = 't' "
+                           "AND query LIKE 'ALTER TABLE t ADD%%'", (self.schema,))
+            queries = [row[0] for row in cursor.fetchall()]
+            self.assertEqual(len(queries), 2, queries)
+            self.assertTrue(all("_t%d_" % index in query and "_t%d_" % other not in query for query in queries),
+                            queries)
+
     def test_process_wide_sources_are_refused_or_empty(self):
         for cursor in self.clients:
             for sql in ("SELECT * FROM metrics_schema.up",

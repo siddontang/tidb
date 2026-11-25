@@ -1311,6 +1311,84 @@ fn opening_keyspaces_leaves_the_job_version_alone() {
     assert_eq!(tidb_model::index::get_global_index_v_1_supported(), global_index_v1);
 }
 
+/// Phase 3d's gate (design §6.4, §10): two keyspaces of one node run DDL
+/// at the same time with colliding job and table IDs, with ANALYZE and
+/// statistics loads, and neither sees the other's: each keeps its own
+/// indexes, columns, rows, job history and statistics.
+#[test]
+fn two_keyspaces_run_ddl_with_colliding_ids_at_once() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // Multi-keyspace serving is nextgen only.
+        return;
+    }
+    let _modes = ProcessModes::set("ks_a", tidb_config_deploymode::get(), false);
+    let stores = [
+        ("a", 3, MockStoreDomain::create_for_keyspace("ks_a").unwrap()),
+        ("b", 5, MockStoreDomain::create_for_keyspace("ks_b").unwrap()),
+    ];
+    let table_id = |session: &mut Session| physical_id(session, "t", None);
+    let mut ids = Vec::new();
+    for (_, rows, store) in &stores {
+        let mut session = store.new_session().unwrap();
+        session.run("create table test.t (a int, b int)").unwrap();
+        let values = (1..=*rows).map(|i| format!("({i}, {i})")).collect::<Vec<_>>().join(", ");
+        session.run(&format!("insert into test.t values {values}")).unwrap();
+        session.run("use test").unwrap();
+        ids.push(table_id(&mut session));
+    }
+    assert_eq!(ids[0], ids[1], "the keyspaces' table IDs do not collide");
+    tidb_keyspace::set_multi_keyspace_mode(true);
+    std::thread::scope(|scope| {
+        for (tag, _, store) in &stores {
+            scope.spawn(move || {
+                let mut session = store.new_session().unwrap();
+                session.run("use test").unwrap();
+                session.run("set tidb_stats_load_sync_wait = 0").unwrap();
+                // Each ADD INDEX analyzes the table in its job, through the
+                // job's context (its done channel and timeouts).
+                session.run("set tidb_stats_update_during_ddl = on").unwrap();
+                for round in 0..3 {
+                    for sql in [
+                        format!("alter table t add index i_{tag}{round} (a)"),
+                        format!("alter table t add column c_{tag}{round} int"),
+                        "analyze table t".to_owned(),
+                        "select * from t where a = 1 and b = 1".to_owned(),
+                    ] {
+                        session.run(&sql).unwrap_or_else(|error| panic!("{tag}: {sql}: {error:?}"));
+                    }
+                }
+            });
+        }
+    });
+    let mut jobs = Vec::new();
+    for (tag, rows, store) in &stores {
+        let other = if *tag == "a" { "b" } else { "a" };
+        let mut session = store.new_session().unwrap();
+        session.run("use test").unwrap();
+        let names = |session: &mut Session, sql: &str, column: usize| -> Vec<String> {
+            row_text(session.run(sql)).into_iter().map(|row| row[column].clone()).collect()
+        };
+        let indexes = names(&mut session, "show index from t", 2);
+        assert_eq!(indexes, [format!("i_{tag}0"), format!("i_{tag}1"), format!("i_{tag}2")], "{tag}");
+        let columns = names(&mut session, "show columns from t", 0);
+        assert_eq!(columns, ["a".to_owned(), "b".to_owned(), format!("c_{tag}0"), format!("c_{tag}1"), format!("c_{tag}2")]);
+        assert_eq!(row_text(session.run("select count(*) from t")), [[rows.to_string()]], "{tag}");
+        assert_eq!(
+            row_text(session.run("select count from mysql.stats_meta where table_id = (select tidb_table_id from information_schema.tables where table_schema = 'test' and table_name = 't')")),
+            [[rows.to_string()]],
+            "{tag}'s statistics"
+        );
+        let history = row_text(session.run(
+            "select job_id, query from information_schema.ddl_jobs where table_name = 't' and query like 'alter table t add%' order by job_id",
+        ));
+        assert_eq!(history.len(), 6, "{tag}: {history:?}");
+        assert!(history.iter().all(|row| row[1].contains(&format!("_{tag}")) && !row[1].contains(&format!("_{other}"))), "{tag}: {history:?}");
+        jobs.push(history.into_iter().map(|row| row[0].clone()).collect::<std::collections::BTreeSet<_>>());
+    }
+    tidb_keyspace::set_multi_keyspace_mode(false);
+    assert!(!jobs[0].is_disjoint(&jobs[1]), "the keyspaces' job IDs do not collide: {jobs:?}");
+}
+
 /// Design §6.8 (phase 3e): two keyspaces of one node read only their own
 /// diagnostics from the process-wide owners. Both run the same statement:
 /// each sees only its own statement-summary rows (current, history,
