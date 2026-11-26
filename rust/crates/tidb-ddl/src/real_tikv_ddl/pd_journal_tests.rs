@@ -90,6 +90,7 @@ struct TenantPd {
     tenant: u32,
     held: Mutex<HashMap<ObjectKey, Arc<Gate>>>,
     delayed: Mutex<HashMap<ObjectKey, Arc<Gate>>>,
+    unreadable: Mutex<std::collections::BTreeSet<ObjectKey>>,
     lose_reply: AtomicBool,
 }
 
@@ -100,6 +101,7 @@ impl TenantPd {
             tenant,
             held: Mutex::default(),
             delayed: Mutex::default(),
+            unreadable: Mutex::default(),
             lose_reply: AtomicBool::new(false),
         }
     }
@@ -146,6 +148,10 @@ impl TenantPd {
 
 impl PdObjects for TenantPd {
     fn read(&self, keys: &[ObjectKey]) -> Result<BTreeMap<ObjectKey, PdValue>, String> {
+        let unreadable = self.unreadable.lock().unwrap();
+        if let Some(key) = keys.iter().find(|key| unreadable.contains(*key)) {
+            return Err(format!("PD cannot read {key}"));
+        }
         Ok(keys.iter().filter_map(|key| self.get(key).map(|value| (key.clone(), value))).collect())
     }
 
@@ -763,4 +769,28 @@ fn a_direct_attempt_is_named_by_its_prepare_timestamp() {
     let op_id = tenant.record(&key).unwrap().op_id;
     let start_ts = op_id.strip_prefix("gc/direct/").and_then(|ts| ts.parse::<u64>().ok());
     assert!(start_ts.is_some_and(|ts| before < ts && ts < after), "{op_id} is not a timestamp in ({before}, {after})");
+}
+
+/// Two independent resource groups that PD lost, one of which PD cannot
+/// read: the same pass restores the other and reports the unreadable one,
+/// which the next pass restores once PD reads it again.
+#[test]
+fn an_unreadable_object_does_not_hold_up_the_others_repair() {
+    let shared = Arc::new(SharedPd::default());
+    let tenant = Tenant::new(&shared, 1);
+    let (healthy, healthy_value) = group("rg_healthy", 1);
+    let (broken, broken_value) = group("rg_unreadable", 1);
+    run_step(&tenant, "owner-a", &[set(&healthy, &healthy_value)]);
+    run_step(&tenant, "owner-a", &[set(&broken, &broken_value)]);
+    tenant.pd.set(&healthy, None);
+    tenant.pd.set(&broken, None);
+    tenant.pd.unreadable.lock().unwrap().insert(broken.clone());
+    let report = tenant.reconcile("owner-b");
+    assert_eq!(report.repaired, [healthy.clone()], "{report:?}");
+    assert_eq!(report.failed.iter().map(|(key, _)| key).collect::<Vec<_>>(), [&broken], "{report:?}");
+    assert_eq!(tenant.pd.get(&healthy), Some(healthy_value));
+    assert_eq!(tenant.pd.get(&broken), None);
+    tenant.pd.unreadable.lock().unwrap().clear();
+    assert_eq!(tenant.reconcile("owner-b").repaired, [broken.clone()]);
+    assert_eq!(tenant.pd.get(&broken), Some(broken_value));
 }

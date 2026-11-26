@@ -34,7 +34,9 @@
 //! write by a paused old owner is repaired by the first pass that starts
 //! after it lands, so it stays in PD for at most the interval plus that
 //! pass's duration: one journal scan, one PD read per record (one request
-//! per bundle and group, one for all label rules), and for each differing
+//! per bundle and group, one for all label rules; when that read fails, one
+//! per object, and an object PD cannot be read for is retried by the next
+//! pass while the others are repaired), and for each differing
 //! object a re-read of its record, one PD write and one PD read back, each
 //! bounded by the PD client's timeout. A failed write or read back is retried
 //! by the next pass, so each failure adds an interval. A non-job intent
@@ -223,11 +225,35 @@ fn repair(store: &dyn MetaStore, pd: &dyn PdObjects, options: &Options, record: 
     }
 }
 
+/// What PD holds under `keys`, and the objects PD could not answer for: one
+/// read of them all, and when that fails, one read per object, so an object
+/// PD cannot read (or answers with something undecodable) leaves the
+/// others' repair to go on.
+fn read_each(pd: &dyn PdObjects, keys: &[ObjectKey]) -> (BTreeMap<ObjectKey, crate::PdValue>, Vec<(ObjectKey, String)>) {
+    let error = match pd.read(keys) {
+        Ok(held) => return (held, Vec::new()),
+        Err(error) => error,
+    };
+    if keys.len() == 1 {
+        return (BTreeMap::new(), vec![(keys[0].clone(), error)]);
+    }
+    let (mut held, mut failed) = (BTreeMap::new(), Vec::new());
+    for key in keys {
+        match pd.read(std::slice::from_ref(key)) {
+            Ok(one) => held.extend(one),
+            Err(error) => failed.push((key.clone(), format!("reading PD: {error}"))),
+        }
+    }
+    (held, failed)
+}
+
 /// One pass over the keyspace's journal; stops early once `still_owner`
-/// answers false.
+/// answers false. An object PD cannot be read for, or compared, is
+/// reported in [`Report::failed`] and retried by the next pass; the others
+/// are repaired.
 ///
 /// # Errors
-/// The journal or PD could not be read.
+/// The journal could not be read or its intents resolved.
 pub fn reconcile_once(
     store: &dyn MetaStore,
     pd: &dyn PdObjects,
@@ -239,12 +265,21 @@ pub fn reconcile_once(
     let Journal { records, intents, .. } = read_journal(store)?;
     let open = intents.into_iter().map(|intent| intent.key).collect::<BTreeSet<_>>();
     let keys = records.keys().filter(|key| !open.contains(*key)).cloned().collect::<Vec<_>>();
-    let held = pd.read(&keys)?;
-    for key in &keys {
+    let (held, unread) = read_each(pd, &keys);
+    let unreadable = unread.iter().map(|(key, _)| key.clone()).collect::<BTreeSet<_>>();
+    report.failed.extend(unread);
+    for key in keys.iter().filter(|key| !unreadable.contains(*key)) {
         let record = &records[key];
-        if in_sync(key, record.value.as_ref(), held.get(key), options.keyspace_id)? {
-            report.in_sync += 1;
-            continue;
+        match in_sync(key, record.value.as_ref(), held.get(key), options.keyspace_id) {
+            Ok(true) => {
+                report.in_sync += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                report.failed.push((key.clone(), format!("comparing with PD: {error}")));
+                continue;
+            }
         }
         if !still_owner() {
             return Ok(report);

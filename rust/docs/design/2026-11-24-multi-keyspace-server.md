@@ -937,7 +937,10 @@ rule client. A tenant's PD effects then go through its own clients:
   same object replaces it. A late write stays in PD for at most the interval
   plus one pass (a journal scan, one PD read per record, and per differing
   object a re-read, a write and a read back, each bounded by the PD
-  client's timeout); a failed repair adds an interval per retry. Within the
+  client's timeout); a failed repair adds an interval per retry. An
+  object PD cannot be read for (or whose value does not decode) fails
+  alone: the pass falls back to one read per object, repairs the others
+  and reports it, and the next pass retries it. Within the
   affected tenant PD can be stale for that long; other tenants' objects are
   never read or written.
 
