@@ -21,8 +21,6 @@
 //! An attempt that an abort resolved (its own, or the owner's reconciler's)
 //! is refused too, and never reports success.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use tidb_meta::MetaStore;
 
 use crate::journal::{self, Attempt, Planned, Refusal, TxnRead};
@@ -30,10 +28,12 @@ use crate::pd::PdObjects;
 use crate::record::wall_ms;
 use crate::JournalError;
 
-/// A fresh op ID for a non-job write by `owner`.
-fn next_op_id(owner: &str, at_ms: u64) -> String {
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    format!("{owner}/direct/{at_ms}/{}", SEQUENCE.fetch_add(1, Ordering::Relaxed))
+/// The op ID of a non-job write by `owner` whose prepare transaction
+/// started at `start_ts`: PD's TSO makes it unique among every process's
+/// attempts, as a DDL step's start timestamp is (an owner name such as GC's
+/// is not unique across processes).
+fn op_id(owner: &str, start_ts: u64) -> String {
+    format!("{owner}/direct/{start_ts}")
 }
 
 /// Makes PD hold `planned` through the journal, as `owner` (the node) of the
@@ -59,7 +59,7 @@ pub fn write_through(
     let mut refused = None;
     journal::run(store, &mut |txn| {
         let at_ms = wall_ms();
-        let attempt = Attempt { op_id: next_op_id(owner, at_ms), owner: owner.to_owned(), job_id: 0, scope };
+        let attempt = Attempt { op_id: op_id(owner, txn.start_ts()), owner: owner.to_owned(), job_id: 0, scope };
         // No catalog baseline here: GC's bundles are of dropped tables, which
         // the catalog no longer holds.
         let plan = journal::plan(&mut TxnRead(&mut *txn), &attempt, planned, &mut |_| Ok(Default::default()), at_ms);

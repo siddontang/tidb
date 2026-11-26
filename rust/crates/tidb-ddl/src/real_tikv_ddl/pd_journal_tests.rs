@@ -747,3 +747,20 @@ fn an_alter_range_the_owner_aborted_never_reports_success() {
         }
     }
 }
+
+/// Two non-job writers with the same owner name (GC's is the literal `gc`
+/// on every node) get distinct op IDs: each is its prepare transaction's
+/// start timestamp.
+#[test]
+fn a_direct_attempt_is_named_by_its_prepare_timestamp() {
+    let shared = Arc::new(SharedPd::default());
+    let tenant = Tenant::new(&shared, 1);
+    tenant.cutover();
+    let (key, value) = range_bundle(1, tidb_placement::KEY_RANGE_GLOBAL, 1);
+    let before = tenant.opener.begin().unwrap().start_ts();
+    tidb_ddl_pdjournal::direct::write_through(tenant.store.as_ref(), tenant.pd.as_ref(), "gc", tenant.scope, &[set(&key, &value)]).unwrap();
+    let after = tenant.opener.begin().unwrap().start_ts();
+    let op_id = tenant.record(&key).unwrap().op_id;
+    let start_ts = op_id.strip_prefix("gc/direct/").and_then(|ts| ts.parse::<u64>().ok());
+    assert!(start_ts.is_some_and(|ts| before < ts && ts < after), "{op_id} is not a timestamp in ({before}, {after})");
+}
