@@ -136,6 +136,7 @@ pub fn cluster_session_stack(
     // default` among them -- write PD's resource manager through it, in the
     // keyspace of the store's PD client.
     info_syncer.init_resource_manager_client(Some(Arc::new(PdResourceManagerClient {
+        pd: tikv_store.store().pd_client(),
         store: tikv_store.clone(),
     })));
     let _info_syncer = tidb_domain_infosync::info_syncer::enter(Arc::clone(&info_syncer));
@@ -1334,14 +1335,10 @@ impl tidb_variable::vars::PdRegionPolicy for ProcessPdRegionPolicy {
 /// PD's `ResourceManagerClient` through the store's PD client, for the
 /// keyspace the store serves.
 struct PdResourceManagerClient {
-    store: tidb_txnkv::driver::tikv_store::TikvStore,
-}
-
-impl PdResourceManagerClient {
     /// The store's PD client, whose requests name the store's keyspace.
-    fn pd_client(&self) -> Arc<tikv_client::PdRpcClient> {
-        self.store.store().pd_client()
-    }
+    pd: Arc<tikv_client::PdRpcClient>,
+    /// The store whose runtime drives the requests.
+    store: tidb_txnkv::driver::tikv_store::TikvStore,
 }
 
 impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for PdResourceManagerClient {
@@ -1349,7 +1346,7 @@ impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for Pd
         &self,
         group: tidb_proto::resource_manager::ResourceGroup,
     ) -> Result<String, String> {
-        let pd = self.pd_client();
+        let pd = Arc::clone(&self.pd);
         self.store
             .block_on(async move { pd.add_resource_group(group).await })
             .map_err(|error| error.to_string())
@@ -1359,14 +1356,14 @@ impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for Pd
         &self,
         group: tidb_proto::resource_manager::ResourceGroup,
     ) -> Result<String, String> {
-        let pd = self.pd_client();
+        let pd = Arc::clone(&self.pd);
         self.store
             .block_on(async move { pd.modify_resource_group(group).await })
             .map_err(|error| error.to_string())
     }
 
     fn delete_resource_group(&self, name: &str) -> Result<String, String> {
-        let pd = self.pd_client();
+        let pd = Arc::clone(&self.pd);
         let name = name.to_owned();
         self.store
             .block_on(async move { pd.delete_resource_group(&name).await })
@@ -1377,7 +1374,7 @@ impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for Pd
         &self,
         name: &str,
     ) -> Result<Option<tidb_proto::resource_manager::ResourceGroup>, String> {
-        let pd = self.pd_client();
+        let pd = Arc::clone(&self.pd);
         let name = name.to_owned();
         match self.store.block_on(async move { pd.get_resource_group(&name, false).await }) {
             Ok(group) => Ok(group),
