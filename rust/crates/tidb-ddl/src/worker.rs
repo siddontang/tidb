@@ -1748,7 +1748,17 @@ where
             .owner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&owner));
-        owner.set_listener(tidb_ddl_pdjournal::owner::with_scheduler(Arc::new(tidb_store_driver_txn::meta_txn::MetaStore::new(Arc::clone(&opener), timeout)), { let pool = Arc::clone(&scheduler.session_pool); Arc::new(move || pool.info_syncer()) }, &owner, scheduler.clone()));
+        // The PD journal cutover checks a label rule's ranges against the
+        // catalog's table IDs, read from a fresh snapshot.
+        let catalog: tidb_ddl_pdjournal::owner::CatalogIds = {
+            let opener = Arc::clone(&opener);
+            Arc::new(move |db: &str, table: &str, partition: &str| {
+                let mut txn = opener.begin().map_err(|error| error.to_string())?;
+                let mut snapshot = tidb_infoschema_issyncer::real_tikv_catalog::TransactionMetaSnapshot::new(&mut txn, timeout);
+                crate::real_tikv_ddl::pd_baseline::rule_table_ids(&mut snapshot, db, table, partition)
+            })
+        };
+        owner.set_listener(tidb_ddl_pdjournal::owner::with_scheduler(Arc::new(tidb_store_driver_txn::meta_txn::MetaStore::new(Arc::clone(&opener), timeout)), { let pool = Arc::clone(&scheduler.session_pool); Arc::new(move || pool.info_syncer()) }, catalog, &owner, scheduler.clone()));
         crate::real_tikv_ddl::add_index_reorg::dist::register_backfill_task(Arc::new(
             crate::real_tikv_ddl::add_index_reorg::dist::BackfillDdl {
                 opener:opener.clone(),timeout,etcd:notifier.clone(),

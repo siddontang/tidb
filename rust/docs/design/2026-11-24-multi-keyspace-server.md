@@ -956,18 +956,38 @@ rule client. A tenant's PD effects then go through its own clients:
   mutation: a keyspace bootstrapped with the journal records its cutover at
   bootstrap; an older keyspace needs the operator's cutover, which seeds a
   record of each such object from PD at DDL owner takeover (only TiDB's
-  own: key-range rules whose ID is a table's or partition's,
-  `[keyspace/<id>/]schema/<db>/<table>[/<partition>]` for the keyspace's
-  codec, and the range bundles under their own group IDs; an operator's
-  rule, even under the keyspace's prefix, gets no record and is never
-  reverted), once
+  own, and the range bundles under their own group IDs), once
   `TIDB_PD_JOURNAL_CUTOVER` (`*` or keyspace IDs) says the writers that
   bypass the journal (nodes of an older build) are drained; no writer of
   this build touches such an object before. Until then such a mutation
   fails before PD with an error naming the cutover: a DDL step fails and
   its job is cancelled (Go cancels a job whose PD call failed), ALTER RANGE
-  and GC's delete return the error. Residual: a
-  repair racing a non-job writer on another node can revert that writer's
+  and GC's delete return the error.
+
+  Which label rules the cutover adopts: `Rule::reset` keeps a rule's
+  database, table, partition and keyspace in its labels, so a rule is
+  TiDB's only when `new_rule_id` rebuilt from those labels for the
+  keyspace's codec is its exact ID, its keyspace label is the tenant's, and
+  its key ranges are exactly the catalog's physical ranges of that table
+  or partition (table and partitions for a table rule), read from the
+  catalog at the cutover; names with `/` are fine, the labels carry them
+  whole. A rule outside TiDB's IDs (`[keyspace/<id>/]schema/...`) is the
+  operator's or PD's: no record, never written or reverted. A rule under
+  TiDB's IDs that fails any check (missing or mismatched labels, another
+  range, a table the catalog does not hold, a catalog that cannot be read)
+  is held back: logged with the reason, returned in the cutover report and
+  recorded durably in the journal (`PDJrnl/H/...`), and every write of it
+  -- a job step, ALTER RANGE, GC -- fails before PD with an error naming
+  it, across restarts and owner changes, so an abort can never take it for
+  absent and delete it. The operator resolves it by inspecting the rule in
+  PD and either deleting it (`pd-ctl region-label delete <id>`; re-apply
+  the table's attributes by DDL afterwards if they were TiDB's) or making
+  it the table's own (its labels and ranges), then restarting the DDL
+  owner with `TIDB_PD_JOURNAL_CUTOVER` naming the keyspace again: that run
+  re-checks every held-back object, adopts one that is now TiDB's, records
+  a tombstone for one PD no longer holds, and keeps the rest held back.
+
+  Residual: a repair racing a non-job writer on another node can revert that writer's
   just-written value until the next pass; BR's restore writes label rules
   without the journal, so where a record already holds a restored rule's ID
   (a tombstone of a dropped table of that name) the reconciler puts the

@@ -22,8 +22,10 @@ use tidb_meta::MetaStore;
 
 use crate::live::LiveHold;
 use crate::pd::PdObjects;
-use crate::record::{cutover_key, intent_key, intents_prefix, record_key, wall_ms, records_prefix};
-use crate::{Cutover, Intent, ObjectKey, PdValue, Record};
+use crate::record::{
+    cutover_key, held_back_key, held_back_prefix, intent_key, intents_prefix, record_key, records_prefix, wall_ms,
+};
+use crate::{Cutover, HeldBack, Intent, ObjectKey, PdValue, Record};
 
 /// Raw key/value pairs, in key order.
 pub type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
@@ -77,6 +79,10 @@ pub enum JournalError {
     /// A PD-only object has no record and the keyspace had no cutover, so
     /// nothing says what an abort would put back.
     NoBaseline(ObjectKey),
+    /// The operator's cutover held the object back ([`HeldBack`]): PD may
+    /// hold a rule of TiDB's shape that is not known to be TiDB's, so no
+    /// value is known to put back.
+    HeldBack(ObjectKey, String),
     /// The journal could not be read or written.
     Storage(String),
 }
@@ -89,6 +95,12 @@ impl std::fmt::Display for JournalError {
                 "{key} has no PD journal baseline in this keyspace: run the PD journal cutover \
                  (start the DDL owner with TIDB_PD_JOURNAL_CUTOVER naming the keyspace ID) \
                  after draining the nodes that write PD without the journal"
+            ),
+            Self::HeldBack(key, reason) => write!(
+                formatter,
+                "{key} was held back at the PD journal cutover ({reason}), so TiDB does not write it: \
+                 inspect it in PD and delete it or make it the table's own rule, then start the DDL \
+                 owner with TIDB_PD_JOURNAL_CUTOVER naming the keyspace ID again to resolve it"
             ),
             Self::Storage(detail) => write!(formatter, "PD journal: {detail}"),
         }
@@ -286,22 +298,47 @@ fn dedup(planned: &[Planned]) -> Vec<Planned> {
     order.into_iter().map(|key| last.remove(&key).expect("recorded")).collect()
 }
 
-/// The first PD-only object among `planned` that has no record before the
-/// keyspace's cutover: the object [`plan`] refuses.
+/// What the cutover held back of `key`, `None` for an object it did not.
+///
+/// # Errors
+/// As [`read_record`].
+pub fn read_held_back(reader: &mut dyn JournalRead, key: &ObjectKey) -> Result<Option<HeldBack>, String> {
+    reader.get(&held_back_key(key))?.as_deref().map(decode).transpose()
+}
+
+/// Every object the cutover held back and the operator has not resolved.
+///
+/// # Errors
+/// As [`read_record`].
+pub fn scan_held_back(reader: &mut dyn JournalRead) -> Result<Vec<HeldBack>, String> {
+    reader
+        .scan_prefix(&held_back_prefix())?
+        .into_iter()
+        .map(|(_, value)| decode(&value))
+        .collect()
+}
+
+/// Why [`plan`] refuses `planned` before any PD write: the first PD-only
+/// object without a record that the cutover held back
+/// ([`JournalError::HeldBack`]), or that has no baseline because the
+/// keyspace had no cutover yet ([`JournalError::NoBaseline`]).
 ///
 /// # Errors
 /// A failed read.
-pub fn missing_baseline(reader: &mut dyn JournalRead, planned: &[Planned]) -> Result<Option<ObjectKey>, String> {
+pub fn missing_baseline(reader: &mut dyn JournalRead, planned: &[Planned]) -> Result<Option<JournalError>, String> {
     let mut cutover = None;
     for entry in planned {
         if entry.key.catalog_reconstructible() || read_record(reader, &entry.key)?.is_some() {
             continue;
         }
+        if let Some(held) = read_held_back(reader, &entry.key)? {
+            return Ok(Some(JournalError::HeldBack(held.key, held.reason)));
+        }
         if cutover.is_none() {
             cutover = Some(read_cutover(reader)?.is_some());
         }
         if cutover == Some(false) {
-            return Ok(Some(entry.key.clone()));
+            return Ok(Some(JournalError::NoBaseline(entry.key.clone())));
         }
     }
     Ok(None)
@@ -316,7 +353,8 @@ pub fn missing_baseline(reader: &mut dyn JournalRead, planned: &[Planned]) -> Re
 ///
 /// # Errors
 /// [`JournalError::NoBaseline`] for a PD-only object without a record before
-/// the cutover (nothing is written), or a failed read.
+/// the cutover, [`JournalError::HeldBack`] for one the cutover held back
+/// (nothing is written in either case), or a failed read.
 pub fn plan(
     reader: &mut dyn JournalRead,
     attempt: &Attempt,
@@ -325,8 +363,8 @@ pub fn plan(
     now_ms: u64,
 ) -> Result<Prepared, JournalError> {
     let planned = dedup(planned);
-    if let Some(key) = missing_baseline(reader, &planned).map_err(JournalError::Storage)? {
-        return Err(JournalError::NoBaseline(key));
+    if let Some(refusal) = missing_baseline(reader, &planned).map_err(JournalError::Storage)? {
+        return Err(refusal);
     }
     let mut records = Vec::with_capacity(planned.len());
     let mut from_catalog = Vec::new();
@@ -547,6 +585,20 @@ impl Prepared {
 /// # Errors
 /// The transaction failed.
 pub fn seed_cutover(store: &dyn MetaStore, objects: &BTreeMap<ObjectKey, PdValue>) -> Result<Option<usize>, String> {
+    seed_cutover_holding_back(store, objects, &BTreeMap::new())
+}
+
+/// [`seed_cutover`], which also records each of `held_back` (an object
+/// without a record, with why it is not adopted) durably, so every write of
+/// it is refused before PD until [`resolve_held_back`] resolves it.
+///
+/// # Errors
+/// The transaction failed.
+pub fn seed_cutover_holding_back(
+    store: &dyn MetaStore,
+    objects: &BTreeMap<ObjectKey, PdValue>,
+    held_back: &BTreeMap<ObjectKey, String>,
+) -> Result<Option<usize>, String> {
     let mut seeded = None;
     run(store, &mut |txn| {
         seeded = None;
@@ -571,12 +623,51 @@ pub fn seed_cutover(store: &dyn MetaStore, objects: &BTreeMap<ObjectKey, PdValue
             )?;
             count += 1;
         }
-        txn.set(cutover_key(), encode(&Cutover { at_ms, source: format!("operator, {count} objects seeded") }))
-            .map_err(|error| error.to_string())?;
+        let mut held = 0;
+        for (key, reason) in held_back {
+            if objects.contains_key(key) || read_record(&mut TxnRead(&mut *txn), key)?.is_some() {
+                continue;
+            }
+            let entry = HeldBack { key: key.clone(), reason: reason.clone(), at_ms };
+            txn.set(held_back_key(key), encode(&entry)).map_err(|error| error.to_string())?;
+            held += 1;
+        }
+        let source = format!("operator, {count} objects seeded, {held} held back");
+        txn.set(cutover_key(), encode(&Cutover { at_ms, source })).map_err(|error| error.to_string())?;
         seeded = Some(count);
         Ok(())
     })?;
     Ok(seeded)
+}
+
+/// The operator's resolution of objects the cutover held back: each of
+/// `resolved` that is still held back and has no record gets a record of
+/// what PD holds now (a tombstone for `None`, an object PD no longer holds)
+/// and is no longer held back, in one transaction. The caller read PD after
+/// the operator fixed the objects there. Answers how many it resolved.
+///
+/// # Errors
+/// The transaction failed.
+pub fn resolve_held_back(store: &dyn MetaStore, resolved: &BTreeMap<ObjectKey, Option<PdValue>>) -> Result<usize, String> {
+    let mut count = 0;
+    run(store, &mut |txn| {
+        count = 0;
+        let at_ms = wall_ms();
+        for (key, value) in resolved {
+            let mut reader = TxnRead(&mut *txn);
+            if read_held_back(&mut reader, key)?.is_none() || read_record(&mut reader, key)?.is_some() {
+                continue;
+            }
+            put_record(
+                txn,
+                &Record { key: key.clone(), generation: 1, op_id: "operator".to_owned(), value: value.clone(), at_ms },
+            )?;
+            txn.delete(&held_back_key(key)).map_err(|error| error.to_string())?;
+            count += 1;
+        }
+        Ok(())
+    })?;
+    Ok(count)
 }
 
 /// The cutover a keyspace bootstrapped with the journal records at

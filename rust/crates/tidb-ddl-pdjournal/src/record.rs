@@ -154,11 +154,26 @@ pub struct Cutover {
     pub source: String,
 }
 
+/// A PD-only object the operator's cutover held back: PD held it under an ID
+/// of TiDB's shape, but its labels or range are not TiDB's for that table
+/// or partition, so it is neither TiDB's baseline nor known to be absent.
+/// Every write of it is refused until the operator resolves it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HeldBack {
+    /// The object.
+    pub key: ObjectKey,
+    /// Why the cutover did not adopt it.
+    pub reason: String,
+    /// When the cutover held it back (wall-clock milliseconds).
+    pub at_ms: u64,
+}
+
 /// The string meta keys' first 8-byte group: every name under one of them
 /// shares the encoded group, so a raw prefix scan finds them all.
 const RECORDS: &[u8; 8] = b"PDJrnl/A";
 const INTENTS: &[u8; 8] = b"PDJrnl/I";
 const CUTOVER: &[u8; 8] = b"PDJrnl/C";
+const HELD_BACK: &[u8; 8] = b"PDJrnl/H";
 
 fn meta_key(name: &[u8]) -> Vec<u8> {
     tidb_structure::encode_string_data_key(tidb_tablecodec::table_key::META_PREFIX, name)
@@ -186,6 +201,14 @@ pub(crate) fn record_key(key: &ObjectKey) -> Vec<u8> {
 
 pub(crate) fn intent_key(key: &ObjectKey, op_id: &str) -> Vec<u8> {
     meta_key(&object_name(INTENTS, key, &format!("\0{op_id}")))
+}
+
+pub(crate) fn held_back_key(key: &ObjectKey) -> Vec<u8> {
+    meta_key(&object_name(HELD_BACK, key, ""))
+}
+
+pub(crate) fn held_back_prefix() -> Vec<u8> {
+    scan_prefix(HELD_BACK)
 }
 
 pub(crate) fn cutover_key() -> Vec<u8> {
@@ -224,6 +247,8 @@ mod tests {
             assert!(record_key(key).starts_with(&records_prefix()), "{key}");
             assert!(intent_key(key, "op").starts_with(&intents_prefix()), "{key}");
             assert!(!record_key(key).starts_with(&intents_prefix()));
+            assert!(held_back_key(key).starts_with(&held_back_prefix()), "{key}");
+            assert!(!held_back_key(key).starts_with(&records_prefix()));
         }
         assert!(!cutover_key().starts_with(&records_prefix()));
     }

@@ -61,7 +61,9 @@
 //! [`Cutover`] at bootstrap, and an older keyspace needs the operator's
 //! cutover ([`journal::seed_cutover`]), run once its old writers are
 //! drained. Until then such a mutation fails before it reaches PD
-//! ([`JournalError::NoBaseline`]).
+//! ([`JournalError::NoBaseline`]). An object the cutover could not tell to
+//! be TiDB's is held back ([`HeldBack`]): its writes fail before PD
+//! ([`JournalError::HeldBack`]) until the operator resolves it.
 
 mod live;
 mod record;
@@ -74,4 +76,4 @@ pub mod pd;
 pub mod reconcile;
 
 pub use journal::{JournalError, JournalRead, Planned, Prepared, TxnRead};
-pub use record::{Cutover, Intent, ObjectKey, ObjectKind, PdValue, Record};
+pub use record::{Cutover, HeldBack, Intent, ObjectKey, ObjectKind, PdValue, Record};

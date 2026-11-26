@@ -830,13 +830,42 @@ fn an_unreadable_object_does_not_hold_up_the_others_repair() {
     assert_eq!(tenant.pd.get(&broken), Some(broken_value));
 }
 
-/// At the operator's cutover PD holds a TiDB table rule and the keyspace's
-/// global range bundle beside an operator's own rule under the keyspace's
-/// prefix (and one shaped like half a TiDB ID) and an operator's bundle:
-/// only TiDB's rule and range bundle get a record, and editing the
-/// operator's objects is never reverted, while a change of TiDB's rule is.
+/// `tenant`'s TiDB rule of table `table` of `db` over the physical `ids`,
+/// as `Rule::reset` builds it.
+fn table_rule(tenant: u32, table: &str, merge: &str, ids: &[i64]) -> tidb_ddl_label::Rule {
+    let codec = tidb_domain_infosync::info_syncer::store_codec(tenant).unwrap();
+    let mut rule = tidb_ddl_label::Rule::new();
+    rule.apply_attributes_spec(&tidb_ast::AttributesSpec { attributes: Some(format!("merge_option={merge}")) })
+        .unwrap();
+    rule.reset(&codec, "db", table, "", ids);
+    rule
+}
+
+/// A catalog of database `db` whose tables are `tables` (name, physical
+/// IDs), for the cutover's check of a rule's ranges.
+fn catalog_of(tables: &[(&str, i64)]) -> tidb_ddl_pdjournal::owner::CatalogIds {
+    let tables = tables.iter().map(|(name, id)| ((*name).to_owned(), *id)).collect::<HashMap<_, _>>();
+    Arc::new(move |db: &str, table: &str, partition: &str| {
+        Ok((db == "db" && partition.is_empty()).then(|| tables.get(table).map(|id| vec![*id])).flatten())
+    })
+}
+
+/// The keyspace's rule ID prefix outside TiDB's (`keyspace/1/` where rules
+/// are keyspace aware, else empty).
+fn keyspace_prefix(syncer: &tidb_domain_infosync::info_syncer::InfoSyncer) -> String {
+    tidb_ddl_label::new_rule_id(syncer.label_codec(), "", "", "").trim_end_matches("schema//").to_owned()
+}
+
+/// At the operator's cutover PD holds TiDB's rules of `t` and of `t/x/y`
+/// (a name with slashes: the labels carry it whole) and the global range
+/// bundle, beside an operator's rule outside TiDB's IDs, an operator rule
+/// under a TiDB-shaped ID without TiDB's labels, a rule with TiDB's labels
+/// over another table's range, and an operator bundle. Only TiDB's three
+/// objects get a record; the two ambiguous rules are held back and
+/// reported; editing the operator's rule is never reverted, while a change
+/// of TiDB's rule is.
 #[test]
-fn the_cutover_adopts_only_tidbs_own_rules_and_range_bundles() {
+fn the_cutover_adopts_only_tidbs_own_rules_and_holds_back_the_ambiguous() {
     use tidb_ddl_pdjournal::owner::seed_from_pd;
     use tidb_ddl_pdjournal::pd::InfoSyncerPd;
 
@@ -844,47 +873,129 @@ fn the_cutover_adopts_only_tidbs_own_rules_and_range_bundles() {
     let tenant = Tenant::new(&shared, 1);
     let syncer = Arc::new(tidb_domain_infosync::info_syncer::InfoSyncer::new(1));
     let pd = InfoSyncerPd(Arc::clone(&syncer));
-    let (tidb_key, tidb_value) = label(1, "t", "deny");
+    let prefix = keyspace_prefix(&syncer);
+    let catalog = catalog_of(&[("t", 100), ("t/x/y", 101), ("t_range", 102)]);
+    let rule_entry = |rule: &tidb_ddl_label::Rule| (ObjectKey::label_rule(&rule.id), label_rule_value(rule));
+    let tidb = [rule_entry(&table_rule(1, "t", "deny", &[100])), rule_entry(&table_rule(1, "t/x/y", "deny", &[101]))];
     let (range_key, range_value) = range_bundle(1, tidb_placement::KEY_RANGE_GLOBAL, 1);
-    // The keyspace's rule prefix (`keyspace/1/` where rules are keyspace
-    // aware, else empty).
-    let prefix = tidb_ddl_label::new_rule_id(syncer.label_codec(), "", "", "").trim_end_matches("schema//").to_owned();
-    let operator_rule = |id: &str, merge: &str| {
-        let (_, mut value) = label(1, "t_operator", merge);
-        value["id"] = PdValue::String(id.to_owned());
-        (ObjectKey::label_rule(id), value)
-    };
-    let operators = [
-        operator_rule(&format!("{prefix}operator/hot"), "deny"),
-        operator_rule(&format!("{prefix}schema/only_db"), "deny"),
-    ];
+    let mut foreign = table_rule(1, "t_operator", "deny", &[200]);
+    foreign.id = format!("{prefix}operator/hot");
+    // A TiDB-shaped ID whose rule carries only the operator's label.
+    let mut unlabeled = rule_entry(&table_rule(1, "t_op", "deny", &[103]));
+    let only_merge = unlabeled.1["labels"].as_array().unwrap().iter().filter(|label| label["key"] == "merge_option").cloned().collect();
+    unlabeled.1["labels"] = PdValue::Array(only_merge);
+    let wrong_range = table_rule(1, "t_range", "deny", &[999]);
+    let ambiguous = [unlabeled, rule_entry(&wrong_range)];
+    let foreign = rule_entry(&foreign);
     let mut operator_bundle = range_value.clone();
     operator_bundle["group_id"] = PdValue::String("operator_group".to_owned());
     let operator_bundle_key = ObjectKey::placement_bundle("operator_group");
-    for (key, value) in [(&tidb_key, &tidb_value), (&range_key, &range_value), (&operator_bundle_key, &operator_bundle)]
-        .into_iter()
-        .chain(operators.iter().map(|(key, value)| (key, value)))
-    {
+    let everything = tidb
+        .iter()
+        .chain(&ambiguous)
+        .chain([&foreign])
+        .cloned()
+        .chain([(range_key.clone(), range_value), (operator_bundle_key.clone(), operator_bundle)])
+        .collect::<Vec<_>>();
+    for (key, value) in &everything {
         pd.write(key, Some(value)).unwrap();
     }
-    let everything = [&tidb_key, &range_key, &operator_bundle_key, &operators[0].0, &operators[1].0].map(Clone::clone);
-    assert_eq!(pd.read(&everything).unwrap().len(), everything.len(), "PD holds every object");
+    let keys = everything.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+    assert_eq!(pd.read(&keys).unwrap().len(), keys.len(), "PD holds every object");
 
-    assert_eq!(seed_from_pd(tenant.store.as_ref(), &syncer).unwrap(), Some(2));
-    assert!(tenant.record(&tidb_key).is_some() && tenant.record(&range_key).is_some());
-    for key in [&operator_bundle_key, &operators[0].0, &operators[1].0] {
-        assert_eq!(tenant.record(key), None, "{key} is the operator's");
+    let report = seed_from_pd(tenant.store.as_ref(), &syncer, &catalog).unwrap();
+    assert!(report.first);
+    assert_eq!(report.seeded, 3, "{report:?}");
+    let held = report.held_back.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+    assert_eq!(held, ambiguous.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>(), "{report:?}");
+    for (key, _) in &tidb {
+        assert!(tenant.record(key).is_some(), "{key} is TiDB's");
     }
+    assert!(tenant.record(&range_key).is_some());
+    for key in [&operator_bundle_key, &foreign.0, &ambiguous[0].0, &ambiguous[1].0] {
+        assert_eq!(tenant.record(key), None, "{key} is not adopted");
+    }
+    let mut journaled = Vec::new();
+    tenant
+        .store
+        .run_in_new_txn(&tidb_gocontext::Context::background(), "test", false, &mut |txn| {
+            journaled = journal::scan_held_back(&mut TxnRead(txn)).unwrap();
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(journaled.into_iter().map(|held| held.key).collect::<Vec<_>>(), held, "held back durably");
 
-    let (_, edited) = operator_rule(&operators[0].0.id, "allow");
-    pd.write(&operators[0].0, Some(&edited)).unwrap();
-    let (_, changed) = label(1, "t", "allow");
-    pd.write(&tidb_key, Some(&changed)).unwrap();
+    let mut edited = foreign.1.clone();
+    edited["labels"] = PdValue::Array(Vec::new());
+    pd.write(&foreign.0, Some(&edited)).unwrap();
+    let (_, changed) = rule_entry(&table_rule(1, "t", "allow", &[100]));
+    pd.write(&tidb[0].0, Some(&changed)).unwrap();
     let report = reconcile_once(tenant.store.as_ref(), &pd, &tenant.options("owner-b"), &|| true).unwrap();
-    assert_eq!(report.repaired, [tidb_key.clone()], "{report:?}");
-    let held = pd.read(&everything).unwrap();
-    assert!(tidb_ddl_pdjournal::normalize::in_sync(&operators[0].0, Some(&edited), held.get(&operators[0].0), Some(1)).unwrap());
-    assert!(tidb_ddl_pdjournal::normalize::in_sync(&tidb_key, Some(&tidb_value), held.get(&tidb_key), Some(1)).unwrap());
+    assert_eq!(report.repaired, [tidb[0].0.clone()], "{report:?}");
+    let held = pd.read(&keys).unwrap();
+    assert!(tidb_ddl_pdjournal::normalize::in_sync(&foreign.0, Some(&edited), held.get(&foreign.0), Some(1)).unwrap());
+    assert!(tidb_ddl_pdjournal::normalize::in_sync(&tidb[0].0, Some(&tidb[0].1), held.get(&tidb[0].0), Some(1)).unwrap());
+}
+
+/// A rule the cutover held back (TiDB's labels for `t`, another table's
+/// range): after the journal's store is reopened by another DDL owner, a
+/// job step that changes or drops `t`'s attributes, and ALTER-RANGE-style
+/// direct writes, are refused before PD, and PD keeps the rule. Once the
+/// operator removes the rule from PD and runs the cutover again, it is
+/// resolved as absent and the step goes through.
+#[test]
+fn a_rule_held_back_at_the_cutover_refuses_writes_after_a_restart() {
+    use tidb_ddl_pdjournal::owner::seed_from_pd;
+    use tidb_ddl_pdjournal::pd::InfoSyncerPd;
+
+    let shared = Arc::new(SharedPd::default());
+    let tenant = Tenant::new(&shared, 1);
+    let syncer = Arc::new(tidb_domain_infosync::info_syncer::InfoSyncer::new(1));
+    let pd = InfoSyncerPd(Arc::clone(&syncer));
+    let catalog = catalog_of(&[("t", 100)]);
+    let stale = table_rule(1, "t", "deny", &[999]);
+    let key = ObjectKey::label_rule(&stale.id);
+    let stale = label_rule_value(&stale);
+    pd.write(&key, Some(&stale)).unwrap();
+    let report = seed_from_pd(tenant.store.as_ref(), &syncer, &catalog).unwrap();
+    assert_eq!(report.held_back.len(), 1, "{report:?}");
+
+    // Another owner, over a store opened afresh.
+    let store: Arc<dyn tidb_meta::MetaStore> =
+        Arc::new(tidb_store_driver_txn::meta_txn::MetaStore::new(Arc::clone(&tenant.opener), TIMEOUT));
+    let step = |value: Option<PdValue>| {
+        let mut delivery = ExternalDelivery::default();
+        let txn_reader = &mut tenant.opener.begin().unwrap();
+        let start_ts = txn_reader.start_ts();
+        delivery
+            .prepare(
+                StepJournal {
+                    store: Arc::clone(&store),
+                    attempt: Attempt { op_id: format!("owner-c/2/{start_ts}"), owner: "owner-c".to_owned(), job_id: 2, scope: elsewhere(&tenant) },
+                },
+                &mut SnapshotRead(&mut TransactionMetaSnapshot::new(txn_reader, TIMEOUT)),
+                &[Planned::new(key.clone(), value)],
+                &mut |_| Ok(BTreeMap::new()),
+                start_ts >> 18,
+            )
+            .map(|_| delivery)
+    };
+    let (_, changed) = label(1, "t", "allow");
+    for value in [Some(changed.clone()), None] {
+        let refused = step(value).err().expect("a held-back rule is refused");
+        assert!(refused.contains("held back at the PD journal cutover"), "{refused}");
+    }
+    let direct = tidb_ddl_pdjournal::direct::write_through(store.as_ref(), &pd, "gc", elsewhere(&tenant), &[Planned::new(key.clone(), None)]);
+    assert!(matches!(direct, Err(tidb_ddl_pdjournal::JournalError::HeldBack(..))), "{direct:?}");
+    assert_eq!(pd.read(std::slice::from_ref(&key)).unwrap().get(&key), Some(&stale), "PD keeps the rule");
+    assert_eq!(tenant.intents(), 0);
+
+    // The operator deletes the rule from PD and runs the cutover again.
+    pd.write(&key, None).unwrap();
+    let report = seed_from_pd(store.as_ref(), &syncer, &catalog).unwrap();
+    assert_eq!((report.first, report.seeded, report.held_back.len()), (false, 1, 0), "{report:?}");
+    assert_eq!(tenant.record(&key).unwrap().value, None);
+    drop(step(Some(changed)).expect("a resolved rule is written"));
 }
 
 /// A pass finds a record PD differs from, and a writer of this process
@@ -972,4 +1083,21 @@ fn a_partly_aborted_two_object_delete_is_resolved_whole() {
         assert_eq!(record.value.as_ref(), Some(value), "{key}");
         assert_eq!(tenant.pd.get(key).as_ref(), Some(value), "{key}");
     }
+}
+
+/// The production catalog lookup of the cutover reads a table's physical
+/// IDs by its lower-case names from a bootstrapped catalog, and answers
+/// `None` for a table or partition it does not hold.
+#[test]
+fn the_cutover_reads_a_rules_table_ids_from_the_catalog() {
+    let shared = Arc::new(SharedPd::default());
+    let tenant = Tenant::new(&shared, 1);
+    tidb_session::bootstrap_publish::publish_bootstrap(&tenant.opener, TIMEOUT).unwrap();
+    let mut txn = tenant.opener.begin().unwrap();
+    let mut snapshot = TransactionMetaSnapshot::new(&mut txn, TIMEOUT);
+    let ids = super::pd_baseline::rule_table_ids(&mut snapshot, "mysql", "tidb_ddl_job", "").unwrap();
+    assert!(ids.is_some_and(|ids| ids.len() == 1 && ids[0] > 0));
+    assert_eq!(super::pd_baseline::rule_table_ids(&mut snapshot, "mysql", "no_such_table", "").unwrap(), None);
+    assert_eq!(super::pd_baseline::rule_table_ids(&mut snapshot, "mysql", "tidb_ddl_job", "p0").unwrap(), None);
+    assert_eq!(super::pd_baseline::rule_table_ids(&mut snapshot, "no_such_db", "tidb_ddl_job", "").unwrap(), None);
 }

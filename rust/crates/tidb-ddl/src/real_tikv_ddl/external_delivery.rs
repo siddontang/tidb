@@ -109,16 +109,16 @@ impl StepObjects<'_> {
 }
 
 /// Why the step may not write its objects: a label rule or range bundle
-/// without a journal baseline before the keyspace's cutover, as of the
-/// step's `snapshot`. `None` otherwise (any other failure surfaces at the
-/// prepare).
+/// without a journal baseline before the keyspace's cutover, or one the
+/// cutover held back, as of the step's `snapshot`. `None` otherwise (any
+/// other failure surfaces at the prepare).
 pub(crate) fn refusal<S: tidb_infoschema::cluster_catalog::MetaSnapshot>(
     mut snapshot: S,
     objects: &StepObjects<'_>,
 ) -> Option<String> {
     let planned = objects.planned().ok()?;
     let missing = tidb_ddl_pdjournal::journal::missing_baseline(&mut super::pd_baseline::SnapshotRead(&mut snapshot), &planned);
-    missing.ok().flatten().map(|key| tidb_ddl_pdjournal::JournalError::NoBaseline(key).to_string())
+    missing.ok().flatten().map(|refusal| refusal.to_string())
 }
 
 /// Where a step's journal lives and who writes it.

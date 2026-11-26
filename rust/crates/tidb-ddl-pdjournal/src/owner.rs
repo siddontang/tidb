@@ -28,7 +28,8 @@ use crate::{ObjectKey, PdValue};
 
 /// The variable that carries the operator's cutover: `*`, or the
 /// comma-separated IDs of the keyspaces whose writers that bypass the journal
-/// (nodes of an older build) the operator has drained.
+/// (nodes of an older build) the operator has drained. Named again after
+/// the cutover, it re-checks the objects the cutover held back.
 pub const CUTOVER_VARIABLE: &str = "TIDB_PD_JOURNAL_CUTOVER";
 
 fn cutover_asked(keyspace_id: Option<u32>) -> bool {
@@ -39,30 +40,91 @@ fn cutover_asked(keyspace_id: Option<u32>) -> bool {
     })
 }
 
-/// Whether `rule` is one TiDB writes for this keyspace: a key-range rule
-/// whose ID is a table's or partition's (`[keyspace/<id>/]schema/<db>/<table>
-/// [/<partition>]`, as [`tidb_ddl_label::new_rule_id`] builds it for the
-/// keyspace's codec). An operator's own rule, even under the keyspace's
-/// prefix, stays outside the journal.
-fn tidb_rule(syncer: &InfoSyncer, rule: &tidb_ddl_label::Rule) -> bool {
-    let prefix = tidb_ddl_label::new_rule_id(syncer.label_codec(), "", "", "");
-    let prefix = format!("{}/", prefix.trim_end_matches('/'));
-    rule.rule_type == tidb_ddl_label::RULE_TYPE
-        && rule.id.strip_prefix(&prefix).is_some_and(|names| {
-            let names = names.split('/').collect::<Vec<_>>();
-            (2..=3).contains(&names.len()) && names.iter().all(|name| !name.is_empty())
-        })
+/// The catalog's physical IDs of the object a TiDB label rule of `(db,
+/// table, partition)` covers, as of now: for a table rule (partition "")
+/// the table's and then its partitions' (Go `getIDs`), for a partition
+/// rule the partition's; `None` when the catalog holds no such table or
+/// partition. The names are lower-case, as TiDB's rules carry them.
+pub type CatalogIds = Arc<dyn Fn(&str, &str, &str) -> Result<Option<Vec<i64>>, String> + Send + Sync>;
+
+/// What the cutover makes of a label rule PD holds.
+#[derive(Debug, PartialEq)]
+enum Ownership {
+    /// TiDB's rule of a table or partition of this keyspace: adopted.
+    Tidb,
+    /// Its ID has TiDB's shape (`[keyspace/<id>/]schema/...`), but it is not
+    /// provably TiDB's: held back, with why.
+    Ambiguous(String),
+    /// Not under TiDB's rule IDs: the operator's (or PD's) own, left alone.
+    Foreign,
 }
 
-/// The keyspace's PD-only objects PD holds now that TiDB wrote: its tables'
-/// and partitions' label rules ([`tidb_rule`]) and its range bundles (read
-/// by their own group IDs only, so no other group is adopted).
-fn pd_only_objects(syncer: &InfoSyncer) -> Result<BTreeMap<ObjectKey, PdValue>, String> {
-    let mut objects = BTreeMap::new();
+/// Whether `rule` is TiDB's own for this keyspace. `Rule::reset` keeps the
+/// database, table, partition and keyspace in labels, so the rule is
+/// TiDB's only when its ID is the one [`tidb_ddl_label::new_rule_id`]
+/// rebuilds from those labels for the keyspace's codec, its keyspace label
+/// is this keyspace's, and its key ranges are exactly the catalog's
+/// physical ranges of that table or partition. A rule under TiDB's ID
+/// prefix that fails any of that is ambiguous.
+fn ownership(syncer: &InfoSyncer, catalog: &CatalogIds, rule: &tidb_ddl_label::Rule) -> Ownership {
+    let codec = syncer.label_codec();
+    let prefix = tidb_ddl_label::new_rule_id(codec, "", "", "");
+    if !rule.id.starts_with(&format!("{}/", prefix.trim_end_matches('/'))) {
+        return Ownership::Foreign;
+    }
+    let ambiguous = |reason: String| Ownership::Ambiguous(reason);
+    let labels = rule.labels.snapshot();
+    let label = |key: &str| labels.iter().find(|label| label.key == key).map(|label| label.value.clone());
+    let (Some(db), Some(table)) = (label("db"), label("table")) else {
+        return ambiguous("it has no db and table labels".to_owned());
+    };
+    let partition = label("partition").unwrap_or_default();
+    let rebuilt = tidb_ddl_label::new_rule_id(codec, &db, &table, &partition);
+    if rebuilt != rule.id {
+        return ambiguous(format!("its labels make the rule ID {rebuilt}"));
+    }
+    if tidb_ddl_label::use_keyspace_aware_rules(codec) && label("keyspace") != Some(codec.keyspace_id().to_string()) {
+        return ambiguous("its keyspace label is not this keyspace's".to_owned());
+    }
+    if rule.rule_type != tidb_ddl_label::RULE_TYPE {
+        return ambiguous(format!("its type is {:?}, not {}", rule.rule_type, tidb_ddl_label::RULE_TYPE));
+    }
+    let ids = match catalog(&db, &table, &partition) {
+        Ok(Some(ids)) => ids,
+        Ok(None) => return ambiguous("the catalog holds no such table or partition".to_owned()),
+        Err(error) => return ambiguous(format!("the catalog could not be read: {error}")),
+    };
+    let mut expected = rule.clone();
+    expected.reset(codec, &db, &table, &partition, &ids);
+    let key = ObjectKey::label_rule(&rule.id);
+    let ranges = |rule: &tidb_ddl_label::Rule| {
+        crate::normalize::projection(&key, &label_rule_value(rule), syncer.keyspace_id()).map(|projected| projected["data"].clone())
+    };
+    match (ranges(&expected), ranges(rule)) {
+        (Ok(wanted), Ok(held)) if wanted == held => Ownership::Tidb,
+        (Ok(_), Ok(_)) => ambiguous(format!("its key ranges are not those of physical tables {ids:?}")),
+        (Err(error), _) | (_, Err(error)) => ambiguous(format!("its ranges could not be read: {error}")),
+    }
+}
+
+/// The keyspace's PD-only objects as PD holds them now: TiDB's own (its
+/// tables' and partitions' label rules ([`ownership`]) and its range
+/// bundles, read by their own group IDs only, so no other group is
+/// adopted), and the label rules held back with why.
+type PdOnly = (BTreeMap<ObjectKey, PdValue>, BTreeMap<ObjectKey, String>);
+
+fn pd_only_objects(syncer: &InfoSyncer, catalog: &CatalogIds) -> Result<PdOnly, String> {
+    let (mut objects, mut held_back) = (BTreeMap::new(), BTreeMap::new());
     let rules = syncer.label_rule_manager().get_all_label_rules(syncer.label_codec())?;
     for rule in tidb_domain_infosync::label_manager::filter_rules_by_keyspace(rules, syncer.label_codec()) {
-        if tidb_rule(syncer, &rule) {
-            objects.insert(ObjectKey::label_rule(&rule.id), label_rule_value(&rule));
+        match ownership(syncer, catalog, &rule) {
+            Ownership::Tidb => {
+                objects.insert(ObjectKey::label_rule(&rule.id), label_rule_value(&rule));
+            }
+            Ownership::Ambiguous(reason) => {
+                held_back.insert(ObjectKey::label_rule(&rule.id), reason);
+            }
+            Ownership::Foreign => {}
         }
     }
     for range in [tidb_placement::KEY_RANGE_GLOBAL, tidb_placement::KEY_RANGE_META] {
@@ -73,58 +135,113 @@ fn pd_only_objects(syncer: &InfoSyncer) -> Result<BTreeMap<ObjectKey, PdValue>, 
             objects.insert(key, value);
         }
     }
-    Ok(objects)
+    Ok((objects, held_back))
 }
 
-/// Seeds the cutover of the keyspace `syncer` serves from what PD holds of
-/// TiDB's own PD-only objects ([`crate::journal::seed_cutover`]); answers
-/// how many records it seeded, `None` after an earlier cutover.
+/// What one run of the operator's cutover did.
+#[derive(Debug, Default, PartialEq)]
+pub struct CutoverReport {
+    /// Whether this run was the keyspace's cutover (false: an earlier one
+    /// had run, and this one re-checked the objects it held back).
+    pub first: bool,
+    /// The records it seeded (or, re-checking, the held-back objects it
+    /// resolved).
+    pub seeded: usize,
+    /// The objects held back, with why: every write of one is refused
+    /// until the operator resolves it.
+    pub held_back: Vec<(ObjectKey, String)>,
+}
+
+/// The operator's cutover of the keyspace `syncer` serves, from what PD
+/// holds now: a record of each of TiDB's PD-only objects, and each label
+/// rule of TiDB's ID shape that is not provably TiDB's
+/// ([`ownership`], against `catalog`) held back durably
+/// ([`crate::journal::seed_cutover_holding_back`]). After an earlier
+/// cutover, re-checks the objects it held back, which the operator has
+/// fixed in PD: one that is now TiDB's is adopted, one PD no longer holds
+/// gets a tombstone, and the others stay held back
+/// ([`crate::journal::resolve_held_back`]).
 ///
 /// # Errors
 /// PD or the journal could not be read, or the seeding not committed.
-pub fn seed_from_pd(store: &dyn tidb_meta::MetaStore, syncer: &InfoSyncer) -> Result<Option<usize>, String> {
-    pd_only_objects(syncer).and_then(|objects| crate::journal::seed_cutover(store, &objects))
+pub fn seed_from_pd(
+    store: &dyn tidb_meta::MetaStore,
+    syncer: &InfoSyncer,
+    catalog: &CatalogIds,
+) -> Result<CutoverReport, String> {
+    let (objects, held_back) = pd_only_objects(syncer, catalog)?;
+    if let Some(seeded) = crate::journal::seed_cutover_holding_back(store, &objects, &held_back)? {
+        return Ok(CutoverReport { first: true, seeded, held_back: held_back.into_iter().collect() });
+    }
+    let mut pending = Vec::new();
+    crate::journal::run(store, &mut |txn| {
+        pending = crate::journal::scan_held_back(&mut crate::TxnRead(txn))?;
+        Ok(())
+    })?;
+    let mut resolved = BTreeMap::new();
+    let mut still = Vec::new();
+    for held in pending {
+        if let Some(reason) = held_back.get(&held.key) {
+            still.push((held.key, reason.clone()));
+        } else {
+            resolved.insert(held.key.clone(), objects.get(&held.key).cloned());
+        }
+    }
+    let seeded = crate::journal::resolve_held_back(store, &resolved)?;
+    Ok(CutoverReport { first: false, seeded, held_back: still })
 }
 
 /// The operator's cutover of the keyspace `syncer` serves, when
-/// [`CUTOVER_VARIABLE`] names it and the keyspace had none: seeds a record
-/// for each of its PD-only objects from PD. No attempt of this build writes
-/// them before (they are refused until the cutover); the variable is the
-/// operator's word that no older node does either.
-fn cutover_if_asked(store: &dyn tidb_meta::MetaStore, syncer: &InfoSyncer) {
+/// [`CUTOVER_VARIABLE`] names it ([`seed_from_pd`]). No attempt of this
+/// build writes the keyspace's PD-only objects before (they are refused
+/// until the cutover); the variable is the operator's word that no older
+/// node does either. Each object held back is logged for the operator.
+fn cutover_if_asked(store: &dyn tidb_meta::MetaStore, syncer: &InfoSyncer, catalog: &CatalogIds) {
+    use tidb_log::{Field, Value};
     if !cutover_asked(syncer.keyspace_id()) {
         return;
     }
-    let seeded = seed_from_pd(store, syncer);
-    let keyspace = tidb_log::Field::new("keyspace", tidb_log::Value::Str(format!("{:?}", syncer.keyspace_id())));
+    let keyspace = Field::new("keyspace", Value::Str(format!("{:?}", syncer.keyspace_id())));
     let logger = tidb_logutil::bg_logger();
-    match seeded {
-        Ok(Some(count)) => logger.info(
-            "PD journal cutover: seeded the keyspace's PD-only objects",
-            &[keyspace, tidb_log::Field::new("seeded", tidb_log::Value::U64(count as u64))],
-        ),
-        Ok(None) => {}
+    match seed_from_pd(store, syncer, catalog) {
+        Ok(report) => {
+            if report.first || report.seeded > 0 {
+                logger.info(
+                    "PD journal cutover: seeded the keyspace's PD-only objects",
+                    &[keyspace.clone(), Field::new("seeded", Value::U64(report.seeded as u64))],
+                );
+            }
+            for (key, reason) in &report.held_back {
+                logger.warn(
+                    "PD journal cutover held an object back: TiDB refuses to write it until the operator resolves it",
+                    &[keyspace.clone(), Field::new("object", Value::Str(key.to_string())), Field::new("reason", Value::Str(reason.clone()))],
+                );
+            }
+        }
         Err(error) => logger.warn(
             "PD journal cutover failed; label rules and range bundles stay refused",
-            &[keyspace, tidb_log::Field::new("error", tidb_log::Value::Str(error))],
+            &[keyspace, Field::new("error", Value::Str(error))],
         ),
     }
 }
 
 /// The DDL owner's PD journal duties over the keyspace's meta `store`, as
 /// a listener of its owner manager beside the job scheduler (`scheduler`):
-/// at a takeover, the operator's cutover and then the reconciler of the
-/// keyspace `info_syncer` answers, which stops at the retirement or once the
-/// node no longer owns the DDL.
+/// at a takeover, the operator's cutover (which reads table IDs from
+/// `catalog`) and then the reconciler of the keyspace `info_syncer`
+/// answers, which stops at the retirement or once the node no longer owns
+/// the DDL.
 pub fn with_scheduler(
     store: Arc<dyn tidb_meta::MetaStore>,
     info_syncer: SyncerOf,
+    catalog: CatalogIds,
     owner: &Arc<dyn tidb_owner::Manager>,
     scheduler: Arc<dyn tidb_owner::Listener>,
 ) -> Arc<dyn tidb_owner::Listener> {
     let duties = PdJournalDuties {
         store,
         info_syncer,
+        catalog,
         owner: Arc::downgrade(owner),
         stop: std::sync::Mutex::default(),
     };
@@ -137,6 +254,7 @@ pub type SyncerOf = Arc<dyn Fn() -> Option<Arc<InfoSyncer>> + Send + Sync>;
 struct PdJournalDuties {
     store: Arc<dyn tidb_meta::MetaStore>,
     info_syncer: SyncerOf,
+    catalog: CatalogIds,
     /// Weak: the owner manager holds this listener.
     owner: std::sync::Weak<dyn tidb_owner::Manager>,
     /// The running reconciler's stop flag.
@@ -153,6 +271,7 @@ impl tidb_owner::Listener for PdJournalDuties {
             previous.store(true, Ordering::Release);
         }
         let (store, owner, info_syncer) = (Arc::clone(&self.store), self.owner.clone(), Arc::clone(&self.info_syncer));
+        let catalog = Arc::clone(&self.catalog);
         let spawned = std::thread::Builder::new().name("ddl-pd-reconciler".to_owned()).spawn(move || {
             let still_owner =
                 || !stop.load(Ordering::Acquire) && owner.upgrade().is_some_and(|owner| owner.is_owner());
@@ -171,7 +290,7 @@ impl tidb_owner::Listener for PdJournalDuties {
                 }
             };
             let _entered = tidb_domain_infosync::info_syncer::enter(Arc::clone(&syncer));
-            cutover_if_asked(store.as_ref(), &syncer);
+            cutover_if_asked(store.as_ref(), &syncer, &catalog);
             // A node without PD keeps its objects in this process's mocks,
             // which no other process writes late: nothing to repair.
             let Some(id) = owner.upgrade().filter(|_| syncer.pd_http_cli().is_some()).map(|owner| owner.id().to_owned()) else {
