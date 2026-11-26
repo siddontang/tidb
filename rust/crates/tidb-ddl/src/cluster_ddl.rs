@@ -5267,6 +5267,15 @@ pub enum ResourceGroupUpdate {
 }
 
 impl ResourceGroupUpdate {
+    /// The group the write names.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Add(group) | Self::Modify(group) => &group.name,
+            Self::Delete(name) => name,
+        }
+    }
+
     /// Makes the write; the error is the job's.
     pub fn apply(&self) -> Result<(), String> {
         match self {

@@ -35,8 +35,7 @@ use std::time::Duration;
 use tidb_proto::resource_manager as rmpb;
 use tikv_client::pd_http;
 
-use crate::cluster_ddl::{LabelRuleStep, ResourceGroupUpdate};
-use crate::real_tikv_ddl::ClusterDdlError;
+use tidb_ddl_build::label_rules::LabelRuleWrite;
 
 /// Where a step's placement bundles go: PD over the store's PD HTTP client,
 /// keyed and ranged by the store's keyspace, or the info syncer's placement
@@ -85,8 +84,8 @@ pub(crate) struct ExternalDelivery {
     resource_group: Option<ResourceGroupReceipt>,
 }
 
-fn not_committed(context: &str, error: impl std::fmt::Display) -> ClusterDdlError {
-    ClusterDdlError::NotCommitted(format!("{context}: {error}"))
+fn failed(context: &str, error: impl std::fmt::Display) -> String {
+    format!("{context}: {error}")
 }
 
 /// The group IDs PD keeps `bundles` under for the keyspace of `codec`.
@@ -105,7 +104,7 @@ impl ExternalDelivery {
         target: PlacementTarget,
         bundles: &[tidb_placement::Bundle],
         timeout: Duration,
-    ) -> Result<(), ClusterDdlError> {
+    ) -> Result<(), String> {
         if bundles.is_empty() {
             return Ok(());
         }
@@ -117,9 +116,9 @@ impl ExternalDelivery {
                     &pd_group_ids(codec.as_ref(), bundles),
                     timeout,
                 )
-                .map_err(|error| not_committed(CONTEXT, error))?;
+                .map_err(|error| failed(CONTEXT, error))?;
                 crate::placement_delivery::put_rule_bundles(&pd_http_client, codec.as_ref(), bundles, timeout)
-                    .map_err(|error| not_committed(CONTEXT, error))?;
+                    .map_err(|error| failed(CONTEXT, error))?;
                 self.placement = Some(PlacementReceipt::Pd { pd_http_client, previous });
             }
             PlacementTarget::InfoSyncer => {
@@ -127,7 +126,7 @@ impl ExternalDelivery {
                     .iter()
                     .map(|bundle| tidb_domain_infosync::info_syncer::get_rule_bundle(&bundle.id))
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| not_committed(CONTEXT, error))?
+                    .map_err(|error| failed(CONTEXT, error))?
                     .into_iter()
                     .zip(bundles)
                     .map(|(previous, bundle)| tidb_placement::Bundle {
@@ -136,7 +135,7 @@ impl ExternalDelivery {
                     })
                     .collect();
                 tidb_domain_infosync::info_syncer::put_rule_bundles_with_default_retry(bundles)
-                    .map_err(|error| not_committed(CONTEXT, error))?;
+                    .map_err(|error| failed(CONTEXT, error))?;
                 self.placement = Some(PlacementReceipt::InfoSyncer { previous });
             }
         }
@@ -146,20 +145,22 @@ impl ExternalDelivery {
     /// Go's job step makes its label-rule calls before the version is
     /// published and fails the job when one fails. The rules the step
     /// touches are read first, so a later failure puts them back.
-    pub(crate) fn deliver_label_rules(&mut self, steps: &[LabelRuleStep]) -> Result<(), ClusterDdlError> {
+    /// `steps` are the step's calls with Go's `errors.Wrapf` context of a
+    /// failed one.
+    pub(crate) fn deliver_label_rules(&mut self, steps: &[(&LabelRuleWrite, Option<&str>)]) -> Result<(), String> {
         if steps.is_empty() {
             return Ok(());
         }
         let manager = tidb_domain_infosync::info_syncer::label_rule_manager();
         let mut rule_ids = steps
             .iter()
-            .flat_map(|step| step.write.rule_ids())
+            .flat_map(|(write, _)| write.rule_ids())
             .collect::<Vec<_>>();
         rule_ids.sort();
         rule_ids.dedup();
         let original = manager
             .get_label_rules(&rule_ids)
-            .map_err(|error| not_committed("failed to get PD the label rules", error))?
+            .map_err(|error| failed("failed to get PD the label rules", error))?
             .into_values()
             .collect();
         self.label = Some(LabelReceipt {
@@ -167,55 +168,59 @@ impl ExternalDelivery {
             original,
             rule_ids,
         });
-        for step in steps {
+        for (write, context) in steps {
             let receipt = self.label.as_ref().expect("just set");
-            if let Err(error) = step.write.apply(receipt.manager.as_ref()) {
-                return Err(ClusterDdlError::NotCommitted(match step.error_context {
-                    Some(context) => format!("{context}: {error}"),
+            if let Err(error) = write.apply(receipt.manager.as_ref()) {
+                return Err(match context {
+                    Some(context) => failed(context, error),
                     None => error,
-                }));
+                });
             }
         }
         Ok(())
     }
 
-    /// Makes the resource-group job's write, after reading the group it
-    /// names.
-    pub(crate) fn deliver_resource_group(&mut self, update: &ResourceGroupUpdate) -> Result<(), ClusterDdlError> {
-        let name = match update {
-            ResourceGroupUpdate::Add(group) | ResourceGroupUpdate::Modify(group) => group.name.clone(),
-            ResourceGroupUpdate::Delete(name) => name.clone(),
-        };
-        let previous = tidb_domain_infosync::info_syncer::lookup_resource_group(&name)
-            .map_err(|error| not_committed("failed to get PD the resource group", error))?;
-        update.apply().map_err(ClusterDdlError::NotCommitted)?;
-        self.resource_group = Some(ResourceGroupReceipt { name, previous });
+    /// Makes the resource-group job's write `apply` of the group `name`,
+    /// after reading the group.
+    pub(crate) fn deliver_resource_group(
+        &mut self,
+        name: &str,
+        apply: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let previous = tidb_domain_infosync::info_syncer::lookup_resource_group(name)
+            .map_err(|error| failed("failed to get PD the resource group", error))?;
+        apply()?;
+        self.resource_group = Some(ResourceGroupReceipt {
+            name: name.to_owned(),
+            previous,
+        });
         Ok(())
     }
 
     /// Undoes the delivered writes of a definitely aborted step, if this
     /// attempt still owns the DDL (`still_owner`); otherwise leaves PD as it
-    /// is. The undo's failures and the skipped undo join `cause`.
+    /// is. Answers what the abort's cause should add: the undo's failures,
+    /// or the undo skipped.
     pub(crate) fn compensate(
         &self,
-        mut cause: ClusterDdlError,
         still_owner: &dyn Fn() -> Result<(), String>,
         timeout: Duration,
-    ) -> ClusterDdlError {
+    ) -> Result<(), String> {
         if self.placement.is_none() && self.label.is_none() && self.resource_group.is_none() {
-            return cause;
+            return Ok(());
         }
         if let Err(error) = still_owner() {
             tidb_ddl_logutil::ddl_logger().warn(
                 "a DDL attempt that lost its ownership leaves its PD writes to the owner",
                 &[tidb_log::Field::new("error", tidb_log::Value::Str(error.clone()))],
             );
-            return ClusterDdlError::NotCommitted(format!(
-                "{cause}; and this node is no longer the DDL owner, so it left the attempt's PD writes: {error}"
+            return Err(format!(
+                "this node is no longer the DDL owner, so it left the attempt's PD writes: {error}"
             ));
         }
+        let mut notes = Vec::new();
         let mut failed = |kind: &str, error: String| {
-            cause = ClusterDdlError::NotCommitted(format!("{cause}; and restoring the attempt's {kind} failed: {error}"));
+            notes.push(format!("restoring the attempt's {kind} failed: {error}"));
         };
         if let Some(receipt) = &self.label {
             if let Err(error) = receipt.restore() {
@@ -232,7 +237,11 @@ impl ExternalDelivery {
                 failed("resource group", error);
             }
         }
-        cause
+        if notes.is_empty() {
+            Ok(())
+        } else {
+            Err(notes.join("; and "))
+        }
     }
 }
 
@@ -412,9 +421,6 @@ mod tests {
         Err("not the DDL owner".to_owned())
     }
 
-    fn aborted() -> ClusterDdlError {
-        ClusterDdlError::NotCommitted("the catalog commit failed".to_owned())
-    }
 
     /// A definitely aborted step that rewrote an existing table's bundle (an
     /// ALTER PLACEMENT POLICY) and created a new one through PD's HTTP API:
@@ -436,8 +442,7 @@ mod tests {
         assert_eq!(pd.peers(&existing), Some(3));
         assert_eq!(pd.peers(&tidb_placement::group_id(200)), Some(3));
 
-        let cause = delivery.compensate(aborted(), &owner, TIMEOUT);
-        assert!(cause.to_string().contains("the catalog commit failed"), "{cause}");
+        delivery.compensate(&owner, TIMEOUT).unwrap();
         assert_eq!(pd.peers(&existing), Some(2), "the existing table keeps its placement");
         assert_eq!(pd.peers(&tidb_placement::group_id(200)), None, "the new group is gone");
     }
@@ -454,8 +459,8 @@ mod tests {
         let mut successor = ExternalDelivery::default();
         successor.deliver_placement(pd.target(), &[bundle(300, 2)], TIMEOUT).unwrap();
 
-        let cause = stale.compensate(aborted(), &lost_owner, TIMEOUT);
-        assert!(cause.to_string().contains("no longer the DDL owner"), "{cause}");
+        let note = stale.compensate(&lost_owner, TIMEOUT).unwrap_err();
+        assert!(note.contains("no longer the DDL owner"), "{note}");
         assert_eq!(pd.peers(&group), Some(3));
     }
 
@@ -488,21 +493,22 @@ mod tests {
         tidb_domain_infosync::info_syncer::add_resource_group(group("rg", 1)).unwrap();
 
         for (still_owner, kept) in [(owner as fn() -> Result<(), String>, false), (lost_owner, true)] {
-            let steps = [LabelRuleStep {
-                write: tidb_ddl_build::label_rules::LabelRuleWrite::Patch(tidb_ddl_label::new_rule_patch(
-                    vec![rule("t", "allow"), rule("t2", "allow")],
-                    Vec::new(),
-                )),
-                error_context: None,
-            }];
+            let write = LabelRuleWrite::Patch(tidb_ddl_label::new_rule_patch(
+                vec![rule("t", "allow"), rule("t2", "allow")],
+                Vec::new(),
+            ));
             let mut delivery = ExternalDelivery::default();
-            delivery.deliver_label_rules(&steps).unwrap();
-            delivery.deliver_resource_group(&ResourceGroupUpdate::Modify(Box::new(group("rg", 9)))).unwrap();
+            delivery.deliver_label_rules(&[(&write, None)]).unwrap();
+            delivery
+                .deliver_resource_group("rg", || tidb_domain_infosync::info_syncer::modify_resource_group(group("rg", 9)))
+                .unwrap();
             let mut created = ExternalDelivery::default();
-            created.deliver_resource_group(&ResourceGroupUpdate::Add(Box::new(group("new_rg", 2)))).unwrap();
+            created
+                .deliver_resource_group("new_rg", || tidb_domain_infosync::info_syncer::add_resource_group(group("new_rg", 2)))
+                .unwrap();
 
-            let _ = delivery.compensate(aborted(), &still_owner, TIMEOUT);
-            let _ = created.compensate(aborted(), &still_owner, TIMEOUT);
+            let _ = delivery.compensate(&still_owner, TIMEOUT);
+            let _ = created.compensate(&still_owner, TIMEOUT);
             let rules = labels.get_label_rules(&["schema/test/t".to_owned(), "schema/test/t2".to_owned()]).unwrap();
             let rg = tidb_domain_infosync::info_syncer::lookup_resource_group("rg").unwrap().unwrap();
             let new_rg = tidb_domain_infosync::info_syncer::lookup_resource_group("new_rg").unwrap();

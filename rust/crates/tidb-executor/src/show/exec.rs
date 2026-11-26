@@ -1786,59 +1786,13 @@ pub trait ShowExec: crate::simple::account_password::AccountPasswordExec {
                 rows.extend(set.rows);
             }
         }
-        // Go `fetchRangesPlacementPlocy`: the `global`, then the `meta`
-        // range, when a policy holds it (`infosync.GetReplicationState` is
-        // PENDING without PD).
-        for range_bundle_id in [
-            tidb_placement::TIDB_BUNDLE_RANGE_PREFIX_FOR_GLOBAL,
-            tidb_placement::TIDB_BUNDLE_RANGE_PREFIX_FOR_META,
-        ] {
-            let policy_name = tidb_ddl::cluster_ddl::placement_policy::get_range_placement_policy_name(range_bundle_id)
-                .map_err(|error| DriverError::Mysql(crate::MysqlError::unknown(error)))?;
-            if policy_name.is_empty() {
-                continue;
-            }
-            let settings = self.with_catalog_mut(|catalog| {
-                Ok(catalog.policy(&policy_name).map(|policy| {
-                    policy
-                        .placement_settings
-                        .as_ref()
-                        .map(|settings| settings.read().to_string())
-                        .unwrap_or_default()
+        rows.extend(crate::show::placement::range_rows(&mut |policy_name| {
+            self.with_catalog_mut(|catalog| {
+                Ok(catalog.policy(policy_name).map(|policy| {
+                    policy.placement_settings.as_ref().map(|settings| settings.read().to_string()).unwrap_or_default()
                 }))
-            })?;
-            let Some(settings) = settings else {
-                return Err(DriverError::Mysql(crate::MysqlError::unknown(format!(
-                    "Policy with name '{policy_name}' not found"
-                ))));
-            };
-            rows.push(vec![
-                Datum::Bytes(format!("RANGE {range_bundle_id}").into_bytes()),
-                Datum::Bytes(settings.into_bytes()),
-                Datum::Bytes(crate::show::placement::PENDING.as_bytes().to_vec()),
-            ]);
-        }
-        // The unqualified global bundle a Go or older node left in PD, which
-        // on a next-generation kernel still places every keyspace's keys
-        // until the operator removes it (multi-keyspace design §6.2). Its
-        // policy may be another keyspace's: then the row names it.
-        let legacy_policy = tidb_ddl::cluster_ddl::placement_policy::get_legacy_global_placement_policy_name()
-            .map_err(|error| DriverError::Mysql(crate::MysqlError::unknown(error)))?;
-        if !legacy_policy.is_empty() {
-            let settings = self.with_catalog_mut(|catalog| {
-                Ok(catalog.policy(&legacy_policy).and_then(|policy| {
-                    policy.placement_settings.as_ref().map(|settings| settings.read().to_string())
-                }))
-            })?;
-            rows.push(vec![
-                Datum::Bytes(
-                    format!("RANGE {} (legacy, every keyspace)", tidb_placement::TIDB_BUNDLE_RANGE_PREFIX_FOR_GLOBAL)
-                        .into_bytes(),
-                ),
-                Datum::Bytes(settings.unwrap_or_else(|| format!("POLICY={legacy_policy}")).into_bytes()),
-                Datum::Bytes(crate::show::placement::PENDING.as_bytes().to_vec()),
-            ]);
-        }
+            })
+        })?);
         Ok(rows)
     }
 

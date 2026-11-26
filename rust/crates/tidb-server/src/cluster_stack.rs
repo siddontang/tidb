@@ -1337,12 +1337,19 @@ struct PdResourceManagerClient {
     store: tidb_txnkv::driver::tikv_store::TikvStore,
 }
 
+impl PdResourceManagerClient {
+    /// The store's PD client, whose requests name the store's keyspace.
+    fn pd_client(&self) -> Arc<tikv_client::PdRpcClient> {
+        self.store.store().pd_client()
+    }
+}
+
 impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for PdResourceManagerClient {
     fn add_resource_group(
         &self,
         group: tidb_proto::resource_manager::ResourceGroup,
     ) -> Result<String, String> {
-        let pd = self.store.store().pd_client();
+        let pd = self.pd_client();
         self.store
             .block_on(async move { pd.add_resource_group(group).await })
             .map_err(|error| error.to_string())
@@ -1352,14 +1359,14 @@ impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for Pd
         &self,
         group: tidb_proto::resource_manager::ResourceGroup,
     ) -> Result<String, String> {
-        let pd = self.store.store().pd_client();
+        let pd = self.pd_client();
         self.store
             .block_on(async move { pd.modify_resource_group(group).await })
             .map_err(|error| error.to_string())
     }
 
     fn delete_resource_group(&self, name: &str) -> Result<String, String> {
-        let pd = self.store.store().pd_client();
+        let pd = self.pd_client();
         let name = name.to_owned();
         self.store
             .block_on(async move { pd.delete_resource_group(&name).await })
@@ -1370,7 +1377,7 @@ impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for Pd
         &self,
         name: &str,
     ) -> Result<Option<tidb_proto::resource_manager::ResourceGroup>, String> {
-        let pd = self.store.store().pd_client();
+        let pd = self.pd_client();
         let name = name.to_owned();
         match self.store.block_on(async move { pd.get_resource_group(&name, false).await }) {
             Ok(group) => Ok(group),

@@ -54,6 +54,7 @@ pub use add_index_reorg::ingest::PipelineError;
 pub use add_index_reorg::operators as backfilling_operators;
 mod backfilling;
 pub mod delete_range;
+mod external_delivery;
 
 /// Why a catalog change did not happen.
 #[derive(Clone, Debug)]
@@ -1631,26 +1632,34 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
     }
     // The step's PD writes, before its catalog change commits; every
     // definite abort from here undoes them ([`ExternalDelivery::compensate`]).
-    let mut delivery = crate::external_delivery::ExternalDelivery::default();
-    let abort = |delivery: &crate::external_delivery::ExternalDelivery, cause: ClusterDdlError| {
-        delivery.compensate(cause, phase.check_owner, timeout)
+    let mut delivery = external_delivery::ExternalDelivery::default();
+    let abort = |delivery: &external_delivery::ExternalDelivery, cause: ClusterDdlError| {
+        match delivery.compensate(phase.check_owner, timeout) {
+            Ok(()) => cause,
+            Err(note) => ClusterDdlError::NotCommitted(format!("{cause}; and {note}")),
+        }
     };
     let placement_target = match opener.store().pd_http_client() {
-        Some(pd_http_client) => crate::external_delivery::PlacementTarget::Pd {
+        Some(pd_http_client) => external_delivery::PlacementTarget::Pd {
             pd_http_client,
             codec: tidb_domain_infosync::info_syncer::store_codec(sess_pool.keyspace_id()),
         },
         // Go `infosync.PutRuleBundlesWithDefaultRetry` on a node without
         // PD: the info syncer's `mockPlacementManager`.
-        None => crate::external_delivery::PlacementTarget::InfoSyncer,
+        None => external_delivery::PlacementTarget::InfoSyncer,
     };
     if let Err(error) = delivery.deliver_placement(placement_target, &write.placement_bundles, timeout) {
         let _ = transaction.rollback();
-        return Err(error);
+        return Err(ClusterDdlError::NotCommitted(error));
     }
-    if let Err(error) = delivery.deliver_label_rules(&write.label_rules) {
+    let label_steps = write
+        .label_rules
+        .iter()
+        .map(|step| (&step.write, step.error_context))
+        .collect::<Vec<_>>();
+    if let Err(error) = delivery.deliver_label_rules(&label_steps) {
         let _ = transaction.rollback();
-        return Err(abort(&delivery, error));
+        return Err(abort(&delivery, ClusterDdlError::NotCommitted(error)));
     }
     // Go `createTableAffinityGroupsInPD`, as in the single-phase path.
     if let Err(error) = write.affinity_groups.apply_create() {
@@ -1658,9 +1667,9 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
         return Err(abort(&delivery, ClusterDdlError::NotCommitted(error)));
     }
     if let Some(update) = &write.resource_group_update {
-        if let Err(error) = delivery.deliver_resource_group(update) {
+        if let Err(error) = delivery.deliver_resource_group(update.name(), || update.apply()) {
             let _ = transaction.rollback();
-            return Err(abort(&delivery, error));
+            return Err(abort(&delivery, ClusterDdlError::NotCommitted(error)));
         }
     }
     if let Some(mdl_info) = &write.mdl_info_update {

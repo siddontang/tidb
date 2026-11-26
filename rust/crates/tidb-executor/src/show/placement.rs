@@ -123,3 +123,54 @@ pub fn placement_table<'a>(
     };
     Ok((stored_database, stored_table, entry))
 }
+
+/// Go `fetchRangesPlacementPlocy`: the `global`, then the `meta` range, when
+/// a policy holds it (`infosync.GetReplicationState` is PENDING without
+/// PD), whose settings `settings_of` reads from the catalog. Then the
+/// unqualified global bundle a Go or older node left in PD, which on a
+/// next-generation kernel still places every keyspace's keys until the
+/// operator removes it (multi-keyspace design §6.2); its policy may be
+/// another keyspace's, and then the row names it.
+///
+/// # Errors
+/// PD's, the catalog's, or a range policy the catalog does not have.
+pub fn range_rows(
+    settings_of: &mut dyn FnMut(&str) -> Result<Option<String>, DriverError>,
+) -> Result<Vec<Vec<Datum>>, DriverError> {
+    let pd_error = |error| DriverError::Mysql(crate::MysqlError::unknown(error));
+    let mut rows = Vec::new();
+    for range_bundle_id in [
+        tidb_placement::TIDB_BUNDLE_RANGE_PREFIX_FOR_GLOBAL,
+        tidb_placement::TIDB_BUNDLE_RANGE_PREFIX_FOR_META,
+    ] {
+        let policy_name =
+            tidb_ddl::cluster_ddl::placement_policy::get_range_placement_policy_name(range_bundle_id).map_err(pd_error)?;
+        if policy_name.is_empty() {
+            continue;
+        }
+        let Some(settings) = settings_of(&policy_name)? else {
+            return Err(DriverError::Mysql(crate::MysqlError::unknown(format!(
+                "Policy with name '{policy_name}' not found"
+            ))));
+        };
+        rows.push(range_row(format!("RANGE {range_bundle_id}"), settings));
+    }
+    let legacy_policy =
+        tidb_ddl::cluster_ddl::placement_policy::get_legacy_global_placement_policy_name().map_err(pd_error)?;
+    if !legacy_policy.is_empty() {
+        let settings = settings_of(&legacy_policy)?.unwrap_or_else(|| format!("POLICY={legacy_policy}"));
+        rows.push(range_row(
+            format!("RANGE {} (legacy, every keyspace)", tidb_placement::TIDB_BUNDLE_RANGE_PREFIX_FOR_GLOBAL),
+            settings,
+        ));
+    }
+    Ok(rows)
+}
+
+fn range_row(target: String, settings: String) -> Vec<Datum> {
+    vec![
+        Datum::Bytes(target.into_bytes()),
+        Datum::Bytes(settings.into_bytes()),
+        Datum::Bytes(PENDING.as_bytes().to_vec()),
+    ]
+}
