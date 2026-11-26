@@ -69,7 +69,7 @@ pub fn gc_worker_deps<S: tidb_store_driver_txn::transaction::StoreClient + 'stat
         store.store().clone(),
         store.store().keyspace_meta().cloned(),
     ));
-    let pd_http_client = store.pd_http_client();
+    let journal_opener = Arc::clone(&opener);
     GcWorkerDeps {
         store: client.clone(),
         pd: client.clone(),
@@ -86,7 +86,7 @@ pub fn gc_worker_deps<S: tidb_store_driver_txn::transaction::StoreClient + 'stat
             }),
         )),
         rules: Arc::new(NodeGcRules {
-            pd_http_client,
+            journal: Arc::new(tidb_store_driver_txn::meta_txn::MetaStore::new(Arc::clone(&journal_opener), GC_RPC_TIMEOUT)),
             // Go `w.store.GetCodec()`: the keyspace the bundles are keyed by,
             // as the DDL job's delivery keys them.
             codec: tidb_domain_infosync::info_syncer::store_codec(tidb_keyspace::KeyspaceCodec::keyspace_id(store)),
@@ -316,7 +316,9 @@ impl GcSession for NodeGcSession<'_> {
 /// `infosync`'s placement and label rule calls, over the store's PD HTTP
 /// client and the domain's info syncer.
 struct NodeGcRules {
-    pd_http_client: Option<tikv_client::pd_http::Client>,
+    /// The keyspace's meta store, which holds its PD journal: GC's deletes
+    /// go through it ([`tidb_ddl_pdjournal::direct::write_through`]).
+    journal: Arc<dyn tidb_meta::MetaStore>,
     /// The store's keyspace codec, `None` for an API-V1 store.
     codec: Option<tikv_client::request::ApiV2Codec>,
     /// The domain's PD managers (design §6.2); `None` reads the process's.
@@ -328,10 +330,36 @@ impl NodeGcRules {
         self.info_syncer.clone().unwrap_or_else(tidb_domain_infosync::info_syncer::get)
     }
 
-    fn pd_http_client(&self) -> GcResult<&tikv_client::pd_http::Client> {
-        self.pd_http_client
-            .as_ref()
-            .ok_or_else(|| GcError::new("pd http client unavailable"))
+    /// Deletes `chosen` (each with the record GC chose it by) through the
+    /// keyspace's PD journal.
+    fn delete_through_journal(&self, chosen: Vec<tidb_ddl_pdjournal::Planned>) -> GcResult<()> {
+        let info_syncer = self.info_syncer();
+        let scope = tidb_ddl_pdjournal::pd::scope(&info_syncer);
+        tidb_ddl_pdjournal::direct::write_through(
+            self.journal.as_ref(),
+            &tidb_ddl_pdjournal::pd::InfoSyncerPd(info_syncer),
+            "gc",
+            scope,
+            &chosen,
+        )
+        .map_err(|error| GcError::new(error.to_string()))
+    }
+
+    /// The records of `keys`; refuses PD-only objects before the keyspace's
+    /// cutover.
+    fn records(
+        &self,
+        keys: &[tidb_ddl_pdjournal::ObjectKey],
+    ) -> GcResult<std::collections::BTreeMap<tidb_ddl_pdjournal::ObjectKey, tidb_ddl_pdjournal::Record>> {
+        let (records, cutover) =
+            tidb_ddl_pdjournal::direct::read_current(self.journal.as_ref(), keys).map_err(GcError::new)?;
+        if let Some(key) = keys
+            .iter()
+            .find(|key| !cutover && !key.catalog_reconstructible() && !records.contains_key(*key))
+        {
+            return Err(GcError::new(tidb_ddl_pdjournal::JournalError::NoBaseline(key.clone()).to_string()));
+        }
+        Ok(records)
     }
 }
 
@@ -355,14 +383,27 @@ impl GcRuleClient for NodeGcRules {
             .map_err(GcError::new)
     }
 
+    /// GC's deletes of dropped tables' bundles (`bundles` are empty), each
+    /// over the record it found, so a delayed retry cannot delete a bundle
+    /// written since.
     fn put_rule_bundles(&self, bundles: Vec<tidb_placement::Bundle>) -> GcResult<()> {
-        tidb_ddl::placement_delivery::put_rule_bundles(
-            self.pd_http_client()?,
-            self.codec.as_ref(),
-            &bundles,
-            GC_RPC_TIMEOUT,
-        )
-        .map_err(gc_error)
+        let keys = bundles
+            .iter()
+            .map(|bundle| {
+                tidb_domain_infosync::placement_manager::encode_bundle(self.codec.as_ref(), bundle)
+                    .map(|encoded| tidb_ddl_pdjournal::pd::bundle_entry(&encoded).0)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(GcError::new)?;
+        let records = self.records(&keys)?;
+        let chosen = keys
+            .into_iter()
+            .map(|key| {
+                let expect = records.get(&key).map(|record| (record.generation, record.op_id.clone()));
+                tidb_ddl_pdjournal::Planned { key, value: None, expect: Some(expect) }
+            })
+            .collect();
+        self.delete_through_journal(chosen)
     }
 
     /// Go `infosync.GetLabelRules`, kept to the rules of the store's keyspace
@@ -394,14 +435,35 @@ impl GcRuleClient for NodeGcRules {
         }
     }
 
-    fn delete_label_rules(&self, rule_ids: Vec<String>) -> GcResult<()> {
-        self.info_syncer()
-            .label_rule_manager()
-            .update_label_rules(&tidb_ddl_label::new_rule_patch(
-                Vec::new(),
-                rule_ids,
-            ))
-            .map_err(GcError::new)
+    /// GC's deletes of the rules it chose from PD: each only while its
+    /// record still holds the rule GC read (a reused name may hold another
+    /// table's rule by now), and over that record's generation.
+    fn delete_label_rules(&self, rules: Vec<tidb_ddl_label::Rule>) -> GcResult<()> {
+        let keys = rules
+            .iter()
+            .map(|rule| tidb_ddl_pdjournal::ObjectKey::label_rule(&rule.id))
+            .collect::<Vec<_>>();
+        let records = self.records(&keys)?;
+        let keyspace_id = self.codec.as_ref().map(tikv_client::request::ApiV2Codec::keyspace_id);
+        let mut chosen = Vec::new();
+        for (key, rule) in keys.into_iter().zip(&rules) {
+            let chose = tidb_ddl_pdjournal::pd::label_rule_value(rule);
+            let record = records.get(&key);
+            let same = record.is_some_and(|record| {
+                tidb_ddl_pdjournal::normalize::in_sync(&key, record.value.as_ref(), Some(&chose), keyspace_id)
+                    .unwrap_or(false)
+            });
+            if !same {
+                tidb_logutil::bg_logger().warn(
+                    "GC leaves a label rule whose record no longer holds the rule it chose",
+                    &[tidb_log::Field::new("rule", tidb_log::Value::Str(key.id.clone()))],
+                );
+                continue;
+            }
+            let expect = record.map(|record| (record.generation, record.op_id.clone()));
+            chosen.push(tidb_ddl_pdjournal::Planned { key, value: None, expect: Some(expect) });
+        }
+        self.delete_through_journal(chosen)
     }
 }
 
@@ -413,6 +475,13 @@ mod tests {
     use tidb_domain_infosync::label_manager::{LabelRuleManager, MockLabelManager};
 
     use super::*;
+
+    /// A keyspace journal over an embedded store, and the store's PD (kept
+    /// alive with it).
+    fn journal() -> (tidb_unistore_tikv::tso::InProcessPd, Arc<dyn tidb_meta::MetaStore>) {
+        let (pd, opener) = tidb_ddl::embedded_store::in_process_write_stack().unwrap();
+        (pd, Arc::new(tidb_store_driver_txn::meta_txn::MetaStore::new(Arc::new(opener), GC_RPC_TIMEOUT)))
+    }
 
     /// A keyspace's GC finds a dropped table's label rule by the ranges the
     /// rule was built with, its keyspace's (design §6.2). Go's `getGCRules`
@@ -428,8 +497,9 @@ mod tests {
         let mut rule: tidb_ddl_label::Rule =
             serde_json::from_value(serde_json::json!({"labels": [{"key": "merge_option", "value": "deny"}]})).unwrap();
         rule.reset(own.label_codec(), "d", "t", "", &[100]);
+        let (_pd, store) = journal();
         let rules = NodeGcRules {
-            pd_http_client: None,
+            journal: store,
             codec: tidb_domain_infosync::info_syncer::store_codec(1),
             info_syncer: Some(Arc::new(own)),
         };
@@ -440,6 +510,37 @@ mod tests {
         );
         assert!(crate::gc_worker::get_gc_rules(&[100], &held, &tidb_ddl_label::CodecV1).is_empty());
         assert!(crate::gc_worker::get_gc_rules(&[101], &held, GcRuleClient::label_codec(&rules).as_ref()).is_empty());
+    }
+
+    /// GC's deletes go through the keyspace's PD journal: a dropped table's
+    /// bundle leaves a tombstone record, and a label rule is refused before
+    /// the keyspace's cutover (PD keeps it).
+    #[test]
+    fn gc_deletes_through_the_journal() {
+        let (_pd, store) = journal();
+        let syncer = Arc::new(InfoSyncer::default());
+        let rules = NodeGcRules { journal: Arc::clone(&store), codec: None, info_syncer: Some(Arc::clone(&syncer)) };
+        let pd = tidb_ddl_pdjournal::pd::InfoSyncerPd(Arc::clone(&syncer));
+        let settings = tidb_model::placement::PlacementSettings { followers: 2, ..Default::default() };
+        let mut bundle = tidb_placement::new_bundle_from_options(Some(&settings)).unwrap();
+        bundle.reset(tidb_placement::RULE_INDEX_TABLE, &[300]);
+        let (key, value) = tidb_ddl_pdjournal::pd::bundle_entry(&bundle);
+        let planned = tidb_ddl_pdjournal::Planned::new(key.clone(), value);
+        tidb_ddl_pdjournal::direct::write_through(store.as_ref(), &pd, "test", 7, &[planned]).unwrap();
+        assert_eq!(tidb_ddl_pdjournal::pd::PdObjects::read(&pd, std::slice::from_ref(&key)).unwrap().len(), 1);
+
+        GcRuleClient::put_rule_bundles(&rules, vec![tidb_placement::new_bundle(300)]).unwrap();
+        assert!(tidb_ddl_pdjournal::pd::PdObjects::read(&pd, std::slice::from_ref(&key)).unwrap().is_empty());
+        let (records, cutover) = tidb_ddl_pdjournal::direct::read_current(store.as_ref(), std::slice::from_ref(&key)).unwrap();
+        assert_eq!(records[&key].value, None, "a tombstone");
+        assert!(!cutover);
+
+        let mut rule = tidb_ddl_label::Rule::new();
+        rule.reset(&tidb_ddl_label::CodecV1, "d", "t", "", &[300]);
+        syncer.label_rule_manager().put_label_rule(&rule).unwrap();
+        let refused = GcRuleClient::delete_label_rules(&rules, vec![rule.clone()]).unwrap_err();
+        assert!(refused.to_string().contains("PD journal cutover"), "{refused}");
+        assert_eq!(syncer.label_rule_manager().get_label_rules(&[rule.id.clone()]).unwrap().len(), 1);
     }
 
     /// A keyspace's GC reads only its own keyspace's label rules (design
@@ -462,14 +563,22 @@ mod tests {
         }
         let own = InfoSyncer::new(1);
         own.init_label_rule_manager(Some(pd.clone()));
+        let (_pd, store) = journal();
         let rules = NodeGcRules {
-            pd_http_client: None,
+            journal: Arc::clone(&store),
             codec: None,
             info_syncer: Some(Arc::new(own)),
         };
         let found = GcRuleClient::get_label_rules(&rules, &ids).unwrap();
         assert_eq!(found.keys().cloned().collect::<Vec<_>>(), ["keyspace/1/schema/d/t"]);
-        GcRuleClient::delete_label_rules(&rules, found.into_keys().collect()).unwrap();
+        // The cutover seeds the rules from PD; GC deletes the one it chose
+        // through the journal.
+        let seeded = found
+            .values()
+            .map(|rule| (tidb_ddl_pdjournal::ObjectKey::label_rule(&rule.id), tidb_ddl_pdjournal::pd::label_rule_value(rule)))
+            .collect();
+        tidb_ddl_pdjournal::journal::seed_cutover(store.as_ref(), &seeded).unwrap();
+        GcRuleClient::delete_label_rules(&rules, found.into_values().collect()).unwrap();
         let left = pd.get_all_label_rules(&tidb_ddl_label::CodecV1).unwrap();
         assert_eq!(
             left.into_iter().map(|rule| rule.id).collect::<Vec<_>>(),

@@ -207,8 +207,10 @@ pub trait GcRuleClient: Send + Sync {
         &self,
         rule_ids: &[String],
     ) -> GcResult<std::collections::HashMap<String, tidb_ddl_label::Rule>>;
-    /// Go `infosync.UpdateLabelRules(label.NewRulePatch([], rule_ids))`.
-    fn delete_label_rules(&self, rule_ids: Vec<String>) -> GcResult<()>;
+    /// Go `infosync.UpdateLabelRules(label.NewRulePatch([], rule_ids))` of
+    /// the rules GC chose, as it read them: a rule is deleted only while it
+    /// is still the object GC chose (a reused name may hold another).
+    fn delete_label_rules(&self, rules: Vec<tidb_ddl_label::Rule>) -> GcResult<()>;
     /// Go `w.store.GetCodec()` as the label rules range keys: the
     /// keyspace-less codec unless the store serves a keyspace.
     fn label_codec(&self) -> Box<dyn tidb_ddl_label::LabelCodec> {

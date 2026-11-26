@@ -1809,14 +1809,31 @@ fn unsupported_type(go_type: &str) -> DriverError {
     )
 }
 
+/// Where ALTER RANGE journals the range bundle it writes: the keyspace's
+/// meta store, and the node that writes it.
+pub struct RangeJournal<'a> {
+    /// The session's keyspace meta store.
+    pub store: &'a dyn tidb_meta::MetaStore,
+    /// The writing node, for the intent (`session/<server id>`).
+    pub owner: String,
+}
+
 /// Go `SimpleExec.executeAlterRange`: the `global` or `meta` range's rule
-/// bundle rebuilt from the policy (or emptied for `DEFAULT`) and put to PD.
+/// bundle rebuilt from the policy (or emptied for `DEFAULT`, which removes
+/// it) and put to PD through the keyspace's PD journal: the statement
+/// succeeds only once the bundle's record committed over the generation it
+/// prepared against, so of two sessions altering one range the later one
+/// to commit is refused and PD keeps the winner's bundle
+/// ([`tidb_ddl_pdjournal::direct::write_through`]).
 ///
 /// # Errors
-/// An unsupported range or option, an unknown policy, or PD's refusal.
+/// An unsupported range or option, an unknown policy, a range without a
+/// journal baseline (before the keyspace's cutover), PD's refusal, or a
+/// concurrent ALTER RANGE that committed first.
 pub fn execute_alter_range(
     s: &tidb_ast::AlterRangeStmt,
     is: &tidb_infoschema::SessionExtendedInfoSchema,
+    journal: &RangeJournal<'_>,
 ) -> Result<(), DriverError> {
     let unknown = |message: String| DriverError::Mysql(tidb_terror::MysqlError::unknown(message));
     let range_name = s.range_name.to_lowercase();
@@ -1849,7 +1866,18 @@ pub fn execute_alter_range(
             ..tidb_placement::Bundle::default()
         }
     };
-    tidb_domain_infosync::info_syncer::put_rule_bundles_with_default_retry(&[bundle]).map_err(unknown)
+    let syncer = tidb_domain_infosync::info_syncer::get();
+    let (key, value) = tidb_ddl_pdjournal::pd::bundle_entry(&syncer.pd_bundle(&bundle).map_err(unknown)?);
+    let planned = tidb_ddl_pdjournal::Planned::new(key, value);
+    let scope = tidb_ddl_pdjournal::pd::scope(&syncer);
+    tidb_ddl_pdjournal::direct::write_through(
+        journal.store,
+        &tidb_ddl_pdjournal::pd::InfoSyncerPd(syncer),
+        &journal.owner,
+        scope,
+        &[planned],
+    )
+    .map_err(|error| unknown(error.to_string()))
 }
 
 /// Go `killBySQLStmt`: a SQL `KILL` of a connection (not `KILL QUERY`) marks

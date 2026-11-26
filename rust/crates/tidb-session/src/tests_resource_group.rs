@@ -160,3 +160,112 @@ fn resource_groups_follow_go() {
     run(&mut session, "drop resource group rg2");
     run(&mut session, "drop resource group if exists rg2");
 }
+
+/// The PD journal through the production entry points over the mock store:
+/// the bootstrap, DDL jobs (resource groups, table placement, attributes)
+/// and ALTER RANGE each leave a record of every PD object they write, equal
+/// to what PD holds, so a writer that bypassed the journal shows as an
+/// object without one; and the reconciler puts back an object PD lost.
+fn journal_records(
+    store: &dyn tidb_meta::MetaStore,
+) -> std::collections::BTreeMap<tidb_ddl_pdjournal::ObjectKey, tidb_ddl_pdjournal::Record> {
+    let mut found = Default::default();
+    store
+        .run_in_new_txn(&tidb_gocontext::Context::background(), "test", false, &mut |txn| {
+            found = tidb_ddl_pdjournal::journal::scan_records(&mut tidb_ddl_pdjournal::TxnRead(txn)).unwrap();
+            assert!(tidb_ddl_pdjournal::journal::read_cutover(&mut tidb_ddl_pdjournal::TxnRead(txn)).unwrap().is_some(), "bootstrap's cutover");
+            Ok(())
+        })
+        .unwrap();
+    found
+}
+
+#[test]
+fn every_pd_entry_point_journals_what_it_writes_and_the_reconciler_repairs_pd() {
+    let mut session = Session::new();
+    let domain = crate::domain::mock_store::domain_of(&session).expect("a mock-store session");
+    let syncer = domain.info_syncer();
+    let store = std::sync::Arc::clone(domain.domain().meta_store.get().expect("a meta store"));
+    let pd = tidb_ddl_pdjournal::pd::InfoSyncerPd(std::sync::Arc::clone(&syncer));
+    let group = |bundle: tidb_placement::Bundle| tidb_ddl_pdjournal::pd::bundle_entry(&syncer.pd_bundle(&bundle).unwrap()).0;
+    let range = |name: &str| {
+        let mut bundle = tidb_placement::Bundle::default();
+        bundle.rebuild_for_range(name, "");
+        group(bundle)
+    };
+
+    let bootstrapped = journal_records(store.as_ref());
+    assert!(bootstrapped.contains_key(&tidb_ddl_pdjournal::ObjectKey::resource_group("default")), "{bootstrapped:?}");
+
+    run(&mut session, "use test");
+    for sql in [
+        "create resource group rg_journal ru_per_sec = 100",
+        "create placement policy p_journal followers = 2",
+        "create table t_journal (c int) placement policy = p_journal",
+        "alter table t_journal attributes = 'merge_option=deny'",
+        "alter range global placement policy p_journal",
+        "alter resource group rg_journal ru_per_sec = 200",
+    ] {
+        run(&mut session, sql);
+    }
+    let table_id: i64 = crate::tests_support::row_text(session.run(
+        "select tidb_table_id from information_schema.tables where table_name = 't_journal'",
+    ))[0][0]
+        .parse()
+        .unwrap();
+    let rule_id = tidb_ddl_label::new_rule_id(syncer.label_codec(), "test", "t_journal", "");
+    let written = [
+        tidb_ddl_pdjournal::ObjectKey::resource_group("rg_journal"),
+        group(tidb_placement::new_bundle(table_id)),
+        tidb_ddl_pdjournal::ObjectKey::label_rule(&rule_id),
+        range(tidb_placement::KEY_RANGE_GLOBAL),
+    ];
+    let journaled = journal_records(store.as_ref());
+    let held = tidb_ddl_pdjournal::pd::PdObjects::read(&pd, &written).unwrap();
+    for key in &written {
+        let record = journaled.get(key).unwrap_or_else(|| panic!("{key} has no record: a writer bypassed the journal"));
+        assert!(
+            tidb_ddl_pdjournal::normalize::in_sync(key, record.value.as_ref(), held.get(key), None).unwrap(),
+            "{key}: record {:?}, PD {:?}",
+            record.value,
+            held.get(key)
+        );
+    }
+
+    // PD loses every object; the owner's reconciler puts them back.
+    for key in &written {
+        tidb_ddl_pdjournal::pd::PdObjects::write(&pd, key, None).unwrap();
+    }
+    let options = tidb_ddl_pdjournal::reconcile::Options::new("test-owner", tidb_ddl_pdjournal::pd::scope(&syncer), None);
+    let report = tidb_ddl_pdjournal::reconcile::reconcile_once(store.as_ref(), &pd, &options, &|| true).unwrap();
+    assert!(report.failed.is_empty(), "{report:?}");
+    for key in &written {
+        assert!(report.repaired.contains(key), "{key}: {report:?}");
+    }
+    assert_eq!(tidb_ddl_pdjournal::pd::PdObjects::read(&pd, &written).unwrap().len(), written.len());
+
+    // Drops and the range's reset leave tombstones PD agrees with.
+    for sql in ["drop resource group rg_journal", "alter range global placement policy default"] {
+        run(&mut session, sql);
+    }
+    let journaled = journal_records(store.as_ref());
+    for key in [&written[0], &written[3]] {
+        assert_eq!(journaled[key].value, None, "{key}");
+        assert!(!tidb_ddl_pdjournal::pd::PdObjects::read(&pd, std::slice::from_ref(key)).unwrap().contains_key(key), "{key}");
+    }
+
+    // Without the keyspace's cutover, a label rule's first mutation fails
+    // before PD and its job is cancelled; ALTER RANGE refuses too.
+    let (cutover, _) = tidb_ddl_pdjournal::journal::bootstrap_cutover_mutation(0);
+    store
+        .run_in_new_txn(&tidb_gocontext::Context::background(), "test", false, &mut |txn| txn.delete(&cutover))
+        .unwrap();
+    run(&mut session, "create table t_unseeded (c int)");
+    for sql in ["alter table t_unseeded attributes = 'merge_option=deny'", "alter range meta placement policy p_journal"] {
+        let refused = format!("{:?}", session.run(sql).err().unwrap_or_else(|| panic!("{sql} must be refused")));
+        assert!(refused.contains("PD journal cutover"), "{sql}: {refused}");
+    }
+    let unseeded = tidb_ddl_pdjournal::ObjectKey::label_rule(&tidb_ddl_label::new_rule_id(syncer.label_codec(), "test", "t_unseeded", ""));
+    let meta = range(tidb_placement::KEY_RANGE_META);
+    assert!(tidb_ddl_pdjournal::pd::PdObjects::read(&pd, &[unseeded, meta]).unwrap().is_empty(), "PD is untouched");
+}

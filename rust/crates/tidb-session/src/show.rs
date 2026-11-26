@@ -436,7 +436,20 @@ impl tidb_executor::admin::AdminExec for Session {
     }
 
     fn alter_range_stmt(&mut self, stmt: &tidb_ast::AlterRangeStmt) -> Result<StmtOutput, DriverError> {
-        self.with_planning_catalog(|is| tidb_executor::admin::execute_alter_range(stmt, is))?;
+        let store = self
+            .domain_services()
+            .and_then(|services| services.domain.upgrade())
+            .and_then(|domain| domain.meta_store.get().cloned())
+            .ok_or_else(|| {
+                DriverError::Mysql(tidb_terror::MysqlError::unknown(
+                    "ALTER RANGE needs the session's domain, whose meta store holds the PD journal".to_owned(),
+                ))
+            })?;
+        let journal = tidb_executor::admin::RangeJournal {
+            store: store.as_ref(),
+            owner: format!("session/{}", self.server_id()),
+        };
+        self.with_planning_catalog(|is| tidb_executor::admin::execute_alter_range(stmt, is, &journal))?;
         Ok(StmtOutput::Affected(0))
     }
 

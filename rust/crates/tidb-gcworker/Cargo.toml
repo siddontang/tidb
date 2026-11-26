@@ -14,6 +14,7 @@ workspace = true
 tidb-sqlexec = { path = "../tidb-sqlexec" }
 tidb-tablecodec = { path = "../tidb-tablecodec" }
 tidb-store-driver-txn = { path = "../tidb-store-driver-txn" }
+tidb-meta = { path = "../tidb-meta" }
 tidb-unistore-tikv = { path = "../tidb-unistore-tikv" }
 tidb-config-configtypes = { path = "../tidb-config-configtypes" }
 tidb-config-deploymode = { path = "../tidb-config-deploymode" }
@@ -37,6 +38,7 @@ tidb-datatype = { path = "../tidb-datatype" }
 tidb-session = { path = "../tidb-session" }
 tidb-ddl = { path = "../tidb-ddl" }
 tidb-ddl-label = { path = "../tidb-ddl-label" }
+tidb-ddl-pdjournal = { path = "../tidb-ddl-pdjournal" }
 chrono.workspace = true
 serde_json = { workspace = true }
 tikv-client.workspace = true

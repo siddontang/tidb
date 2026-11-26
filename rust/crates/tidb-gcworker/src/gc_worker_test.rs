@@ -274,8 +274,8 @@ impl GcRuleClient for FakeRules {
             .collect())
     }
 
-    fn delete_label_rules(&self, rule_ids: Vec<String>) -> GcResult<()> {
-        self.deleted_label_rules.lock().unwrap().push(rule_ids);
+    fn delete_label_rules(&self, rules: Vec<tidb_ddl_label::Rule>) -> GcResult<()> {
+        self.deleted_label_rules.lock().unwrap().push(rules.into_iter().map(|rule| rule.id).collect());
         Ok(())
     }
 }

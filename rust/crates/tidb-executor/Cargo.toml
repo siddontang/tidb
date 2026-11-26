@@ -179,6 +179,7 @@ tidb-ddl-session = { path = "../tidb-ddl-session" }
 tidb-ddl-jobsubmit = { path = "../tidb-ddl-jobsubmit" }
 tidb-ddl = { path = "../tidb-ddl" }
 tidb-ddl-label = { path = "../tidb-ddl-label" }
+tidb-ddl-pdjournal = { path = "../tidb-ddl-pdjournal" }
 tidb-domain = { path = "../tidb-domain" }
 tidb-replayer = { path = "../tidb-replayer" }
 tidb-planner-extstore = { path = "../tidb-planner-extstore" }

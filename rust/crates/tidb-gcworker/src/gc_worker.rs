@@ -1897,8 +1897,8 @@ impl GcJobContext {
         // TODO in Go too: the rules are read from PD and filtered.
         let rules = self.deps.rules.get_label_rules(&rule_ids)?;
         physical_table_ids.push(history_job.table_id);
-        let rule_ids = get_gc_rules(&physical_table_ids, &rules, self.deps.rules.label_codec().as_ref());
-        self.deps.rules.delete_label_rules(rule_ids)
+        let ids = get_gc_rules(&physical_table_ids, &rules, self.deps.rules.label_codec().as_ref());
+        self.deps.rules.delete_label_rules(ids.iter().filter_map(|id| rules.get(id).cloned()).collect())
     }
 }
 
