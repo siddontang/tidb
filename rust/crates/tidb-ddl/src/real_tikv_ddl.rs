@@ -55,6 +55,10 @@ pub use add_index_reorg::operators as backfilling_operators;
 mod backfilling;
 pub mod delete_range;
 mod external_delivery;
+pub(crate) mod pd_baseline;
+pub use pd_baseline::bootstrap_journal;
+#[cfg(test)]
+mod pd_journal_tests;
 
 /// Why a catalog change did not happen.
 #[derive(Clone, Debug)]
@@ -1566,7 +1570,17 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
     let mut run_error = step.run_error.map(|error| (error, step.error_count));
     let mut job = step.job;
     let mut write = step.write;
-    if write.check_constraint_validation.is_some() {
+    let codec = tidb_domain_infosync::info_syncer::store_codec(sess_pool.keyspace_id());
+    // A label rule or range bundle without a PD journal baseline fails the
+    // step before PD and cancels the job, as Go cancels one whose PD call failed.
+    let refused = transaction.snapshot().ok().and_then(|snapshot| {
+        let labels = write.label_rules.iter().map(|step| (&step.write, step.error_context)).collect::<Vec<_>>();
+        let objects = external_delivery::StepObjects { codec: codec.as_ref(), bundles: &write.placement_bundles, labels: &labels, resource_group: None };
+        external_delivery::refusal(SnapshotMetaSnapshot::new(snapshot), &objects)
+    });
+    let failure = if let Some(refused) = &refused {
+        Some(PersistedDdlJobFailure::Error(DdlPlanError::Encode(refused.clone())))
+    } else if write.check_constraint_validation.is_some() {
         let stage_action = || {
             transaction
                 .snapshot()
@@ -1587,62 +1601,91 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
                     Ok(())
                 })
         };
-        let staged = recover_ddl_action(stage_action);
-        let failure = match staged {
+        match recover_ddl_action(stage_action) {
             Ok(Ok(())) => None,
             Err(()) => Some(PersistedDdlJobFailure::Panic),
-            Ok(Err(error)) => Some(PersistedDdlJobFailure::Error(match error {
-                ClusterDdlError::Plan(error) => error,
-                error => DdlPlanError::Encode(error.to_string()),
-            })),
-        };
-        if let Some(failure) = failure {
-            let ddl_job_id = phase.ddl_job_id;
-            // Rust's planned metadata and staged rows are not applied until
-            // commit. Discard both, as Go resets failed action mutations, but
-            // keep this transaction's snapshot and conflict protection; the
-            // checkpoint's own statements stage into the fresh buffer.
-            buffer = MutationBuffer::new();
-            step_sql = Default::default();
-            let session = crate::job_txn::StepSession {
-                pool: Arc::clone(&sess_pool),
-                buffer: buffer.clone(),
-                sql: Arc::clone(&step_sql),
-                start_mode: backfiller.start_mode(),
-                step_ctx: Default::default(),
-            };
-            let checkpoint = plan_persisted_ddl_job_failure(
-                ddl_job_id, start_ts, failure, &job,
-                &|| refresh_ddl_error_count_limit(&*sess_pool, ddl_job_id), &session,
-            );
-            let checkpoint = match checkpoint {
-                Ok(checkpoint) => checkpoint,
-                Err(error) => {
-                    let _ = transaction.rollback();
-                    return Err(error.into());
-                }
-            };
-            write = checkpoint.write;
-            job = checkpoint.job;
-            persisted_job_terminal = checkpoint.terminal;
-            run_error = checkpoint
-                .run_error
-                .map(|error| (error, checkpoint.error_count));
+            Ok(Err(ClusterDdlError::Plan(error))) => Some(PersistedDdlJobFailure::Error(error)),
+            Ok(Err(error)) => Some(PersistedDdlJobFailure::Error(DdlPlanError::Encode(error.to_string()))),
         }
+    } else {
+        None
+    };
+    if let Some(failure) = failure {
+        let ddl_job_id = phase.ddl_job_id;
+        // Rust's planned metadata and staged rows are not applied until
+        // commit. Discard both, as Go resets failed action mutations, but
+        // keep this transaction's snapshot and conflict protection; the
+        // checkpoint's own statements stage into the fresh buffer.
+        buffer = MutationBuffer::new();
+        step_sql = Default::default();
+        let session = crate::job_txn::StepSession {
+            pool: Arc::clone(&sess_pool),
+            buffer: buffer.clone(),
+            sql: Arc::clone(&step_sql),
+            start_mode: backfiller.start_mode(),
+            step_ctx: Default::default(),
+        };
+        let limit = || if refused.is_some() { 0 } else { refresh_ddl_error_count_limit(&*sess_pool, ddl_job_id) };
+        let checkpoint = plan_persisted_ddl_job_failure(ddl_job_id, start_ts, failure, &job, &limit, &session);
+        let checkpoint = match checkpoint {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                let _ = transaction.rollback();
+                return Err(error.into());
+            }
+        };
+        write = checkpoint.write;
+        job = checkpoint.job;
+        persisted_job_terminal = checkpoint.terminal;
+        run_error = checkpoint
+            .run_error
+            .map(|error| (error, checkpoint.error_count));
     }
-    // The step's PD writes, before its catalog change commits; every
-    // definite abort from here undoes them ([`ExternalDelivery::compensate`]).
+    // The step's PD writes, journaled before they are made, whose records
+    // commit with the catalog change; every definite abort from here undoes
+    // them ([`ExternalDelivery::compensate`]).
     let mut delivery = external_delivery::ExternalDelivery::default();
+    let journal_pd = tidb_ddl_pdjournal::pd::InfoSyncerPd(tidb_domain_infosync::info_syncer::get());
     let abort = |delivery: &external_delivery::ExternalDelivery, cause: ClusterDdlError| {
-        match delivery.compensate(phase.check_owner, timeout) {
+        match delivery.compensate(phase.check_owner, &journal_pd) {
             Ok(()) => cause,
             Err(note) => ClusterDdlError::NotCommitted(format!("{cause}; and {note}")),
+        }
+    };
+    let label_steps = write.label_rules.iter().map(|step| (&step.write, step.error_context)).collect::<Vec<_>>();
+    let journal = external_delivery::StepJournal {
+        store: Arc::new(tidb_store_driver_txn::meta_txn::MetaStore::new(Arc::clone(&opener), timeout)),
+        attempt: tidb_ddl_pdjournal::journal::Attempt { op_id: format!("{owner_id}/{}/{start_ts}", phase.ddl_job_id),
+            owner: owner_id.to_owned(), job_id: phase.ddl_job_id, scope: tidb_ddl_pdjournal::pd::scope(&journal_pd.0) },
+    };
+    let step_objects = external_delivery::StepObjects {
+        codec: codec.as_ref(),
+        bundles: &write.placement_bundles,
+        labels: &label_steps,
+        resource_group: write.resource_group_update.as_ref().map(|update| (update.name(), update.desired())),
+    };
+    let snapshots = transaction.snapshot().and_then(|snapshot| Ok((snapshot, transaction.snapshot()?)));
+    let journal_records = snapshots.map_err(|error| error.to_string()).and_then(|(snapshot, catalog)| {
+        // The catalog baselines read the owner's image of the snapshot's
+        // version when it has one, else load it.
+        let catalog = match &phase.schema_state.info_cache {
+            Some(cache) => SnapshotMetaSnapshot::new(catalog).with_latest_info_schema(cache.get_latest()),
+            None => SnapshotMetaSnapshot::new(catalog),
+        };
+        let snapshots = (SnapshotMetaSnapshot::new(snapshot), catalog);
+        delivery.prepare_step(journal, snapshots, &step_objects, start_ts)
+    });
+    let journal_records = match journal_records {
+        Ok(records) => records,
+        Err(error) => {
+            let _ = transaction.rollback();
+            return Err(abort(&delivery, ClusterDdlError::NotCommitted(error)));
         }
     };
     let placement_target = match opener.store().pd_http_client() {
         Some(pd_http_client) => external_delivery::PlacementTarget::Pd {
             pd_http_client,
-            codec: tidb_domain_infosync::info_syncer::store_codec(sess_pool.keyspace_id()),
+            codec,
         },
         // Go `infosync.PutRuleBundlesWithDefaultRetry` on a node without
         // PD: the info syncer's `mockPlacementManager`.
@@ -1650,13 +1693,8 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
     };
     if let Err(error) = delivery.deliver_placement(placement_target, &write.placement_bundles, timeout) {
         let _ = transaction.rollback();
-        return Err(ClusterDdlError::NotCommitted(error));
+        return Err(abort(&delivery, ClusterDdlError::NotCommitted(error)));
     }
-    let label_steps = write
-        .label_rules
-        .iter()
-        .map(|step| (&step.write, step.error_context))
-        .collect::<Vec<_>>();
     if let Err(error) = delivery.deliver_label_rules(&label_steps) {
         let _ = transaction.rollback();
         return Err(abort(&delivery, ClusterDdlError::NotCommitted(error)));
@@ -1667,7 +1705,7 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
         return Err(abort(&delivery, ClusterDdlError::NotCommitted(error)));
     }
     if let Some(update) = &write.resource_group_update {
-        if let Err(error) = delivery.deliver_resource_group(update.name(), || update.apply()) {
+        if let Err(error) = update.apply() {
             let _ = transaction.rollback();
             return Err(abort(&delivery, ClusterDdlError::NotCommitted(error)));
         }
@@ -1697,8 +1735,11 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
         return Err(abort(&delivery, ClusterDdlError::SchemaSync(error)));
     }
     let planned_version = write.schema_version;
-    match transaction.commit_with(&buffer, write.mutations) {
+    let mut mutations = write.mutations;
+    mutations.extend(journal_records);
+    match transaction.commit_with(&buffer, mutations) {
         Ok(_) => {
+            delivery.committed();
             // Go `deleteTableAffinityGroupsInPD`: best-effort, once durable.
             write.affinity_groups.apply_delete();
             if planned_version != 0 {

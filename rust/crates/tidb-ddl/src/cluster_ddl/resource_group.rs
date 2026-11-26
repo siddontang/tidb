@@ -220,3 +220,14 @@ pub(super) fn on_drop_resource_group(
         SchemaState::NONE,
     )
 }
+
+impl ResourceGroupUpdate {
+    /// The group PD should hold after the write, `None` after a drop.
+    #[must_use]
+    pub fn desired(&self) -> Option<&tidb_proto::resource_manager::ResourceGroup> {
+        match self {
+            Self::Add(group) | Self::Modify(group) => Some(group),
+            Self::Delete(_) => None,
+        }
+    }
+}

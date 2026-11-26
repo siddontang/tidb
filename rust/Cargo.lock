@@ -5524,6 +5524,7 @@ dependencies = [
  "tidb-ddl-label",
  "tidb-ddl-logutil",
  "tidb-ddl-notifier",
+ "tidb-ddl-pdjournal",
  "tidb-ddl-resourcegroup",
  "tidb-ddl-serverstate",
  "tidb-ddl-session",

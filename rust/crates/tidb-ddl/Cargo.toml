@@ -111,6 +111,7 @@ tidb-unistore = { path = "../tidb-unistore" }
 tidb-vardef = { path = "../tidb-vardef" }
 
 tidb-ddl-label = { path = "../tidb-ddl-label" }
+tidb-ddl-pdjournal = { path = "../tidb-ddl-pdjournal" }
 tidb-ddl-resourcegroup = { path = "../tidb-ddl-resourcegroup" }
 tidb-codec = { path = "../tidb-codec" }
 tidb-ddl-notifier = { path = "../tidb-ddl-notifier" }

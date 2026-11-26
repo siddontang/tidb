@@ -161,14 +161,24 @@ fn publish<S: StoreClient>(
     let _ = transaction.rollback(&UnaryCallContext::with_timeout(timeout));
     let (write, bootstrap_pool) = crate::mysql_bootstrap::jobs::execute_on(opener, timeout, &environment, layout(), domain)
         .map_err(|error| error.to_string())?;
-    let transaction = opener.begin().map_err(|error| error.to_string())?;
+    let mut transaction = opener.begin().map_err(|error| error.to_string())?;
     let schema_version = write.schema_version;
     let splits = write.splits.clone();
     // The DML commit starts after all DDL jobs have completed.
     let call = UnaryCallContext::with_timeout(timeout);
     let resource_group_update = write.resource_group_update.clone();
+    // The default group's PD journal record and the keyspace's cutover commit
+    // with the bootstrap's catalog, before the resource manager write that
+    // `resource_group_update` replays (multi-keyspace design §6.2).
+    let mut mutations = write.mutations;
+    if let Some(group) = resource_group_update.desired() {
+        mutations.extend(tidb_ddl::real_tikv_ddl::bootstrap_journal(
+            &mut TransactionMetaSnapshot::new(&mut transaction, timeout),
+            group,
+        )?);
+    }
     let outcome = transaction
-        .commit(write.mutations, &call)
+        .commit(mutations, &call)
         .map_err(|error| error.to_string())?;
     // Go `bootstrap(s)`'s `doDMLWorks(s)` on the bootstrap domain the DDL ran
     // on; a caller that brought its own domain runs it on that domain's

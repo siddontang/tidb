@@ -1748,7 +1748,7 @@ where
             .owner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&owner));
-        owner.set_listener(Arc::clone(&scheduler) as Arc<dyn tidb_owner::Listener>);
+        owner.set_listener(tidb_ddl_pdjournal::owner::with_scheduler(Arc::new(tidb_store_driver_txn::meta_txn::MetaStore::new(Arc::clone(&opener), timeout)), { let pool = Arc::clone(&scheduler.session_pool); Arc::new(move || pool.info_syncer()) }, &owner, scheduler.clone()));
         crate::real_tikv_ddl::add_index_reorg::dist::register_backfill_task(Arc::new(
             crate::real_tikv_ddl::add_index_reorg::dist::BackfillDdl {
                 opener:opener.clone(),timeout,etcd:notifier.clone(),
