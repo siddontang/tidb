@@ -950,7 +950,12 @@ rule client. A tenant's PD effects then go through its own clients:
   owner's delayed write, so they need a seeded baseline before their first
   mutation: a keyspace bootstrapped with the journal records its cutover at
   bootstrap; an older keyspace needs the operator's cutover, which seeds a
-  record of each such object from PD at DDL owner takeover, once
+  record of each such object from PD at DDL owner takeover (only TiDB's
+  own: key-range rules whose ID is a table's or partition's,
+  `[keyspace/<id>/]schema/<db>/<table>[/<partition>]` for the keyspace's
+  codec, and the range bundles under their own group IDs; an operator's
+  rule, even under the keyspace's prefix, gets no record and is never
+  reverted), once
   `TIDB_PD_JOURNAL_CUTOVER` (`*` or keyspace IDs) says the writers that
   bypass the journal (nodes of an older build) are drained; no writer of
   this build touches such an object before. Until then such a mutation

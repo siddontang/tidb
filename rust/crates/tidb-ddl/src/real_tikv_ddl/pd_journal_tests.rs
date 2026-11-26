@@ -794,3 +794,60 @@ fn an_unreadable_object_does_not_hold_up_the_others_repair() {
     assert_eq!(tenant.reconcile("owner-b").repaired, [broken.clone()]);
     assert_eq!(tenant.pd.get(&broken), Some(broken_value));
 }
+
+/// At the operator's cutover PD holds a TiDB table rule and the keyspace's
+/// global range bundle beside an operator's own rule under the keyspace's
+/// prefix (and one shaped like half a TiDB ID) and an operator's bundle:
+/// only TiDB's rule and range bundle get a record, and editing the
+/// operator's objects is never reverted, while a change of TiDB's rule is.
+#[test]
+fn the_cutover_adopts_only_tidbs_own_rules_and_range_bundles() {
+    use tidb_ddl_pdjournal::owner::seed_from_pd;
+    use tidb_ddl_pdjournal::pd::InfoSyncerPd;
+
+    let shared = Arc::new(SharedPd::default());
+    let tenant = Tenant::new(&shared, 1);
+    let syncer = Arc::new(tidb_domain_infosync::info_syncer::InfoSyncer::new(1));
+    let pd = InfoSyncerPd(Arc::clone(&syncer));
+    let (tidb_key, tidb_value) = label(1, "t", "deny");
+    let (range_key, range_value) = range_bundle(1, tidb_placement::KEY_RANGE_GLOBAL, 1);
+    // The keyspace's rule prefix (`keyspace/1/` where rules are keyspace
+    // aware, else empty).
+    let prefix = tidb_ddl_label::new_rule_id(syncer.label_codec(), "", "", "").trim_end_matches("schema//").to_owned();
+    let operator_rule = |id: &str, merge: &str| {
+        let (_, mut value) = label(1, "t_operator", merge);
+        value["id"] = PdValue::String(id.to_owned());
+        (ObjectKey::label_rule(id), value)
+    };
+    let operators = [
+        operator_rule(&format!("{prefix}operator/hot"), "deny"),
+        operator_rule(&format!("{prefix}schema/only_db"), "deny"),
+    ];
+    let mut operator_bundle = range_value.clone();
+    operator_bundle["group_id"] = PdValue::String("operator_group".to_owned());
+    let operator_bundle_key = ObjectKey::placement_bundle("operator_group");
+    for (key, value) in [(&tidb_key, &tidb_value), (&range_key, &range_value), (&operator_bundle_key, &operator_bundle)]
+        .into_iter()
+        .chain(operators.iter().map(|(key, value)| (key, value)))
+    {
+        pd.write(key, Some(value)).unwrap();
+    }
+    let everything = [&tidb_key, &range_key, &operator_bundle_key, &operators[0].0, &operators[1].0].map(Clone::clone);
+    assert_eq!(pd.read(&everything).unwrap().len(), everything.len(), "PD holds every object");
+
+    assert_eq!(seed_from_pd(tenant.store.as_ref(), &syncer).unwrap(), Some(2));
+    assert!(tenant.record(&tidb_key).is_some() && tenant.record(&range_key).is_some());
+    for key in [&operator_bundle_key, &operators[0].0, &operators[1].0] {
+        assert_eq!(tenant.record(key), None, "{key} is the operator's");
+    }
+
+    let (_, edited) = operator_rule(&operators[0].0.id, "allow");
+    pd.write(&operators[0].0, Some(&edited)).unwrap();
+    let (_, changed) = label(1, "t", "allow");
+    pd.write(&tidb_key, Some(&changed)).unwrap();
+    let report = reconcile_once(tenant.store.as_ref(), &pd, &tenant.options("owner-b"), &|| true).unwrap();
+    assert_eq!(report.repaired, [tidb_key.clone()], "{report:?}");
+    let held = pd.read(&everything).unwrap();
+    assert!(tidb_ddl_pdjournal::normalize::in_sync(&operators[0].0, Some(&edited), held.get(&operators[0].0), Some(1)).unwrap());
+    assert!(tidb_ddl_pdjournal::normalize::in_sync(&tidb_key, Some(&tidb_value), held.get(&tidb_key), Some(1)).unwrap());
+}

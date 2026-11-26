@@ -39,13 +39,31 @@ fn cutover_asked(keyspace_id: Option<u32>) -> bool {
     })
 }
 
-/// The keyspace's PD-only objects PD holds now: its label rules and its
-/// range bundles.
+/// Whether `rule` is one TiDB writes for this keyspace: a key-range rule
+/// whose ID is a table's or partition's (`[keyspace/<id>/]schema/<db>/<table>
+/// [/<partition>]`, as [`tidb_ddl_label::new_rule_id`] builds it for the
+/// keyspace's codec). An operator's own rule, even under the keyspace's
+/// prefix, stays outside the journal.
+fn tidb_rule(syncer: &InfoSyncer, rule: &tidb_ddl_label::Rule) -> bool {
+    let prefix = tidb_ddl_label::new_rule_id(syncer.label_codec(), "", "", "");
+    let prefix = format!("{}/", prefix.trim_end_matches('/'));
+    rule.rule_type == tidb_ddl_label::RULE_TYPE
+        && rule.id.strip_prefix(&prefix).is_some_and(|names| {
+            let names = names.split('/').collect::<Vec<_>>();
+            (2..=3).contains(&names.len()) && names.iter().all(|name| !name.is_empty())
+        })
+}
+
+/// The keyspace's PD-only objects PD holds now that TiDB wrote: its tables'
+/// and partitions' label rules ([`tidb_rule`]) and its range bundles (read
+/// by their own group IDs only, so no other group is adopted).
 fn pd_only_objects(syncer: &InfoSyncer) -> Result<BTreeMap<ObjectKey, PdValue>, String> {
     let mut objects = BTreeMap::new();
     let rules = syncer.label_rule_manager().get_all_label_rules(syncer.label_codec())?;
     for rule in tidb_domain_infosync::label_manager::filter_rules_by_keyspace(rules, syncer.label_codec()) {
-        objects.insert(ObjectKey::label_rule(&rule.id), label_rule_value(&rule));
+        if tidb_rule(syncer, &rule) {
+            objects.insert(ObjectKey::label_rule(&rule.id), label_rule_value(&rule));
+        }
     }
     for range in [tidb_placement::KEY_RANGE_GLOBAL, tidb_placement::KEY_RANGE_META] {
         let mut bundle = tidb_placement::Bundle::default();
@@ -58,6 +76,16 @@ fn pd_only_objects(syncer: &InfoSyncer) -> Result<BTreeMap<ObjectKey, PdValue>, 
     Ok(objects)
 }
 
+/// Seeds the cutover of the keyspace `syncer` serves from what PD holds of
+/// TiDB's own PD-only objects ([`crate::journal::seed_cutover`]); answers
+/// how many records it seeded, `None` after an earlier cutover.
+///
+/// # Errors
+/// PD or the journal could not be read, or the seeding not committed.
+pub fn seed_from_pd(store: &dyn tidb_meta::MetaStore, syncer: &InfoSyncer) -> Result<Option<usize>, String> {
+    pd_only_objects(syncer).and_then(|objects| crate::journal::seed_cutover(store, &objects))
+}
+
 /// The operator's cutover of the keyspace `syncer` serves, when
 /// [`CUTOVER_VARIABLE`] names it and the keyspace had none: seeds a record
 /// for each of its PD-only objects from PD. No attempt of this build writes
@@ -67,7 +95,7 @@ fn cutover_if_asked(store: &dyn tidb_meta::MetaStore, syncer: &InfoSyncer) {
     if !cutover_asked(syncer.keyspace_id()) {
         return;
     }
-    let seeded = pd_only_objects(syncer).and_then(|objects| crate::journal::seed_cutover(store, &objects));
+    let seeded = seed_from_pd(store, syncer);
     let keyspace = tidb_log::Field::new("keyspace", tidb_log::Value::Str(format!("{:?}", syncer.keyspace_id())));
     let logger = tidb_logutil::bg_logger();
     match seeded {
