@@ -32,6 +32,17 @@ pub type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
 /// record each holds now.
 pub type Moved = Vec<(ObjectKey, Option<Record>)>;
 
+/// Why [`Prepared::finalize`] commits nothing.
+#[derive(Debug)]
+pub enum Refusal {
+    /// The records moved since the prepare.
+    Moved(Moved),
+    /// The attempt's intents on these objects are no longer there: an abort
+    /// (the owner's reconciler, or the attempt's own compensation) resolved
+    /// them, so the attempt must not report success.
+    Resolved(Vec<ObjectKey>),
+}
+
 /// Reads of the journal's keys, from a meta transaction or a DDL step's
 /// snapshot.
 pub trait JournalRead {
@@ -145,12 +156,46 @@ pub(crate) fn put_record(txn: &mut dyn MetaTransaction, record: &Record) -> Resu
     txn.set(key, value).map_err(|error| error.to_string())
 }
 
-pub(crate) fn delete_record(txn: &mut dyn MetaTransaction, key: &ObjectKey) -> Result<(), String> {
-    txn.delete(&record_key(key)).map_err(|error| error.to_string())
-}
-
 pub(crate) fn delete_intent(txn: &mut dyn MetaTransaction, intent: &Intent) -> Result<(), String> {
     txn.delete(&intent_key(&intent.key, &intent.op_id)).map_err(|error| error.to_string())
+}
+
+/// Whether `intent` itself, as prepared, is still outstanding in `txn`.
+fn outstanding(txn: &mut dyn MetaTransaction, intent: &Intent) -> Result<bool, String> {
+    let held = txn.get(&intent_key(&intent.key, &intent.op_id)).map_err(|error| error.to_string())?;
+    Ok(held.as_deref().map(decode::<Intent>).transpose()?.is_some_and(|held| held.generation == intent.generation))
+}
+
+/// Resolves the aborted `intent` durably in `txn`, which also removes it:
+/// unless its op committed or a later generation superseded it, the
+/// object's record moves to a generation above the intent's and holds the
+/// baseline (the record's value, or the intent's pre-image for an object
+/// without one; a tombstone when that was absent). A write of the attempt
+/// that lands later is then a divergence from a recorded value, which the
+/// reconciler reverts, and a delayed commit of the attempt conflicts with
+/// the record or fails its compare. Answers whether the op had committed.
+pub(crate) fn resolve_aborted(txn: &mut dyn MetaTransaction, intent: &Intent) -> Result<bool, String> {
+    let record = read_record(&mut TxnRead(&mut *txn), &intent.key)?;
+    let committed = record.as_ref().is_some_and(|record| record.op_id == intent.op_id);
+    let superseded = record.as_ref().is_some_and(|record| record.generation >= intent.generation);
+    if !committed && !superseded {
+        let value = match record {
+            Some(record) => record.value,
+            None => intent.pre_image.clone(),
+        };
+        put_record(
+            txn,
+            &Record {
+                key: intent.key.clone(),
+                generation: intent.generation + 1,
+                op_id: format!("aborted:{}", intent.op_id),
+                value,
+                at_ms: wall_ms(),
+            },
+        )?;
+    }
+    delete_intent(txn, intent)?;
+    Ok(committed)
 }
 
 /// Runs `body` in one fresh meta transaction of `store`, without retrying a
@@ -392,8 +437,24 @@ impl Prepared {
             .collect()
     }
 
-    /// Removes the intents once the attempt is resolved (committed, or its
-    /// pre-images restored).
+    /// Resolves the attempt's definite abort durably ([`resolve_aborted`])
+    /// and removes its intents, in one transaction.
+    ///
+    /// # Errors
+    /// The transaction failed; the reconciler resolves the intents.
+    pub fn abort(&self, store: &dyn MetaStore) -> Result<(), String> {
+        if self.intents.is_empty() {
+            return Ok(());
+        }
+        run(store, &mut |txn| {
+            for intent in &self.intents {
+                resolve_aborted(txn, intent)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Removes the intents once the attempt committed its records.
     ///
     /// # Errors
     /// The removal failed; the reconciler resolves the intents.
@@ -432,17 +493,28 @@ impl Prepared {
     }
 
     /// Commits the attempt's records in a meta transaction of its own,
-    /// provided each record is still the one the prepare read, and removes
-    /// the intents. Answers the objects whose record moved, with the record
-    /// now there, when it does not commit for that reason.
+    /// provided each of its intents is still outstanding exactly as
+    /// prepared (op and generation) and each record is still the one the
+    /// prepare read, and removes the intents. Answers why nothing committed
+    /// otherwise.
     ///
     /// # Errors
     /// The transaction failed (its outcome may be unknown).
-    pub fn finalize(&self, store: &dyn MetaStore) -> Result<Result<(), Moved>, String> {
-        let mut moved = Vec::new();
+    pub fn finalize(&self, store: &dyn MetaStore) -> Result<Result<(), Refusal>, String> {
+        let mut refusal = None;
         run(store, &mut |txn| {
-            moved.clear();
-            let start_ms = wall_ms();
+            refusal = None;
+            let mut resolved = Vec::new();
+            for intent in &self.intents {
+                if !outstanding(txn, intent)? {
+                    resolved.push(intent.key.clone());
+                }
+            }
+            if !resolved.is_empty() {
+                refusal = Some(Refusal::Resolved(resolved));
+                return Ok(());
+            }
+            let mut moved = Vec::new();
             for (intent, read) in self.intents.iter().zip(&self.read) {
                 let current = read_record(&mut TxnRead(&mut *txn), &intent.key)?;
                 let found = current.as_ref().map(|record| (record.generation, record.op_id.clone()));
@@ -451,9 +523,10 @@ impl Prepared {
                 }
             }
             if !moved.is_empty() {
+                refusal = Some(Refusal::Moved(moved));
                 return Ok(());
             }
-            for record in self.records(start_ms) {
+            for record in self.records(wall_ms()) {
                 put_record(txn, &record)?;
             }
             for intent in &self.intents {
@@ -461,7 +534,7 @@ impl Prepared {
             }
             Ok(())
         })?;
-        Ok(if moved.is_empty() { Ok(()) } else { Err(moved) })
+        Ok(refusal.map_or(Ok(()), Err))
     }
 }
 

@@ -904,14 +904,20 @@ rule client. A tenant's PD effects then go through its own clients:
   transaction (`DdlWrite.mutations`), so they commit with the catalog
   change or not at all, and racing attempts conflict on the record key;
   ALTER RANGE (global and meta, a policy or `DEFAULT`) and GC's deletes
-  commit them in a small meta transaction that compares the generation
-  the intent was prepared against, so a delayed session cannot commit over
-  its successor and SQL succeeds only after that commit; the bootstrap
-  commits the default group's record (and the keyspace's cutover) with its
-  catalog. A definite abort puts every object's pre-image back (a failed or
-  unanswered PD write counts as applied) and drops the intents; an
-  undetermined commit leaves them. Only the owner undoes; a lost owner
-  leaves PD and its intents to the successor.
+  commit them in a small meta transaction that commits only while the
+  attempt's own intents (op ID and generation) are still outstanding and
+  over the generation they were prepared against, so a delayed session
+  cannot commit over its successor, nor after an abort resolved it, and
+  SQL succeeds only after that commit; the bootstrap commits the default
+  group's record (and the keyspace's cutover) with its catalog. A definite
+  abort (a job step's, a session's compensation, or the reconciler's)
+  puts every object's pre-image back (a failed or unanswered PD write
+  counts as applied) and removes the intents only in the transaction that
+  moves the record above the attempt's generation, holding the baseline (a
+  tombstone for an object that did not exist), so the attempt's write that
+  PD applies later is a divergence the reconciler reverts; an undetermined
+  commit leaves the intents. Only the owner undoes; a lost owner leaves PD
+  and its intents to the successor.
 
   The current DDL owner reconciles at takeover and every 30 s
   (`reconcile::SCAN_INTERVAL`; a node without PD, whose objects live in the
@@ -923,8 +929,12 @@ rule client. A tenant's PD effects then go through its own clients:
   which keeps every range bound and the keyspace-qualified IDs; PD-only
   fields and defaults compare equal, a cleared field or another tenant's
   range never does) and rewrites and reads back what differs. It never acts
-  on an object without a record, and keeps tombstones for 24 h against a
-  delayed resurrection. A late write stays in PD for at most the interval
+  on an object without a record. Records are never deleted: a request PD
+  accepted late can complete at any time, which no lease or timeout
+  bounds, so a deleted object's tombstone (key, generation, op ID, no
+  value; about a hundred bytes of the keyspace's meta for every object
+  ever deleted or aborted while absent) stays until a newer record of the
+  same object replaces it. A late write stays in PD for at most the interval
   plus one pass (a journal scan, one PD read per record, and per differing
   object a re-read, a write and a read back, each bounded by the PD
   client's timeout); a failed repair adds an interval per retry. Within the

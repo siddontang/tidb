@@ -36,9 +36,13 @@
 //! change, and by the non-job writers (ALTER RANGE, GC, bootstrap) in a small
 //! meta transaction that compares the generation it prepared against
 //! ([`direct`]). Racing attempts write the same record key, so the
-//! transaction layer lets one of them commit. An abort leaves the record at
-//! its previous generation and puts the pre-image back into PD; a lost PD
-//! reply counts as applied.
+//! transaction layer lets one of them commit. An abort puts the pre-image
+//! back into PD and removes its intents only in the transaction that moves
+//! the record above the attempt's generation, holding the baseline (a
+//! tombstone for an object that was absent), so a write of the attempt that
+//! lands later is a divergence the reconciler reverts; a lost PD reply
+//! counts as applied. Records are never deleted: a tombstone stays until a
+//! newer record of its object replaces it.
 //!
 //! The current DDL owner reconciles ([`reconcile`]) at takeover and every
 //! [`reconcile::SCAN_INTERVAL`]: it resolves the intents no live attempt

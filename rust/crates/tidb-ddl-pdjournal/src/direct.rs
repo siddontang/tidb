@@ -13,16 +13,19 @@
 // limitations under the License.
 
 //! The writers outside a DDL job (ALTER RANGE, GC's deletes): intent, PD,
-//! then the records in a small meta transaction that commits only over the
-//! generations the intent was prepared against. Two sessions that prepare
-//! the same range both write PD, but only the first to finalize commits; the
+//! then the records in a small meta transaction that commits only while the
+//! attempt's intents are still outstanding as prepared and over the
+//! generations they were prepared against. Two sessions that prepare the
+//! same range both write PD, but only the first to finalize commits; the
 //! other is refused, puts the record that won back into PD, and reports it.
+//! An attempt that an abort resolved (its own, or the owner's reconciler's)
+//! is refused too, and never reports success.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tidb_meta::MetaStore;
 
-use crate::journal::{self, Attempt, Planned, TxnRead};
+use crate::journal::{self, Attempt, Planned, Refusal, TxnRead};
 use crate::pd::PdObjects;
 use crate::record::wall_ms;
 use crate::JournalError;
@@ -38,9 +41,10 @@ fn next_op_id(owner: &str, at_ms: u64) -> String {
 ///
 /// # Errors
 /// [`JournalError::NoBaseline`] (PD untouched), a failed PD write (the
-/// pre-images are put back), a record that moved since the prepare (the
-/// winner's value is put back), or a failed final commit (the reconciler
-/// resolves it).
+/// pre-images are put back and the abort recorded), a record that moved
+/// since the prepare (the winner's value is put back), an attempt the
+/// owner's reconciler aborted meanwhile (the records' values are put back),
+/// or a failed final commit (the reconciler resolves it).
 pub fn write_through(
     store: &dyn MetaStore,
     pd: &dyn PdObjects,
@@ -73,34 +77,51 @@ pub fn write_through(
     })
     .map_err(|error| refused.take().unwrap_or(JournalError::Storage(error)))?;
     let prepared = prepared.expect("a committed prepare planned");
+    // A write that failed may still land; the abort records the baseline
+    // first, so the reconciler reverts it.
+    let abort = |detail: String| {
+        let mut detail = detail;
+        if let Err(error) = prepared.restore_pre_images(pd) {
+            detail.push_str(&format!("; restoring the previous values failed: {error}"));
+        }
+        if let Err(error) = prepared.abort(store) {
+            detail.push_str(&format!("; recording the abort failed, the reconciler resolves it: {error}"));
+        }
+        JournalError::Storage(detail)
+    };
     for intent in prepared.intents() {
         if let Err(error) = pd.write(&intent.key, intent.value.as_ref()) {
-            let mut detail = format!("writing {}: {error}", intent.key);
-            match prepared.restore_pre_images(pd) {
-                Ok(()) => {
-                    let _ = prepared.clear_intents(store);
-                }
-                Err(restore) => detail.push_str(&format!("; and restoring the previous values failed: {restore}")),
-            }
-            return Err(JournalError::Storage(detail));
+            return Err(abort(format!("writing {}: {error}", intent.key)));
         }
     }
     match prepared.finalize(store) {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(moved)) => {
+        Ok(Err(Refusal::Moved(moved))) => {
             // Nothing committed: every object goes back to its pre-image,
             // and the ones that moved to the record that won.
-            let mut detail = String::from("a concurrent change committed first:");
-            if let Err(error) = prepared.restore_pre_images(pd) {
-                detail = format!("restoring the previous values failed ({error}); {detail}");
-            }
+            let mut error = abort(String::from("a concurrent change committed first:"));
             for (key, record) in &moved {
-                detail.push_str(&format!(" {key}"));
-                if let Err(error) = pd.write(key, record.as_ref().and_then(|record| record.value.as_ref())) {
-                    detail.push_str(&format!(" (putting its value back failed: {error})"));
+                if let Err(write) = pd.write(key, record.as_ref().and_then(|record| record.value.as_ref())) {
+                    error = JournalError::Storage(format!("{error}; putting {key} back failed: {write}"));
                 }
             }
-            let _ = prepared.clear_intents(store);
+            Err(error)
+        }
+        Ok(Err(Refusal::Resolved(keys))) => {
+            // An abort resolved the attempt and recorded each object's
+            // baseline; PD gets the records back (the reconciler would too).
+            let mut detail = format!("the write was aborted before it committed: {keys:?}");
+            match read_current(store, &keys) {
+                Ok((records, _)) => {
+                    for key in &keys {
+                        let value = records.get(key).and_then(|record| record.value.as_ref());
+                        if let Err(error) = pd.write(key, value) {
+                            detail.push_str(&format!("; putting {key} back failed: {error}"));
+                        }
+                    }
+                }
+                Err(error) => detail.push_str(&format!("; reading the records failed: {error}")),
+            }
             Err(JournalError::Storage(detail))
         }
         Err(error) => Err(JournalError::Storage(format!(

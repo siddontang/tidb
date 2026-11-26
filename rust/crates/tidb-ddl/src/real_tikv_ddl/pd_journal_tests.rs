@@ -72,19 +72,36 @@ struct SharedPd {
     writes: Mutex<Vec<(u32, ObjectKey)>>,
 }
 
+impl SharedPd {
+    fn set(&self, tenant: u32, key: &ObjectKey, value: Option<PdValue>) {
+        let mut objects = self.objects.lock().unwrap();
+        match value {
+            Some(value) => objects.insert((tenant, key.clone()), value),
+            None => objects.remove(&(tenant, key.clone())),
+        };
+    }
+}
+
 /// One tenant's client of [`SharedPd`]: it can hold back its next write of
-/// an object, and lose the reply to one (applied, but answered with an
-/// error).
+/// an object, time one out while PD applies it later, and lose the reply to
+/// one (applied, but answered with an error).
 struct TenantPd {
     shared: Arc<SharedPd>,
     tenant: u32,
     held: Mutex<HashMap<ObjectKey, Arc<Gate>>>,
+    delayed: Mutex<HashMap<ObjectKey, Arc<Gate>>>,
     lose_reply: AtomicBool,
 }
 
 impl TenantPd {
     fn new(shared: &Arc<SharedPd>, tenant: u32) -> Self {
-        Self { shared: Arc::clone(shared), tenant, held: Mutex::default(), lose_reply: AtomicBool::new(false) }
+        Self {
+            shared: Arc::clone(shared),
+            tenant,
+            held: Mutex::default(),
+            delayed: Mutex::default(),
+            lose_reply: AtomicBool::new(false),
+        }
     }
 
     fn get(&self, key: &ObjectKey) -> Option<PdValue> {
@@ -92,11 +109,24 @@ impl TenantPd {
     }
 
     fn set(&self, key: &ObjectKey, value: Option<PdValue>) {
-        let mut objects = self.shared.objects.lock().unwrap();
-        match value {
-            Some(value) => objects.insert((self.tenant, key.clone()), value),
-            None => objects.remove(&(self.tenant, key.clone())),
-        };
+        self.shared.set(self.tenant, key, value);
+    }
+
+    /// Times the next write of `key` out at once; PD applies it when the
+    /// gate is released.
+    fn delay(&self, key: &ObjectKey) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        self.delayed.lock().unwrap().insert(key.clone(), Arc::clone(&gate));
+        gate
+    }
+
+    /// Waits until PD holds `value` under `key`.
+    fn wait_for(&self, key: &ObjectKey, value: &PdValue) {
+        let started = Instant::now();
+        while self.get(key).as_ref() != Some(value) {
+            assert!(started.elapsed() < TIMEOUT, "{key}: the delayed write never landed");
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     /// Waits until a writer is blocked on the hold of `key`.
@@ -120,6 +150,16 @@ impl PdObjects for TenantPd {
     }
 
     fn write(&self, key: &ObjectKey, value: Option<&PdValue>) -> Result<(), String> {
+        let delayed = self.delayed.lock().unwrap().remove(key);
+        if let Some(gate) = delayed {
+            let (shared, tenant, key, value) = (Arc::clone(&self.shared), self.tenant, key.clone(), value.cloned());
+            std::thread::spawn(move || {
+                gate.wait();
+                shared.set(tenant, &key, value);
+                shared.writes.lock().unwrap().push((tenant, key));
+            });
+            return Err("PD did not answer in time".to_owned());
+        }
         let gate = self.held.lock().unwrap().remove(key);
         if let Some(gate) = gate {
             gate.wait();
@@ -191,6 +231,15 @@ impl Tenant {
             })
             .unwrap();
         count
+    }
+
+    /// Deletes the record of `key`, as the expiry of a tombstone did before
+    /// tombstones were kept.
+    fn forget_record(&self, key: &ObjectKey) {
+        let (raw, _) = journal::record_mutation(&self.record(key).unwrap());
+        self.store
+            .run_in_new_txn(&tidb_gocontext::Context::background(), "test", false, &mut |txn| txn.delete(&raw))
+            .unwrap();
     }
 
     fn cutover(&self) {
@@ -274,6 +323,17 @@ fn label(tenant: u32, table: &str, merge: &str) -> (ObjectKey, PdValue) {
         .unwrap();
     rule.reset(&codec, "db", table, "", &[100]);
     (ObjectKey::label_rule(&rule.id), label_rule_value(&rule))
+}
+
+/// `tenant`'s bundle of the range `range` (global or meta).
+fn range_bundle(tenant: u32, range: &str, followers: u64) -> (ObjectKey, PdValue) {
+    let settings = tidb_model::placement::PlacementSettings { followers, ..Default::default() };
+    let mut bundle = tidb_placement::new_bundle_from_options(Some(&settings)).unwrap();
+    bundle.rebuild_for_range(range, "p");
+    let codec = tidb_domain_infosync::info_syncer::store_codec(tenant);
+    let encoded = tidb_domain_infosync::placement_manager::encode_bundle(codec.as_ref(), &bundle).unwrap();
+    let (key, value) = bundle_entry(&encoded);
+    (key, value.unwrap())
 }
 
 fn group(name: &str, priority: u32) -> (ObjectKey, PdValue) {
@@ -415,7 +475,7 @@ fn a_crashed_step_is_resolved_from_its_records() {
         let report = tenant.reconcile("owner-b");
         assert_eq!(report.aborted, 1, "{key}: {report:?}");
         assert_eq!(tenant.pd.get(&key), Some(v0.clone()));
-        assert_eq!(tenant.record(&key).unwrap().generation, generation + 1, "the attempt's generation is burned");
+        assert_eq!(tenant.record(&key).unwrap().generation, generation + 2, "the record moves above the attempt's generation");
 
         // After PD applied, before the reply.
         let step = begin_step(&tenant, "owner-a", elsewhere(&tenant), &[set(&key, &v1)]).unwrap();
@@ -529,17 +589,8 @@ fn a_delayed_alter_range_cannot_commit_over_its_successor() {
     let shared = Arc::new(SharedPd::default());
     let tenant = Arc::new(Tenant::new(&shared, 1));
     tenant.cutover();
-    let codec = tidb_domain_infosync::info_syncer::store_codec(1);
-    let range_bundle = |followers: u64| {
-        let settings = tidb_model::placement::PlacementSettings { followers, ..Default::default() };
-        let mut bundle = tidb_placement::new_bundle_from_options(Some(&settings)).unwrap();
-        bundle.rebuild_for_range(tidb_placement::KEY_RANGE_GLOBAL, "p");
-        let encoded = tidb_domain_infosync::placement_manager::encode_bundle(codec.as_ref(), &bundle).unwrap();
-        let (key, value) = bundle_entry(&encoded);
-        (key, value.unwrap())
-    };
-    let (key, first) = range_bundle(1);
-    let (_, second) = range_bundle(2);
+    let (key, first) = range_bundle(1, tidb_placement::KEY_RANGE_GLOBAL, 1);
+    let (_, second) = range_bundle(1, tidb_placement::KEY_RANGE_GLOBAL, 2);
     let gate = tenant.pd.hold(&key);
     let delayed = {
         let tenant = Arc::clone(&tenant);
@@ -578,4 +629,121 @@ fn a_gc_delete_needs_the_generation_it_chose() {
         .to_string();
     assert!(refused.contains("changed since it was chosen"), "{refused}");
     assert_eq!(tenant.pd.get(&key), Some(reused));
+}
+
+/// The first ALTER RANGE after the cutover: PD times out with the write in
+/// flight, and the session's compensation removes the bundle and records
+/// the abort -- a tombstone above the attempt's generation, since the range
+/// had none. A pass agrees with it and keeps it; when the original write
+/// lands later, the next pass reverts it.
+#[test]
+fn a_timed_out_first_alter_range_is_reverted_when_its_write_lands() {
+    let shared = Arc::new(SharedPd::default());
+    let tenant = Tenant::new(&shared, 1);
+    tenant.cutover();
+    let (key, value) = range_bundle(1, tidb_placement::KEY_RANGE_GLOBAL, 1);
+    let landing = tenant.pd.delay(&key);
+    let failed = tidb_ddl_pdjournal::direct::write_through(tenant.store.as_ref(), tenant.pd.as_ref(), "session/1", tenant.scope, &[set(&key, &value)])
+        .unwrap_err()
+        .to_string();
+    assert!(failed.contains("did not answer"), "{failed}");
+    assert_eq!(tenant.pd.get(&key), None);
+    assert_eq!(tenant.intents(), 0);
+    let record = tenant.record(&key).expect("the abort records the baseline");
+    assert_eq!((record.generation, record.value), (2, None));
+    let report = tenant.reconcile("owner-b");
+    assert_eq!((report.in_sync, report.repaired.len()), (1, 0), "{report:?}");
+
+    landing.release();
+    tenant.pd.wait_for(&key, &value);
+    let report = tenant.reconcile("owner-b");
+    assert_eq!(report.repaired, [key.clone()], "{report:?}");
+    assert_eq!(tenant.pd.get(&key), None);
+    assert_eq!(tenant.record(&key).unwrap().generation, 2, "the tombstone stays");
+}
+
+/// A job step's first write of a label rule after the cutover times out
+/// with the write in flight, and the step is definitely aborted: its
+/// compensation records the abort, and the reconciler reverts the write
+/// when it lands.
+#[test]
+fn a_timed_out_first_step_write_is_reverted_when_it_lands() {
+    let shared = Arc::new(SharedPd::default());
+    let tenant = Tenant::new(&shared, 1);
+    tenant.cutover();
+    let (key, value) = label(1, "t_late", "deny");
+    let mut delivery = ExternalDelivery::default();
+    let txn_reader = &mut tenant.opener.begin().unwrap();
+    let start_ts = txn_reader.start_ts();
+    delivery
+        .prepare(
+            StepJournal {
+                store: Arc::clone(&tenant.store),
+                attempt: Attempt { op_id: format!("owner-a/1/{start_ts}"), owner: "owner-a".to_owned(), job_id: 1, scope: tenant.scope },
+            },
+            &mut SnapshotRead(&mut TransactionMetaSnapshot::new(txn_reader, TIMEOUT)),
+            &[set(&key, &value)],
+            &mut |_| Ok(BTreeMap::new()),
+            start_ts >> 18,
+        )
+        .unwrap();
+    let landing = tenant.pd.delay(&key);
+    assert!(tenant.pd.write(&key, Some(&value)).is_err());
+    delivery.compensate(&|| Ok(()), tenant.pd.as_ref()).unwrap();
+    assert_eq!(tenant.pd.get(&key), None);
+    assert_eq!(tenant.intents(), 0);
+    let record = tenant.record(&key).expect("the abort records the baseline");
+    assert_eq!((record.generation, record.value), (2, None));
+    // The step is over: its hold on the rule goes.
+    drop(delivery);
+
+    landing.release();
+    tenant.pd.wait_for(&key, &value);
+    let report = tenant.reconcile("owner-b");
+    assert_eq!(report.repaired, [key.clone()], "{report:?}");
+    assert_eq!(tenant.pd.get(&key), None);
+}
+
+/// An ALTER RANGE session of another node prepared against absence, and its
+/// PD write was held until after the owner's reconciler aborted its intent:
+/// its finalize is refused (the SQL statement fails) and PD gets the
+/// tombstone back, which further passes keep. Its intent is gone, so it is
+/// refused even where the tombstone is gone too (as its expiry left it
+/// before tombstones were kept).
+#[test]
+fn an_alter_range_the_owner_aborted_never_reports_success() {
+    let shared = Arc::new(SharedPd::default());
+    let tenant = Arc::new(Tenant::new(&shared, 1));
+    tenant.cutover();
+    for (range, forget) in [(tidb_placement::KEY_RANGE_GLOBAL, false), (tidb_placement::KEY_RANGE_META, true)] {
+        let (key, value) = range_bundle(1, range, 1);
+        let gate = tenant.pd.hold(&key);
+        let session = {
+            let tenant = Arc::clone(&tenant);
+            let planned = set(&key, &value);
+            std::thread::spawn(move || {
+                tidb_ddl_pdjournal::direct::write_through(tenant.store.as_ref(), tenant.pd.as_ref(), "session/1", elsewhere(&tenant), &[planned])
+            })
+        };
+        tenant.pd.wait_held(&key);
+        let report = tenant.reconcile("owner-b");
+        assert_eq!(report.aborted, 1, "{range}: {report:?}");
+        assert_eq!(tenant.record(&key).unwrap().value, None);
+        if forget {
+            tenant.forget_record(&key);
+        } else {
+            assert_eq!(tenant.reconcile("owner-b").in_sync, 1);
+        }
+        gate.release();
+        let refused = session.join().unwrap().unwrap_err().to_string();
+        assert!(refused.contains("aborted before it committed"), "{range}: {refused}");
+        assert_eq!(tenant.pd.get(&key), None, "{range}");
+        assert_eq!(tenant.intents(), 0);
+        if !forget {
+            assert_eq!(tenant.record(&key).unwrap().value, None);
+            tenant.reconcile("owner-b");
+            assert_eq!(tenant.pd.get(&key), None);
+            assert_eq!(tenant.record(&key).unwrap().generation, 2, "the tombstone stays");
+        }
+    }
 }

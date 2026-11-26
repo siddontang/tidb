@@ -16,13 +16,19 @@
 //!
 //! A pass (1) resolves every intent no live attempt holds: an intent whose op
 //! committed the record is done, one a later generation superseded is
-//! dropped, and any other is aborted -- its record's generation moves past it
-//! (the pre-image becomes the record of an object that had none), which a
-//! delayed commit of the same attempt then conflicts with or fails to
-//! compare; then (2) compares every record without an open intent with PD
-//! ([`crate::normalize`]) and rewrites, then reads back, each object PD holds
-//! differently; and (3) drops the tombstones PD agrees with once they are
-//! older than [`Options::tombstone_retention`].
+//! dropped, and any other is aborted durably
+//! ([`crate::journal::Prepared::abort`]'s resolution: the record moves above
+//! the intent's generation and holds the baseline, a tombstone for an object
+//! that was absent), which a delayed commit of the same attempt then
+//! conflicts with or fails to compare; then (2) compares every record without
+//! an open intent with PD ([`crate::normalize`]) and rewrites, then reads
+//! back, each object PD holds differently.
+//!
+//! Tombstones are never expired. A PD request an old attempt submitted can
+//! complete at any later time (a client timeout bounds only how long the
+//! client waits), so a deleted object keeps its compact record -- key,
+//! generation, op, no value; about a hundred bytes of meta per object ever
+//! deleted -- until a newer record of the same object replaces it.
 //!
 //! Timing: a pass runs at takeover and then every [`SCAN_INTERVAL`]. A late
 //! write by a paused old owner is repaired by the first pass that starts
@@ -62,9 +68,6 @@ pub struct Options {
     pub keyspace_id: Option<u32>,
     /// How long a non-job intent is left to its session.
     pub non_job_grace: Duration,
-    /// How long a tombstone PD agrees with is kept, against a delayed
-    /// resurrection of its object.
-    pub tombstone_retention: Duration,
 }
 
 impl Options {
@@ -76,7 +79,6 @@ impl Options {
             scope,
             keyspace_id,
             non_job_grace: Duration::from_secs(60),
-            tombstone_retention: Duration::from_secs(24 * 3600),
         }
     }
 }
@@ -96,13 +98,11 @@ pub struct Report {
     pub repaired: Vec<ObjectKey>,
     /// Objects whose repair failed, retried by the next pass.
     pub failed: Vec<(ObjectKey, String)>,
-    /// Tombstones dropped.
-    pub compacted: usize,
 }
 
 impl Report {
     fn changed_anything(&self) -> bool {
-        self.committed + self.aborted + self.compacted > 0 || !self.repaired.is_empty() || !self.failed.is_empty()
+        self.committed + self.aborted > 0 || !self.repaired.is_empty() || !self.failed.is_empty()
     }
 }
 
@@ -146,32 +146,13 @@ fn verdict(record: Option<&Record>, intent: &Intent, now_ms: u64, options: &Opti
     Verdict::Abort
 }
 
-/// Aborts `intent`: its record moves to the intent's generation with the
-/// value it had (the pre-image for an object without one), and the intent
-/// goes. Answers whether its op had committed after all.
+/// Aborts `intent` durably ([`journal::resolve_aborted`]). Answers whether
+/// its op had committed after all.
 fn abort(store: &dyn MetaStore, intent: &Intent) -> Result<bool, String> {
     let mut committed = false;
     journal::run(store, &mut |txn| {
-        let record = journal::read_record(&mut TxnRead(&mut *txn), &intent.key)?;
-        committed = record.as_ref().is_some_and(|record| record.op_id == intent.op_id);
-        if !committed {
-            let burned = match record {
-                Some(record) => Record {
-                    generation: record.generation.max(intent.generation),
-                    op_id: format!("aborted:{}", intent.op_id),
-                    ..record
-                },
-                None => Record {
-                    key: intent.key.clone(),
-                    generation: intent.generation,
-                    op_id: format!("aborted:{}", intent.op_id),
-                    value: intent.pre_image.clone(),
-                    at_ms: wall_ms(),
-                },
-            };
-            journal::put_record(txn, &burned)?;
-        }
-        journal::delete_intent(txn, intent)
+        committed = journal::resolve_aborted(txn, intent)?;
+        Ok(())
     })?;
     Ok(committed)
 }
@@ -255,19 +236,14 @@ pub fn reconcile_once(
 ) -> Result<Report, String> {
     let mut report = Report::default();
     resolve_intents(store, options, still_owner, &mut report)?;
-    let Journal { records, intents, now_ms } = read_journal(store)?;
+    let Journal { records, intents, .. } = read_journal(store)?;
     let open = intents.into_iter().map(|intent| intent.key).collect::<BTreeSet<_>>();
     let keys = records.keys().filter(|key| !open.contains(*key)).cloned().collect::<Vec<_>>();
     let held = pd.read(&keys)?;
-    let retention = u64::try_from(options.tombstone_retention.as_millis()).unwrap_or(u64::MAX);
-    let mut expired = Vec::new();
     for key in &keys {
         let record = &records[key];
         if in_sync(key, record.value.as_ref(), held.get(key), options.keyspace_id)? {
             report.in_sync += 1;
-            if record.value.is_none() && now_ms.saturating_sub(record.at_ms) > retention {
-                expired.push(record);
-            }
             continue;
         }
         if !still_owner() {
@@ -277,17 +253,6 @@ pub fn reconcile_once(
             Ok(true) => report.repaired.push(key.clone()),
             Ok(false) => report.left += 1,
             Err(error) => report.failed.push((key.clone(), error)),
-        }
-    }
-    for record in expired {
-        let compacted = journal::run(store, &mut |txn| {
-            if journal::read_record(&mut TxnRead(&mut *txn), &record.key)?.as_ref() == Some(record) {
-                journal::delete_record(txn, &record.key)?;
-            }
-            Ok(())
-        });
-        if compacted.is_ok() {
-            report.compacted += 1;
         }
     }
     Ok(report)
