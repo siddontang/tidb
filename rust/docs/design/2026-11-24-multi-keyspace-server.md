@@ -889,24 +889,71 @@ rule client. A tenant's PD effects then go through its own clients:
   that wants global placement has set its own, remove the unqualified group
   from PD (`pd-ctl config placement-rules rule-bundle delete TiDB_GLOBAL`).
   Go next-generation nodes in the same fleet keep writing it.
-- **Undoing a step's PD writes:** a job step writes bundles, label rules
-  and the resource-group write before its catalog transaction commits
-  (`tidb-ddl/src/external_delivery.rs`). It reads what PD held under each
-  name first; a definite abort after a write (the MDL registration, the
-  owner check, a definite commit failure, a failed later delivery) puts the
-  previous values back and removes only what the attempt created. An
-  undetermined commit undoes nothing. Only the owner undoes: the abort
-  checks the owner lease first, and an attempt that lost it leaves PD as it
-  is, since a successor may have committed the same names, even the same
-  values. Residual window: the lease ending between that check and PD
-  answering the undo. **Open:** PD's bundle, label-rule and resource-group
-  APIs have no conditional write, so a stale owner whose forward PD write
-  lands late (it was paused after its last lease check while a successor
-  committed) can leave PD differing from the committed catalog, and nothing
-  repairs it short of the next DDL on the object. Convergence needs a
-  durable repair record per attempt and periodic reconciliation by the
-  current owner against the committed desired state (which, for label
-  rules and range bundles, the catalog does not hold); not done in 3b.
+- **PD journal and reconciler (eventual repair):** PD's bundle, label-rule
+  and resource-group APIs have no conditional write, so a stale owner whose
+  forward write lands late (paused after its last lease check while a
+  successor committed) could leave PD differing from the committed catalog.
+  Every physical PD object a keyspace writes now has a journal record in
+  the keyspace's own meta (`tidb-ddl-pdjournal`; plain string meta keys
+  `PDJrnl/...`): the authoritative record (desired value as PD keeps it, a
+  tombstone for a delete, and a generation) and the prepared intents of
+  attempts about to write it (stable op ID, value, the generation it would
+  commit, and the pre-image, which is the last authoritative value and
+  never a fresh PD read). A write is (1) intent committed, (2) PD written,
+  (3) record committed: a DDL job step writes the records in its catalog
+  transaction (`DdlWrite.mutations`), so they commit with the catalog
+  change or not at all, and racing attempts conflict on the record key;
+  ALTER RANGE (global and meta, a policy or `DEFAULT`) and GC's deletes
+  commit them in a small meta transaction that compares the generation
+  the intent was prepared against, so a delayed session cannot commit over
+  its successor and SQL succeeds only after that commit; the bootstrap
+  commits the default group's record (and the keyspace's cutover) with its
+  catalog. A definite abort puts every object's pre-image back (a failed or
+  unanswered PD write counts as applied) and drops the intents; an
+  undetermined commit leaves them. Only the owner undoes; a lost owner
+  leaves PD and its intents to the successor.
+
+  The current DDL owner reconciles at takeover and every 30 s
+  (`reconcile::SCAN_INTERVAL`; a node without PD, whose objects live in the
+  process's mocks, runs no loop): it resolves each intent no live attempt
+  holds from the records (its op committed: dropped; otherwise aborted, and
+  the record's generation moves past it so a delayed commit of the attempt
+  conflicts or fails its compare), then compares each record with PD over
+  the fields TiDB sets (`normalize`: both sides read into TiDB's own types,
+  which keeps every range bound and the keyspace-qualified IDs; PD-only
+  fields and defaults compare equal, a cleared field or another tenant's
+  range never does) and rewrites and reads back what differs. It never acts
+  on an object without a record, and keeps tombstones for 24 h against a
+  delayed resurrection. A late write stays in PD for at most the interval
+  plus one pass (a journal scan, one PD read per record, and per differing
+  object a re-read, a write and a read back, each bounded by the PD
+  client's timeout); a failed repair adds an interval per retry. Within the
+  affected tenant PD can be stale for that long; other tenants' objects are
+  never read or written.
+
+  Baselines: resource groups and table or partition bundles without a
+  record take the catalog's value as of the step's snapshot. Label rules
+  and range bundles exist only in PD, and a PD read can return an old
+  owner's delayed write, so they need a seeded baseline before their first
+  mutation: a keyspace bootstrapped with the journal records its cutover at
+  bootstrap; an older keyspace needs the operator's cutover, which seeds a
+  record of each such object from PD at DDL owner takeover, once
+  `TIDB_PD_JOURNAL_CUTOVER` (`*` or keyspace IDs) says the writers that
+  bypass the journal (nodes of an older build) are drained; no writer of
+  this build touches such an object before. Until then such a mutation
+  fails before PD with an error naming the cutover: a DDL step fails and
+  its job is cancelled (Go cancels a job whose PD call failed), ALTER RANGE
+  and GC's delete return the error. Residual: a
+  repair racing a non-job writer on another node can revert that writer's
+  just-written value until the next pass; BR's restore writes label rules
+  without the journal, so where a record already holds a restored rule's ID
+  (a tombstone of a dropped table of that name) the reconciler puts the
+  record's value back (re-apply the attributes by DDL after a restore); the
+  unqualified legacy `TiDB_GLOBAL` bundle is never journaled; a non-job
+  intent (ALTER RANGE, GC) is left to its session for 60 s before the
+  reconciler resolves it; a table bundle's first catalog baseline scans
+  the keyspace's tables once; and a pass reads PD once per bundle and
+  group, so its duration grows with the number of journaled objects.
 
 Still shared, and every multi-keyspace use is refused (1235) or off:
 
