@@ -19,7 +19,9 @@
 //! same range both write PD, but only the first to finalize commits; the
 //! other is refused, puts the record that won back into PD, and reports it.
 //! An attempt that an abort resolved (its own, or the owner's reconciler's)
-//! is refused too, and never reports success.
+//! is refused too, and never reports success. Within one process the
+//! writers of an object take turns from their first PD write until they
+//! committed or put PD back ([`journal::Prepared::write`]).
 
 use tidb_meta::MetaStore;
 
@@ -77,6 +79,9 @@ pub fn write_through(
     })
     .map_err(|error| refused.take().unwrap_or(JournalError::Storage(error)))?;
     let prepared = prepared.expect("a committed prepare planned");
+    // This process's writers of these objects wait until this attempt
+    // committed or put PD back.
+    let _writing = prepared.write();
     for intent in prepared.intents() {
         if let Err(error) = pd.write(&intent.key, intent.value.as_ref()) {
             return Err(abandon(store, pd, &prepared, format!("writing {}: {error}", intent.key)));
@@ -104,38 +109,13 @@ fn names(keys: &[crate::ObjectKey]) -> String {
     keys.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
 }
 
-/// Resolves the whole of a definitely refused or failed attempt: every one
-/// of its intents is aborted durably ([`journal::Prepared::abort`]: an
-/// intent an abort or a newer record already resolved is just removed),
-/// then every object it wrote gets its current authoritative record back
-/// in PD -- the baseline the abort recorded, or the newer record of a
-/// writer that won. A write of the attempt that PD applies later is a
-/// divergence the reconciler reverts. Answers the error, with `detail`.
+/// Resolves the whole of a definitely refused or failed attempt
+/// ([`journal::Prepared::abandon`]); answers the error, with `detail`.
 fn abandon(store: &dyn MetaStore, pd: &dyn PdObjects, prepared: &journal::Prepared, detail: String) -> JournalError {
-    let mut detail = detail;
-    let aborted = prepared.abort(store);
-    if let Err(error) = &aborted {
-        detail.push_str(&format!("; recording the abort failed, the reconciler resolves it: {error}"));
+    match prepared.abandon(store, pd) {
+        Ok(()) => JournalError::Storage(detail),
+        Err(error) => JournalError::Storage(format!("{detail}; {error}")),
     }
-    let keys = prepared.intents().iter().map(|intent| intent.key.clone()).collect::<Vec<_>>();
-    match read_current(store, &keys) {
-        Ok((records, _)) => {
-            for intent in prepared.intents() {
-                // Without a record (the abort did not commit), the pre-image.
-                let value = match records.get(&intent.key) {
-                    Some(record) => record.value.as_ref(),
-                    None => intent.pre_image.as_ref(),
-                };
-                if let Err(error) = pd.write(&intent.key, value) {
-                    detail.push_str(&format!("; putting {} back failed: {error}", intent.key));
-                }
-            }
-        }
-        Err(error) => {
-            detail.push_str(&format!("; reading the records failed, the reconciler repairs PD: {error}"));
-        }
-    }
-    JournalError::Storage(detail)
 }
 
 /// The records of `keys` and whether the keyspace had its cutover, read in

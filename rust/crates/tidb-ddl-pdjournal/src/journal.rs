@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use tidb_meta::transaction::MetaTransaction;
 use tidb_meta::MetaStore;
 
-use crate::live::LiveHold;
+use crate::live::{LiveHold, Writing};
 use crate::pd::PdObjects;
 use crate::record::{
     cutover_key, held_back_key, held_back_prefix, intent_key, intents_prefix, record_key, records_prefix, wall_ms,
@@ -277,7 +277,7 @@ pub struct Prepared {
     intents: Vec<Intent>,
     /// Each intent's record as the prepare read it.
     read: Vec<Option<(u64, String)>>,
-    _hold: LiveHold,
+    hold: LiveHold,
 }
 
 /// The catalog's value of the catalog-reconstructible objects among `keys`
@@ -418,7 +418,7 @@ pub fn plan(
         attempt: attempt.clone(),
         intents,
         read,
-        _hold: hold,
+        hold,
     })
 }
 
@@ -508,21 +508,58 @@ impl Prepared {
         })
     }
 
-    /// Puts every object's pre-image back into PD: a write that failed may
-    /// still have been applied.
+    /// Waits until no other attempt of this process writes any of the
+    /// attempt's objects, then lets it write them alone until the answer is
+    /// dropped: take it before the first PD write and keep it until the
+    /// records committed or [`Self::abandon`] put PD back, so this process's
+    /// writers of an object are ordered. Drop it before the attempt.
+    #[must_use]
+    pub fn write(&self) -> Writing {
+        self.hold.write()
+    }
+
+    /// Resolves the whole of a definitely aborted or refused attempt: every
+    /// one of its intents is aborted durably ([`Self::abort`]: one an abort
+    /// or a newer record already resolved is just removed), then each
+    /// object it wrote gets its current authoritative record back in PD --
+    /// the baseline the abort recorded, or the newer record of a writer that
+    /// won (the pre-image where the abort did not commit), read after the
+    /// abort. A write of the attempt that PD applies later is a divergence
+    /// the reconciler reverts. Call it under [`Self::write`], so no writer of
+    /// this process commits between the read and the PD write.
     ///
     /// # Errors
-    /// The restores that failed.
-    pub fn restore_pre_images(&self, pd: &dyn PdObjects) -> Result<(), String> {
-        let failures = self
-            .intents
-            .iter()
-            .filter_map(|intent| {
-                pd.write(&intent.key, intent.pre_image.as_ref())
-                    .err()
-                    .map(|error| format!("{}: {error}", intent.key))
-            })
-            .collect::<Vec<_>>();
+    /// What failed (the abort, the read, or a PD write); the reconciler
+    /// resolves and repairs the rest.
+    pub fn abandon(&self, store: &dyn MetaStore, pd: &dyn PdObjects) -> Result<(), String> {
+        let mut failures = Vec::new();
+        if let Err(error) = self.abort(store) {
+            failures.push(format!("recording the abort failed, the reconciler resolves it: {error}"));
+        }
+        let mut records = BTreeMap::new();
+        let read = run(store, &mut |txn| {
+            records.clear();
+            for intent in &self.intents {
+                if let Some(record) = read_record(&mut TxnRead(&mut *txn), &intent.key)? {
+                    records.insert(intent.key.clone(), record);
+                }
+            }
+            Ok(())
+        });
+        match read {
+            Ok(()) => {
+                for intent in &self.intents {
+                    let value = match records.get(&intent.key) {
+                        Some(record) => record.value.as_ref(),
+                        None => intent.pre_image.as_ref(),
+                    };
+                    if let Err(error) = pd.write(&intent.key, value) {
+                        failures.push(format!("putting {} back failed: {error}", intent.key));
+                    }
+                }
+            }
+            Err(error) => failures.push(format!("reading the records failed, the reconciler repairs PD: {error}")),
+        }
         if failures.is_empty() {
             Ok(())
         } else {

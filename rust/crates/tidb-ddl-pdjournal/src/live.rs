@@ -22,14 +22,34 @@
 //! attempt's own PD write or does not happen. The lock is per keyspace and
 //! object: a repair waiting on PD blocks only the writers of that object, and
 //! the shared map is never locked across PD I/O.
+//!
+//! Writers of one object in this process are ordered too: from its first
+//! PD write until its records committed or its compensation put PD back
+//! ([`Writing`]), an attempt writes its objects alone, so a compensation
+//! that re-reads a record and writes it to PD cannot be overtaken by a
+//! second writer's commit, nor overwrite it.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use crate::ObjectKey;
 
-/// One object of one keyspace: how many live attempts hold it.
-type Slot = Arc<Mutex<usize>>;
+/// One object of one keyspace: how many live attempts hold it, and whether
+/// one of them is writing it.
+#[derive(Debug, Default)]
+struct State {
+    holds: usize,
+    writing: bool,
+}
+
+#[derive(Debug, Default)]
+struct SlotInner {
+    state: Mutex<State>,
+    /// Signalled when a writer is done.
+    done: Condvar,
+}
+
+type Slot = Arc<SlotInner>;
 
 static BUSY: LazyLock<Mutex<HashMap<(u32, ObjectKey), Slot>>> = LazyLock::new(Mutex::default);
 
@@ -37,8 +57,8 @@ fn map() -> MutexGuard<'static, HashMap<(u32, ObjectKey), Slot>> {
     BUSY.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn lock(slot: &Slot) -> MutexGuard<'_, usize> {
-    slot.lock().unwrap_or_else(PoisonError::into_inner)
+fn lock(slot: &Slot) -> MutexGuard<'_, State> {
+    slot.state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The slot of `key` in keyspace `scope`, created when absent. The map's lock
@@ -58,9 +78,33 @@ pub(crate) struct LiveHold {
 impl LiveHold {
     pub(crate) fn new(scope: u32, keys: Vec<ObjectKey>) -> Self {
         for key in &keys {
-            *lock(&slot(scope, key)) += 1;
+            lock(&slot(scope, key)).holds += 1;
         }
         Self { scope, keys }
+    }
+
+    /// Waits until no other attempt of this process writes any of the
+    /// hold's objects, then writes them alone until the answer is dropped.
+    /// Takes the objects in key order, so two attempts sharing objects never
+    /// wait for each other in a circle.
+    pub(crate) fn write(&self) -> Writing {
+        let mut keys = self.keys.clone();
+        keys.sort();
+        keys.dedup();
+        let slots = keys
+            .iter()
+            .map(|key| {
+                let held = slot(self.scope, key);
+                let mut state = lock(&held);
+                while state.writing {
+                    state = held.done.wait(state).unwrap_or_else(PoisonError::into_inner);
+                }
+                state.writing = true;
+                drop(state);
+                held
+            })
+            .collect();
+        Writing { slots }
     }
 }
 
@@ -71,12 +115,28 @@ impl Drop for LiveHold {
             let Some(held) = map().get(&entry).cloned() else {
                 continue;
             };
-            let mut count = lock(&held);
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                drop(count);
+            let mut state = lock(&held);
+            state.holds = state.holds.saturating_sub(1);
+            if state.holds == 0 {
+                drop(state);
                 forget_if_idle(&entry, &held);
             }
+        }
+    }
+}
+
+/// An attempt's exclusive write of its objects ([`LiveHold::write`]),
+/// released on drop. It lives no longer than the attempt's hold.
+#[derive(Debug)]
+pub struct Writing {
+    slots: Vec<Slot>,
+}
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        for held in &self.slots {
+            lock(held).writing = false;
+            held.done.notify_all();
         }
     }
 }
@@ -87,7 +147,7 @@ fn forget_if_idle(entry: &(u32, ObjectKey), held: &Slot) {
     let mut map = map();
     let idle = map
         .get(entry)
-        .is_some_and(|slot| Arc::ptr_eq(slot, held) && Arc::strong_count(slot) == 2 && *lock(slot) == 0);
+        .is_some_and(|slot| Arc::ptr_eq(slot, held) && Arc::strong_count(slot) == 2 && lock(slot).holds == 0);
     if idle {
         map.remove(entry);
     }
@@ -98,12 +158,12 @@ fn forget_if_idle(entry: &(u32, ObjectKey), held: &Slot) {
 /// while `write` runs.
 pub(crate) fn unless_busy<T>(scope: u32, key: &ObjectKey, write: impl FnOnce() -> T) -> Option<T> {
     let held = slot(scope, key);
-    let count = lock(&held);
-    if *count > 0 {
+    let state = lock(&held);
+    if state.holds > 0 {
         return None;
     }
     let result = write();
-    drop(count);
+    drop(state);
     forget_if_idle(&(scope, key.clone()), &held);
     Some(result)
 }
@@ -111,7 +171,7 @@ pub(crate) fn unless_busy<T>(scope: u32, key: &ObjectKey, write: impl FnOnce() -
 /// Whether a live attempt of this process holds `key` in keyspace `scope`.
 pub(crate) fn is_busy(scope: u32, key: &ObjectKey) -> bool {
     let held = map().get(&(scope, key.clone())).cloned();
-    held.is_some_and(|held| *lock(&held) > 0)
+    held.is_some_and(|held| lock(&held).holds > 0)
 }
 
 #[cfg(test)]

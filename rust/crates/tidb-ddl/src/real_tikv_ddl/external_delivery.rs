@@ -27,7 +27,7 @@
 //! record before the keyspace's cutover refuses the step before PD is
 //! touched.
 //!
-//! A definite abort puts every object's pre-image back -- a failed or
+//! A definite abort puts every object's baseline back -- a failed or
 //! unanswered PD write may still have been applied -- and removes the
 //! intents only in the transaction that records each object's baseline at a
 //! generation above the attempt's (a tombstone for an object that was
@@ -133,7 +133,10 @@ pub(crate) struct StepJournal {
 /// The PD writes one job step delivered, and their journal.
 #[derive(Default)]
 pub(crate) struct ExternalDelivery {
-    journal: Option<(Arc<dyn tidb_meta::MetaStore>, Prepared)>,
+    /// The step's journal: its store, its prepared intents, and its turn as
+    /// this process's only writer of its objects until the step is over
+    /// (declared first, so it is dropped before the attempt).
+    journal: Option<(tidb_ddl_pdjournal::Writing, Arc<dyn tidb_meta::MetaStore>, Prepared)>,
 }
 
 fn failed(context: &str, error: impl std::fmt::Display) -> String {
@@ -169,7 +172,7 @@ impl ExternalDelivery {
             .iter()
             .map(tidb_ddl_pdjournal::journal::record_mutation)
             .collect();
-        self.journal = Some((journal.store, prepared));
+        self.journal = Some((prepared.write(), journal.store, prepared));
         Ok(records)
     }
 
@@ -239,7 +242,7 @@ impl ExternalDelivery {
 
     /// The step committed: its intents are done.
     pub(crate) fn committed(&self) {
-        if let Some((store, prepared)) = &self.journal {
+        if let Some((_, store, prepared)) = &self.journal {
             if let Err(error) = prepared.clear_intents(store.as_ref()) {
                 tidb_ddl_logutil::ddl_logger().warn(
                     "a committed step's PD journal intents stay for the reconciler",
@@ -250,13 +253,13 @@ impl ExternalDelivery {
     }
 
     /// Undoes the step's PD writes after a definite abort, if this attempt
-    /// still owns the DDL (`still_owner`): every object gets its pre-image
-    /// back from `pd`, and the abort is recorded durably
-    /// ([`Prepared::abort`]), which removes the intents. Otherwise leaves PD and the
+    /// still owns the DDL (`still_owner`): the abort is recorded durably,
+    /// which removes the intents, and every object gets its current record
+    /// back in PD ([`Prepared::abandon`]). Otherwise leaves PD and the
     /// intents to the owner's reconciler. Answers what the abort's cause
     /// should add: the undo's failures, or the undo skipped.
     pub(crate) fn compensate(&self, still_owner: &dyn Fn() -> Result<(), String>, pd: &dyn PdObjects) -> Result<(), String> {
-        let Some((store, prepared)) = &self.journal else {
+        let Some((_, store, prepared)) = &self.journal else {
             return Ok(());
         };
         if let Err(error) = still_owner() {
@@ -270,17 +273,11 @@ impl ExternalDelivery {
         }
         // A write that failed may still land: the abort records each
         // object's baseline above the attempt's generation, so the
-        // reconciler reverts it, even when restoring PD here failed.
-        let restored = prepared
-            .restore_pre_images(pd)
-            .map_err(|error| format!("restoring the attempt's PD objects failed, the reconciler retries: {error}"));
-        let aborted = prepared
-            .abort(store.as_ref())
-            .map_err(|error| format!("recording the attempt's abort failed, the reconciler resolves it: {error}"));
-        match (restored, aborted) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Err(restore), Err(abort)) => Err(format!("{restore}; {abort}")),
-        }
+        // reconciler reverts it, even when restoring PD here failed. The
+        // step still writes its objects alone, so the records put back are
+        // the current ones.
+        prepared
+            .abandon(store.as_ref(), pd)
+            .map_err(|error| format!("undoing the attempt's PD writes: {error}"))
     }
 }

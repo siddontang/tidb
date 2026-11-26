@@ -191,10 +191,11 @@ impl PdObjects for TenantPd {
 }
 
 /// A meta store that runs a hook once, after the next transaction it runs
-/// once armed.
+/// once armed and `skip` more have passed.
 struct HookedStore {
     inner: Arc<dyn tidb_meta::MetaStore>,
     after_next: Mutex<Option<Hook>>,
+    skip: std::sync::atomic::AtomicUsize,
 }
 
 impl tidb_meta::MetaStore for HookedStore {
@@ -206,7 +207,13 @@ impl tidb_meta::MetaStore for HookedStore {
         f: &mut dyn FnMut(&mut dyn tidb_meta::transaction::MetaTransaction) -> tidb_meta::Result<()>,
     ) -> Result<(), String> {
         let result = self.inner.run_in_new_txn(ctx, source_type, retryable, f);
-        let hook = self.after_next.lock().unwrap().take();
+        let mut armed = self.after_next.lock().unwrap();
+        if armed.is_some() && self.skip.load(Ordering::SeqCst) > 0 {
+            self.skip.fetch_sub(1, Ordering::SeqCst);
+            return result;
+        }
+        let hook = armed.take();
+        drop(armed);
         if let Some(hook) = hook {
             hook();
         }
@@ -623,7 +630,8 @@ fn an_untracked_rule_is_refused_before_the_cutover_and_restored_after_it() {
 }
 
 /// Two ALTER RANGE sessions prepare the same range bundle: the one whose PD
-/// write was held finalizes last, is refused, and PD keeps the winner's
+/// write was held (on another node: this process's writers of an object
+/// take turns) finalizes last, is refused, and PD keeps the winner's
 /// bundle; only the winner's record committed.
 #[test]
 fn a_delayed_alter_range_cannot_commit_over_its_successor() {
@@ -637,7 +645,7 @@ fn a_delayed_alter_range_cannot_commit_over_its_successor() {
         let tenant = Arc::clone(&tenant);
         let planned = set(&key, &first);
         std::thread::spawn(move || {
-            tidb_ddl_pdjournal::direct::write_through(tenant.store.as_ref(), tenant.pd.as_ref(), "session/1", tenant.scope, &[planned])
+            tidb_ddl_pdjournal::direct::write_through(tenant.store.as_ref(), tenant.pd.as_ref(), "session/1", elsewhere(&tenant), &[planned])
         })
     };
     tenant.pd.wait_held(&key);
@@ -1014,7 +1022,7 @@ fn a_repair_never_writes_back_a_value_a_writer_replaced() {
     let (_, v3) = group("rg_race", 3);
     run_step(&tenant, "owner-a", &[set(&key, &v1)]);
     tenant.pd.set(&key, Some(late));
-    let store = Arc::new(HookedStore { inner: Arc::clone(&tenant.store), after_next: Mutex::default() });
+    let store = Arc::new(HookedStore { inner: Arc::clone(&tenant.store), after_next: Mutex::default(), skip: Default::default() });
     let (done, written) = std::sync::mpsc::channel();
     let writer = Arc::new(Mutex::new(None));
     *tenant.pd.after_read.lock().unwrap() = Some(Box::new({
@@ -1100,4 +1108,53 @@ fn the_cutover_reads_a_rules_table_ids_from_the_catalog() {
     assert_eq!(super::pd_baseline::rule_table_ids(&mut snapshot, "mysql", "no_such_table", "").unwrap(), None);
     assert_eq!(super::pd_baseline::rule_table_ids(&mut snapshot, "mysql", "tidb_ddl_job", "p0").unwrap(), None);
     assert_eq!(super::pd_baseline::rule_table_ids(&mut snapshot, "no_such_db", "tidb_ddl_job", "").unwrap(), None);
+}
+
+/// An ALTER RANGE whose PD write timed out is abandoned: it reads the
+/// range's record to put it back, and right then a second session of the
+/// same process commits a newer ALTER RANGE (the hook runs after the
+/// abandon's record read, before its PD write). PD must end with the newer
+/// value: the abandoning session writes its objects alone until it put PD
+/// back, so the second one writes after it.
+#[test]
+fn an_abandoned_alter_range_never_overwrites_a_newer_one() {
+    use tidb_ddl_pdjournal::direct::write_through;
+
+    let shared = Arc::new(SharedPd::default());
+    let tenant = Arc::new(Tenant::new(&shared, 1));
+    tenant.cutover();
+    let (key, v0) = range_bundle(1, tidb_placement::KEY_RANGE_GLOBAL, 1);
+    let (_, v1) = range_bundle(1, tidb_placement::KEY_RANGE_GLOBAL, 2);
+    let (_, v2) = range_bundle(1, tidb_placement::KEY_RANGE_GLOBAL, 3);
+    write_through(tenant.store.as_ref(), tenant.pd.as_ref(), "session/1", tenant.scope, &[set(&key, &v0)]).unwrap();
+    let landing = tenant.pd.delay(&key);
+    // The abandoning session's transactions: its prepare, its abort, then
+    // the record read the hook follows.
+    let store = Arc::new(HookedStore { inner: Arc::clone(&tenant.store), after_next: Mutex::default(), skip: 2.into() });
+    let second = Arc::new(Mutex::new(None));
+    *store.after_next.lock().unwrap() = Some(Box::new({
+        let (tenant, second, key, v2) = (Arc::clone(&tenant), Arc::clone(&second), key.clone(), v2.clone());
+        move || {
+            let (done, finished) = std::sync::mpsc::channel();
+            *second.lock().unwrap() = Some(std::thread::spawn(move || {
+                let written = write_through(tenant.store.as_ref(), tenant.pd.as_ref(), "session/2", tenant.scope, &[set(&key, &v2)]);
+                let _ = done.send(());
+                written
+            }));
+            // Long enough for an unordered second session to commit.
+            let _ = finished.recv_timeout(Duration::from_millis(500));
+        }
+    }));
+    let failed = write_through(store.as_ref(), tenant.pd.as_ref(), "session/1", tenant.scope, &[set(&key, &v1)]);
+    assert!(failed.is_err());
+    second.lock().unwrap().take().expect("the second session ran").join().unwrap().unwrap();
+    assert_eq!(tenant.record(&key).unwrap().value.as_ref(), Some(&v2));
+    assert_eq!(tenant.pd.get(&key).as_ref(), Some(&v2), "the newer ALTER RANGE stays in PD");
+    assert_eq!(tenant.intents(), 0);
+
+    // The timed-out write lands at last; the reconciler reverts it.
+    landing.release();
+    tenant.pd.wait_for(&key, &v1);
+    tenant.reconcile("owner-b");
+    assert_eq!(tenant.pd.get(&key).as_ref(), Some(&v2));
 }

@@ -947,7 +947,12 @@ rule client. A tenant's PD effects then go through its own clients:
   never read or written. A repair re-reads the record and checks for an
   open intent under the object's lock, the one a writer of the same
   process takes before its prepare, so it never writes back a value such a
-  writer has just replaced.
+  writer has just replaced. The writers of an object in one process (job
+  steps, ALTER RANGE, GC) take turns from their first PD write until their
+  records committed or their compensation put PD back, and a compensation
+  reads the records it restores within its turn, so it never puts an older
+  value over a newer committed one; across nodes the reconciler repairs
+  such an overwrite at its next pass.
 
   Baselines: resource groups and table or partition bundles without a
   record take the catalog's value as of the step's snapshot. Label rules

@@ -76,4 +76,5 @@ pub mod pd;
 pub mod reconcile;
 
 pub use journal::{JournalError, JournalRead, Planned, Prepared, TxnRead};
+pub use live::Writing;
 pub use record::{Cutover, HeldBack, Intent, ObjectKey, ObjectKind, PdValue, Record};
