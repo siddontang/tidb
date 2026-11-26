@@ -907,8 +907,10 @@ rule client. A tenant's PD effects then go through its own clients:
   commit them in a small meta transaction that commits only while the
   attempt's own intents (op ID and generation) are still outstanding and
   over the generation they were prepared against, so a delayed session
-  cannot commit over its successor, nor after an abort resolved it, and
-  SQL succeeds only after that commit; the bootstrap commits the default
+  cannot commit over its successor, nor after an abort resolved it (even
+  one of its objects: a refused attempt then aborts all its intents and
+  puts every object it wrote back to its current record, a newer winner's
+  included), and SQL succeeds only after that commit; the bootstrap commits the default
   group's record (and the keyspace's cutover) with its catalog. A definite
   abort (a job step's, a session's compensation, or the reconciler's)
   puts every object's pre-image back (a failed or unanswered PD write
@@ -942,7 +944,10 @@ rule client. A tenant's PD effects then go through its own clients:
   alone: the pass falls back to one read per object, repairs the others
   and reports it, and the next pass retries it. Within the
   affected tenant PD can be stale for that long; other tenants' objects are
-  never read or written.
+  never read or written. A repair re-reads the record and checks for an
+  open intent under the object's lock, the one a writer of the same
+  process takes before its prepare, so it never writes back a value such a
+  writer has just replaced.
 
   Baselines: resource groups and table or partition bundles without a
   record take the catalog's value as of the step's snapshot. Label rules

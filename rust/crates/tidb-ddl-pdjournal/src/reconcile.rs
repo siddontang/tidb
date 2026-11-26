@@ -209,20 +209,26 @@ fn resolve_intents(
     Ok(())
 }
 
+/// Rewrites `record`'s object in PD and reads it back, unless a live
+/// attempt holds it. The record and the absence of an open intent are
+/// re-read under the object's lock, which a writer of this process takes
+/// before its prepare: a writer that committed a newer value and released
+/// its hold since the pass read the journal is seen, and the old value is
+/// not written back. Answers false when it left the object.
 fn repair(store: &dyn MetaStore, pd: &dyn PdObjects, options: &Options, record: &Record) -> Result<bool, String> {
-    if !still_settled(store, record)? {
-        return Ok(false);
-    }
-    let Some(written) = live::unless_busy(options.scope, &record.key, || pd.write(&record.key, record.value.as_ref())) else {
-        return Ok(false);
-    };
-    written?;
-    let held = pd.read(std::slice::from_ref(&record.key))?;
-    if in_sync(&record.key, record.value.as_ref(), held.get(&record.key), options.keyspace_id)? {
-        Ok(true)
-    } else {
-        Err("PD still holds a different value after the rewrite".to_owned())
-    }
+    let repaired = live::unless_busy(options.scope, &record.key, || {
+        if !still_settled(store, record)? {
+            return Ok(false);
+        }
+        pd.write(&record.key, record.value.as_ref())?;
+        let held = pd.read(std::slice::from_ref(&record.key))?;
+        if in_sync(&record.key, record.value.as_ref(), held.get(&record.key), options.keyspace_id)? {
+            Ok(true)
+        } else {
+            Err("PD still holds a different value after the rewrite".to_owned())
+        }
+    });
+    repaired.unwrap_or(Ok(false))
 }
 
 /// What PD holds under `keys`, and the objects PD could not answer for: one

@@ -91,8 +91,12 @@ struct TenantPd {
     held: Mutex<HashMap<ObjectKey, Arc<Gate>>>,
     delayed: Mutex<HashMap<ObjectKey, Arc<Gate>>>,
     unreadable: Mutex<std::collections::BTreeSet<ObjectKey>>,
+    /// Runs once after the next read.
+    after_read: Mutex<Option<Hook>>,
     lose_reply: AtomicBool,
 }
+
+type Hook = Box<dyn FnOnce() + Send>;
 
 impl TenantPd {
     fn new(shared: &Arc<SharedPd>, tenant: u32) -> Self {
@@ -102,6 +106,7 @@ impl TenantPd {
             held: Mutex::default(),
             delayed: Mutex::default(),
             unreadable: Mutex::default(),
+            after_read: Mutex::default(),
             lose_reply: AtomicBool::new(false),
         }
     }
@@ -152,7 +157,13 @@ impl PdObjects for TenantPd {
         if let Some(key) = keys.iter().find(|key| unreadable.contains(*key)) {
             return Err(format!("PD cannot read {key}"));
         }
-        Ok(keys.iter().filter_map(|key| self.get(key).map(|value| (key.clone(), value))).collect())
+        drop(unreadable);
+        let held = keys.iter().filter_map(|key| self.get(key).map(|value| (key.clone(), value))).collect();
+        let hook = self.after_read.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        Ok(held)
     }
 
     fn write(&self, key: &ObjectKey, value: Option<&PdValue>) -> Result<(), String> {
@@ -176,6 +187,30 @@ impl PdObjects for TenantPd {
             return Err("the PD reply was lost".to_owned());
         }
         Ok(())
+    }
+}
+
+/// A meta store that runs a hook once, after the next transaction it runs
+/// once armed.
+struct HookedStore {
+    inner: Arc<dyn tidb_meta::MetaStore>,
+    after_next: Mutex<Option<Hook>>,
+}
+
+impl tidb_meta::MetaStore for HookedStore {
+    fn run_in_new_txn(
+        &self,
+        ctx: &tidb_gocontext::Context,
+        source_type: &str,
+        retryable: bool,
+        f: &mut dyn FnMut(&mut dyn tidb_meta::transaction::MetaTransaction) -> tidb_meta::Result<()>,
+    ) -> Result<(), String> {
+        let result = self.inner.run_in_new_txn(ctx, source_type, retryable, f);
+        let hook = self.after_next.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        result
     }
 }
 
@@ -850,4 +885,91 @@ fn the_cutover_adopts_only_tidbs_own_rules_and_range_bundles() {
     let held = pd.read(&everything).unwrap();
     assert!(tidb_ddl_pdjournal::normalize::in_sync(&operators[0].0, Some(&edited), held.get(&operators[0].0), Some(1)).unwrap());
     assert!(tidb_ddl_pdjournal::normalize::in_sync(&tidb_key, Some(&tidb_value), held.get(&tidb_key), Some(1)).unwrap());
+}
+
+/// A pass finds a record PD differs from, and a writer of this process
+/// commits a newer value and releases its hold right after the pass's
+/// repair would have checked the record (the hook runs after the first
+/// journal read that follows the pass's PD read). The repair must not put
+/// the older record back over the writer's value: it checks the record
+/// under the object's lock, so either it sees the newer record or the
+/// writer waits for the repair and writes after it.
+#[test]
+fn a_repair_never_writes_back_a_value_a_writer_replaced() {
+    let shared = Arc::new(SharedPd::default());
+    let tenant = Arc::new(Tenant::new(&shared, 1));
+    let (key, v1) = group("rg_race", 1);
+    let (_, late) = group("rg_race", 2);
+    let (_, v3) = group("rg_race", 3);
+    run_step(&tenant, "owner-a", &[set(&key, &v1)]);
+    tenant.pd.set(&key, Some(late));
+    let store = Arc::new(HookedStore { inner: Arc::clone(&tenant.store), after_next: Mutex::default() });
+    let (done, written) = std::sync::mpsc::channel();
+    let writer = Arc::new(Mutex::new(None));
+    *tenant.pd.after_read.lock().unwrap() = Some(Box::new({
+        let (store, tenant, writer, key, v3) = (Arc::clone(&store), Arc::clone(&tenant), Arc::clone(&writer), key.clone(), v3.clone());
+        move || {
+            *store.after_next.lock().unwrap() = Some(Box::new(move || {
+                *writer.lock().unwrap() = Some(std::thread::spawn(move || {
+                    run_step(&tenant, "owner-a", &[set(&key, &v3)]);
+                    // The hook stopped waiting when the writer was blocked.
+                    let _ = done.send(());
+                }));
+                // Long enough for an unblocked writer to finish.
+                let _ = written.recv_timeout(Duration::from_millis(500));
+            }));
+        }
+    }));
+    let report = reconcile_once(store.as_ref(), tenant.pd.as_ref(), &tenant.options("owner-b"), &|| true).unwrap();
+    writer.lock().unwrap().take().expect("the writer ran").join().unwrap();
+    assert_eq!(tenant.record(&key).unwrap().value.as_ref(), Some(&v3));
+    assert_eq!(tenant.pd.get(&key).as_ref(), Some(&v3), "{report:?}");
+    assert_eq!(tenant.reconcile("owner-b").repaired, Vec::<ObjectKey>::new());
+}
+
+/// A GC delete of two label rules in another process: the owner's
+/// reconciler aborts the first intent while the deletes are held in PD,
+/// then steps down. The session's finalize is refused, and it resolves the
+/// whole attempt: right after the failed call, both rules are back in PD as
+/// their records hold them and no intent is left.
+#[test]
+fn a_partly_aborted_two_object_delete_is_resolved_whole() {
+    let shared = Arc::new(SharedPd::default());
+    let tenant = Arc::new(Tenant::new(&shared, 1));
+    tenant.cutover();
+    let rules = [label(1, "t1", "deny"), label(1, "t2", "deny")];
+    for (key, value) in &rules {
+        run_step(&tenant, "owner-a", &[set(key, value)]);
+    }
+    let planned = rules
+        .iter()
+        .map(|(key, _)| Planned {
+            key: key.clone(),
+            value: None,
+            expect: Some(tenant.record(key).map(|record| (record.generation, record.op_id))),
+        })
+        .collect::<Vec<_>>();
+    let gate = tenant.pd.hold(&rules[0].0);
+    let session = {
+        let tenant = Arc::clone(&tenant);
+        std::thread::spawn(move || {
+            tidb_ddl_pdjournal::direct::write_through(tenant.store.as_ref(), tenant.pd.as_ref(), "gc", elsewhere(&tenant), &planned)
+        })
+    };
+    tenant.pd.wait_held(&rules[0].0);
+    let checks = std::sync::atomic::AtomicUsize::new(0);
+    let report = reconcile_once(tenant.store.as_ref(), tenant.pd.as_ref(), &tenant.options("owner-b"), &|| {
+        checks.fetch_add(1, Ordering::SeqCst) == 0
+    })
+    .unwrap();
+    assert_eq!((report.aborted, tenant.intents()), (1, 1), "the owner aborted one intent and stepped down: {report:?}");
+    gate.release();
+    let refused = session.join().unwrap().unwrap_err().to_string();
+    assert!(refused.contains("aborted before it committed"), "{refused}");
+    assert_eq!(tenant.intents(), 0);
+    for (key, value) in &rules {
+        let record = tenant.record(key).unwrap();
+        assert_eq!(record.value.as_ref(), Some(value), "{key}");
+        assert_eq!(tenant.pd.get(key).as_ref(), Some(value), "{key}");
+    }
 }
