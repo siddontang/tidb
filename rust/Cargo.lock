@@ -5804,6 +5804,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidb-ddl-pdjournal"
+version = "0.0.0"
+dependencies = [
+ "hex",
+ "prost 0.14.4",
+ "serde",
+ "serde_json",
+ "tidb-ddl-label",
+ "tidb-domain-infosync",
+ "tidb-gocontext",
+ "tidb-log",
+ "tidb-logutil",
+ "tidb-meta",
+ "tidb-owner",
+ "tidb-placement",
+ "tidb-proto",
+ "tidb-structure",
+ "tidb-tablecodec",
+ "tidb-txnkv",
+]
+
+[[package]]
 name = "tidb-ddl-resourcegroup"
 version = "0.0.0"
 dependencies = [

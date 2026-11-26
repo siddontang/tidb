@@ -1,0 +1,29 @@
+[package]
+name = "tidb-ddl-pdjournal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The per-keyspace journal of the PD objects TiDB writes (resource groups, placement bundles, label rules) and its reconciler."
+
+[dependencies]
+hex = "0.4"
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tidb-ddl-label = { path = "../tidb-ddl-label" }
+tidb-domain-infosync = { path = "../tidb-domain-infosync" }
+tidb-gocontext = { path = "../tidb-gocontext" }
+tidb-log = { path = "../tidb-log" }
+tidb-logutil = { path = "../tidb-logutil" }
+tidb-meta = { path = "../tidb-meta" }
+tidb-owner = { path = "../tidb-owner" }
+tidb-placement = { path = "../tidb-placement" }
+tidb-proto = { path = "../tidb-proto" }
+tidb-structure = { path = "../tidb-structure" }
+tidb-tablecodec = { path = "../tidb-tablecodec" }
+tidb-txnkv = { path = "../tidb-txnkv" }
+
+[lints]
+workspace = true

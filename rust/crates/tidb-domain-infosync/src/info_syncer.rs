@@ -103,6 +103,20 @@ impl InfoSyncer {
         self.codec.as_ref()
     }
 
+    /// The keyspace this syncer's store serves, `None` for an API-V1 store.
+    pub fn keyspace_id(&self) -> Option<u32> {
+        self.codec.as_ref().map(ApiV2Codec::keyspace_id)
+    }
+
+    /// `bundle` as PD keeps it for this keyspace
+    /// ([`placement_manager::encode_bundle`]).
+    ///
+    /// # Errors
+    /// A rule key that is not a hex `codec.EncodeBytes` key.
+    pub fn pd_bundle(&self, bundle: &Bundle) -> Result<Bundle, String> {
+        placement_manager::encode_bundle(self.codec.as_ref(), bundle)
+    }
+
     /// The bundle `name` of this keyspace from its placement manager, read
     /// back from the group PD keeps it under
     /// ([`placement_manager::decode_bundle`]).

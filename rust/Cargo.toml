@@ -381,6 +381,7 @@ members = [
     "crates/tidb-unistore-kverrors",
     "crates/tidb-ddl-build",
     "crates/tidb-ddl-label",
+    "crates/tidb-ddl-pdjournal",
     "crates/tidb-privilege",
     "crates/tidb-privilege-conn",
     "crates/tidb-privilege-ldap",
