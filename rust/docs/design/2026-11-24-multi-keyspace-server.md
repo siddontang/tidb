@@ -970,13 +970,15 @@ rule client. A tenant's PD effects then go through its own clients:
   and GC's delete return the error.
 
   Which label rules the cutover adopts: `Rule::reset` keeps a rule's
-  database, table, partition and keyspace in its labels, so a rule is
-  TiDB's only when `new_rule_id` rebuilt from those labels for the
-  keyspace's codec is its exact ID, its keyspace label is the tenant's, and
-  its key ranges are exactly the catalog's physical ranges of that table
-  or partition (table and partitions for a table rule), read from the
-  catalog at the cutover; names with `/` are fine, the labels carry them
-  whole. A rule outside TiDB's IDs (`[keyspace/<id>/]schema/...`) is the
+  database, table, partition and keyspace in its labels and sets every
+  other field TiDB writes, so a rule is TiDB's only when `new_rule_id`
+  rebuilt from those labels for the keyspace's codec is its exact ID and
+  the whole rule equals the one `Rule::reset` builds from its labels over
+  the catalog's physical IDs of that table or partition (table and
+  partitions for a table rule): index 2 or 3, type, reserved labels (the
+  tenant's keyspace label on a keyspace-aware codec) and key ranges. The
+  catalog is listed once per database per cutover run; names with `/` are
+  fine, the labels carry them whole. A rule outside TiDB's IDs (`[keyspace/<id>/]schema/...`) is the
   operator's or PD's: no record, never written or reverted. A rule under
   TiDB's IDs that fails any check (missing or mismatched labels, another
   range, a table the catalog does not hold, a catalog that cannot be read)
@@ -984,13 +986,17 @@ rule client. A tenant's PD effects then go through its own clients:
   recorded durably in the journal (`PDJrnl/H/...`), and every write of it
   -- a job step, ALTER RANGE, GC -- fails before PD with an error naming
   it, across restarts and owner changes, so an abort can never take it for
-  absent and delete it. The operator resolves it by inspecting the rule in
+  absent and delete it; GC's delete of a dropped table's rule fails too,
+  so its delete-range task stays pending until the rule is resolved. The operator resolves it by inspecting the rule in
   PD and either deleting it (`pd-ctl region-label delete <id>`; re-apply
   the table's attributes by DDL afterwards if they were TiDB's) or making
   it the table's own (its labels and ranges), then restarting the DDL
   owner with `TIDB_PD_JOURNAL_CUTOVER` naming the keyspace again: that run
   re-checks every held-back object, adopts one that is now TiDB's, records
   a tombstone for one PD no longer holds, and keeps the rest held back.
+  With the variable left set, a takeover after a complete cutover reads
+  the marker and the held-back objects first and, with none held back,
+  reads neither PD nor the catalog.
 
   Residual: a repair racing a non-job writer on another node can revert that writer's
   just-written value until the next pass; BR's restore writes label rules

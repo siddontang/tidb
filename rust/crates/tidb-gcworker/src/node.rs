@@ -437,13 +437,25 @@ impl GcRuleClient for NodeGcRules {
 
     /// GC's deletes of the rules it chose from PD: each only while its
     /// record still holds the rule GC read (a reused name may hold another
-    /// table's rule by now), and over that record's generation.
+    /// table's rule by now), and over that record's generation. A rule the
+    /// cutover held back fails the delete, so its task stays pending until
+    /// the operator resolves it.
     fn delete_label_rules(&self, rules: Vec<tidb_ddl_label::Rule>) -> GcResult<()> {
         let keys = rules
             .iter()
             .map(|rule| tidb_ddl_pdjournal::ObjectKey::label_rule(&rule.id))
             .collect::<Vec<_>>();
         let records = self.records(&keys)?;
+        // A rule the cutover held back has no record on purpose: GC must not
+        // skip it as a reused name and complete its task, but wait for the
+        // operator to resolve it.
+        let unrecorded = keys.iter().filter(|key| !records.contains_key(*key)).cloned().collect::<Vec<_>>();
+        if !unrecorded.is_empty() {
+            let held = tidb_ddl_pdjournal::direct::read_held_back(self.journal.as_ref(), &unrecorded).map_err(GcError::new)?;
+            if let Some(held) = held.into_iter().next() {
+                return Err(GcError::new(tidb_ddl_pdjournal::JournalError::HeldBack(held.key, held.reason).to_string()));
+            }
+        }
         let keyspace_id = self.codec.as_ref().map(tikv_client::request::ApiV2Codec::keyspace_id);
         let mut chosen = Vec::new();
         for (key, rule) in keys.into_iter().zip(&rules) {
@@ -541,6 +553,47 @@ mod tests {
         let refused = GcRuleClient::delete_label_rules(&rules, vec![rule.clone()]).unwrap_err();
         assert!(refused.to_string().contains("PD journal cutover"), "{refused}");
         assert_eq!(syncer.label_rule_manager().get_label_rules(&[rule.id.clone()]).unwrap().len(), 1);
+    }
+
+    /// A dropped table's label rule the PD journal cutover held back (it
+    /// has no record on purpose): GC finds it and its delete fails with the
+    /// operator-facing error instead of skipping it as a reused name, so
+    /// the delete-range task stays pending and PD keeps the rule. Once the
+    /// operator resolves it (here: adopts it as TiDB's), GC deletes it.
+    #[test]
+    fn gc_waits_for_a_label_rule_the_cutover_held_back() {
+        let (_pd, store) = journal();
+        let syncer = Arc::new(InfoSyncer::new(1));
+        let rules = NodeGcRules {
+            journal: Arc::clone(&store),
+            codec: tidb_domain_infosync::info_syncer::store_codec(1),
+            info_syncer: Some(Arc::clone(&syncer)),
+        };
+        // A rule with an attribute label, as ALTER TABLE ATTRIBUTES left it.
+        let mut rule: tidb_ddl_label::Rule =
+            serde_json::from_value(serde_json::json!({ "labels": [{ "key": "merge_option", "value": "deny" }] })).unwrap();
+        rule.reset(GcRuleClient::label_codec(&rules).as_ref(), "d", "t", "", &[300]);
+        syncer.label_rule_manager().put_label_rule(&rule).unwrap();
+        let key = tidb_ddl_pdjournal::ObjectKey::label_rule(&rule.id);
+        let held = [(key.clone(), "its key ranges differ".to_owned())].into_iter().collect();
+        tidb_ddl_pdjournal::journal::seed_cutover_holding_back(store.as_ref(), &Default::default(), &held).unwrap();
+
+        let gc = |rules: &NodeGcRules| {
+            let found = GcRuleClient::get_label_rules(rules, std::slice::from_ref(&rule.id))?;
+            let chosen = crate::gc_worker::get_gc_rules(&[300], &found, GcRuleClient::label_codec(rules).as_ref());
+            assert_eq!(chosen, [rule.id.clone()], "GC chooses the dropped table's rule");
+            GcRuleClient::delete_label_rules(rules, chosen.iter().map(|id| found[id].clone()).collect())
+        };
+        let refused = gc(&rules).unwrap_err().to_string();
+        assert!(refused.contains("held back at the PD journal cutover"), "{refused}");
+        assert_eq!(syncer.label_rule_manager().get_label_rules(&[rule.id.clone()]).unwrap().len(), 1, "PD keeps it");
+
+        let adopted = [(key.clone(), Some(tidb_ddl_pdjournal::pd::label_rule_value(&rule)))].into_iter().collect();
+        assert_eq!(tidb_ddl_pdjournal::journal::resolve_held_back(store.as_ref(), &adopted).unwrap(), 1);
+        gc(&rules).unwrap();
+        assert!(syncer.label_rule_manager().get_label_rules(&[rule.id.clone()]).unwrap().is_empty());
+        let (records, _) = tidb_ddl_pdjournal::direct::read_current(store.as_ref(), std::slice::from_ref(&key)).unwrap();
+        assert_eq!(records[&key].value, None, "a tombstone");
     }
 
     /// A keyspace's GC reads only its own keyspace's label rules (design

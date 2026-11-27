@@ -142,3 +142,22 @@ pub fn read_current(
     })?;
     Ok(read)
 }
+
+/// The objects among `keys` the keyspace's cutover held back, read in one
+/// transaction: a writer that chooses objects by their record (GC) must not
+/// take one of them for an object without a record and skip it.
+///
+/// # Errors
+/// The journal could not be read.
+pub fn read_held_back(store: &dyn MetaStore, keys: &[crate::ObjectKey]) -> Result<Vec<crate::HeldBack>, String> {
+    let mut held = Vec::new();
+    journal::run(store, &mut |txn| {
+        let mut reader = TxnRead(txn);
+        held.clear();
+        for key in keys {
+            held.extend(journal::read_held_back(&mut reader, key)?);
+        }
+        Ok(())
+    })?;
+    Ok(held)
+}

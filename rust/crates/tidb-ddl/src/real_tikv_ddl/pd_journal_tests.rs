@@ -850,12 +850,20 @@ fn table_rule(tenant: u32, table: &str, merge: &str, ids: &[i64]) -> tidb_ddl_la
 }
 
 /// A catalog of database `db` whose tables are `tables` (name, physical
-/// IDs), for the cutover's check of a rule's ranges.
-fn catalog_of(tables: &[(&str, i64)]) -> tidb_ddl_pdjournal::owner::CatalogIds {
-    let tables = tables.iter().map(|(name, id)| ((*name).to_owned(), *id)).collect::<HashMap<_, _>>();
-    Arc::new(move |db: &str, table: &str, partition: &str| {
-        Ok((db == "db" && partition.is_empty()).then(|| tables.get(table).map(|id| vec![*id])).flatten())
-    })
+/// ID), for the cutover's check of a rule's ranges, and how many times the
+/// cutover listed a database's tables.
+fn catalog_of(tables: &[(&str, i64)]) -> (tidb_ddl_pdjournal::owner::CatalogTables, Arc<std::sync::atomic::AtomicUsize>) {
+    let tables = tables
+        .iter()
+        .map(|(name, id)| tidb_ddl_pdjournal::owner::CatalogTable { name: (*name).to_owned(), id: *id, partitions: Vec::new() })
+        .collect::<Vec<_>>();
+    let listed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&listed);
+    let catalog: tidb_ddl_pdjournal::owner::CatalogTables = Arc::new(move |db: &str| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Ok((db == "db").then(|| tables.clone()))
+    });
+    (catalog, listed)
 }
 
 /// The keyspace's rule ID prefix outside TiDB's (`keyspace/1/` where rules
@@ -882,7 +890,7 @@ fn the_cutover_adopts_only_tidbs_own_rules_and_holds_back_the_ambiguous() {
     let syncer = Arc::new(tidb_domain_infosync::info_syncer::InfoSyncer::new(1));
     let pd = InfoSyncerPd(Arc::clone(&syncer));
     let prefix = keyspace_prefix(&syncer);
-    let catalog = catalog_of(&[("t", 100), ("t/x/y", 101), ("t_range", 102)]);
+    let (catalog, _) = catalog_of(&[("t", 100), ("t/x/y", 101), ("t_range", 102)]);
     let rule_entry = |rule: &tidb_ddl_label::Rule| (ObjectKey::label_rule(&rule.id), label_rule_value(rule));
     let tidb = [rule_entry(&table_rule(1, "t", "deny", &[100])), rule_entry(&table_rule(1, "t/x/y", "deny", &[101]))];
     let (range_key, range_value) = range_bundle(1, tidb_placement::KEY_RANGE_GLOBAL, 1);
@@ -960,7 +968,7 @@ fn a_rule_held_back_at_the_cutover_refuses_writes_after_a_restart() {
     let tenant = Tenant::new(&shared, 1);
     let syncer = Arc::new(tidb_domain_infosync::info_syncer::InfoSyncer::new(1));
     let pd = InfoSyncerPd(Arc::clone(&syncer));
-    let catalog = catalog_of(&[("t", 100)]);
+    let (catalog, _) = catalog_of(&[("t", 100)]);
     let stale = table_rule(1, "t", "deny", &[999]);
     let key = ObjectKey::label_rule(&stale.id);
     let stale = label_rule_value(&stale);
@@ -1093,9 +1101,9 @@ fn a_partly_aborted_two_object_delete_is_resolved_whole() {
     }
 }
 
-/// The production catalog lookup of the cutover reads a table's physical
-/// IDs by its lower-case names from a bootstrapped catalog, and answers
-/// `None` for a table or partition it does not hold.
+/// The production catalog lookup of the cutover lists a database's tables
+/// (lower-case names, physical IDs) from a bootstrapped catalog, and
+/// answers `None` for a database it does not hold.
 #[test]
 fn the_cutover_reads_a_rules_table_ids_from_the_catalog() {
     let shared = Arc::new(SharedPd::default());
@@ -1103,11 +1111,10 @@ fn the_cutover_reads_a_rules_table_ids_from_the_catalog() {
     tidb_session::bootstrap_publish::publish_bootstrap(&tenant.opener, TIMEOUT).unwrap();
     let mut txn = tenant.opener.begin().unwrap();
     let mut snapshot = TransactionMetaSnapshot::new(&mut txn, TIMEOUT);
-    let ids = super::pd_baseline::rule_table_ids(&mut snapshot, "mysql", "tidb_ddl_job", "").unwrap();
-    assert!(ids.is_some_and(|ids| ids.len() == 1 && ids[0] > 0));
-    assert_eq!(super::pd_baseline::rule_table_ids(&mut snapshot, "mysql", "no_such_table", "").unwrap(), None);
-    assert_eq!(super::pd_baseline::rule_table_ids(&mut snapshot, "mysql", "tidb_ddl_job", "p0").unwrap(), None);
-    assert_eq!(super::pd_baseline::rule_table_ids(&mut snapshot, "no_such_db", "tidb_ddl_job", "").unwrap(), None);
+    let tables = super::pd_baseline::catalog_tables(&mut snapshot, "mysql").unwrap().expect("the mysql database");
+    let job = tables.iter().find(|table| table.name == "tidb_ddl_job").expect("mysql.tidb_ddl_job");
+    assert!(job.id > 0 && job.partitions.is_empty(), "{job:?}");
+    assert_eq!(super::pd_baseline::catalog_tables(&mut snapshot, "no_such_db").unwrap(), None);
 }
 
 /// An ALTER RANGE whose PD write timed out is abandoned: it reads the
@@ -1157,4 +1164,67 @@ fn an_abandoned_alter_range_never_overwrites_a_newer_one() {
     tenant.pd.wait_for(&key, &v1);
     tenant.reconcile("owner-b");
     assert_eq!(tenant.pd.get(&key).as_ref(), Some(&v2));
+}
+
+/// Rules with TiDB's labels and the right ranges that still differ from
+/// the rule `Rule::reset` builds -- one with index 5 (TiDB sets 2 for a
+/// table), one with a wrong reserved label (the keyspace's on a
+/// keyspace-aware codec, else the database's) -- are held back.
+#[test]
+fn a_rule_differing_from_tidbs_in_any_field_is_held_back() {
+    use tidb_ddl_pdjournal::owner::seed_from_pd;
+    use tidb_ddl_pdjournal::pd::InfoSyncerPd;
+
+    let shared = Arc::new(SharedPd::default());
+    let tenant = Tenant::new(&shared, 1);
+    let syncer = Arc::new(tidb_domain_infosync::info_syncer::InfoSyncer::new(1));
+    let pd = InfoSyncerPd(Arc::clone(&syncer));
+    let (catalog, _) = catalog_of(&[("t_index", 100), ("t_label", 101), ("t_ok", 102)]);
+    let entry = |rule: &tidb_ddl_label::Rule| (ObjectKey::label_rule(&rule.id), label_rule_value(rule));
+    let (index_key, mut index_value) = entry(&table_rule(1, "t_index", "deny", &[100]));
+    index_value["index"] = PdValue::from(5);
+    let (label_key, mut label_value) = entry(&table_rule(1, "t_label", "deny", &[101]));
+    let reserved = if tidb_ddl_label::use_keyspace_aware_rules(syncer.label_codec()) { "keyspace" } else { "db" };
+    for label in label_value["labels"].as_array_mut().unwrap() {
+        if label["key"] == reserved {
+            label["value"] = PdValue::from("2");
+        }
+    }
+    let (ok_key, ok_value) = entry(&table_rule(1, "t_ok", "deny", &[102]));
+    for (key, value) in [(&index_key, &index_value), (&label_key, &label_value), (&ok_key, &ok_value)] {
+        pd.write(key, Some(value)).unwrap();
+    }
+    let report = seed_from_pd(tenant.store.as_ref(), &syncer, &catalog).unwrap();
+    assert_eq!(report.seeded, 1, "{report:?}");
+    let held = report.held_back.iter().map(|(key, _)| key.clone()).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(held, [index_key.clone(), label_key.clone()].into_iter().collect(), "{report:?}");
+    assert!(report.held_back.iter().any(|(key, reason)| *key == index_key && reason.contains("index")), "{report:?}");
+    assert!(tenant.record(&ok_key).is_some());
+    assert_eq!((tenant.record(&index_key), tenant.record(&label_key)), (None, None));
+}
+
+/// The first cutover over twelve TiDB rules of one database lists that
+/// database's tables once; once the cutover is complete with nothing held
+/// back, a takeover that runs it again reads no catalog at all.
+#[test]
+fn a_cutover_lists_each_database_once_and_a_completed_one_none() {
+    use tidb_ddl_pdjournal::owner::seed_from_pd;
+    use tidb_ddl_pdjournal::pd::InfoSyncerPd;
+
+    let shared = Arc::new(SharedPd::default());
+    let tenant = Tenant::new(&shared, 1);
+    let syncer = Arc::new(tidb_domain_infosync::info_syncer::InfoSyncer::new(1));
+    let pd = InfoSyncerPd(Arc::clone(&syncer));
+    let names = (0..12).map(|index| (format!("t{index}"), 100 + index)).collect::<Vec<_>>();
+    let (catalog, listed) = catalog_of(&names.iter().map(|(name, id)| (name.as_str(), *id)).collect::<Vec<_>>());
+    for (name, id) in &names {
+        let rule = table_rule(1, name, "deny", &[*id]);
+        pd.write(&ObjectKey::label_rule(&rule.id), Some(&label_rule_value(&rule))).unwrap();
+    }
+    let report = seed_from_pd(tenant.store.as_ref(), &syncer, &catalog).unwrap();
+    assert_eq!((report.first, report.seeded, report.held_back.len()), (true, 12, 0), "{report:?}");
+    assert_eq!(listed.load(Ordering::SeqCst), 1, "one listing of the database");
+    let report = seed_from_pd(tenant.store.as_ref(), &syncer, &catalog).unwrap();
+    assert_eq!(report, tidb_ddl_pdjournal::owner::CutoverReport::default());
+    assert_eq!(listed.load(Ordering::SeqCst), 1, "a completed cutover reads no catalog");
 }

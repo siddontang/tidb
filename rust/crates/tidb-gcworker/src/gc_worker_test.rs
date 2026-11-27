@@ -244,6 +244,16 @@ struct FakeRules {
     put_bundles: Mutex<Vec<Vec<String>>>,
     label_rules: Mutex<HashMap<String, tidb_ddl_label::Rule>>,
     deleted_label_rules: Mutex<Vec<Vec<String>>>,
+    /// The error the label-rule deletes answer with, as `NodeGcRules` does
+    /// for a rule the PD journal cutover held back.
+    label_delete_error: Mutex<Option<String>>,
+}
+
+impl FakeRules {
+    /// Makes the label-rule deletes fail with `error` (`None`: succeed).
+    fn fail_label_deletes(&self, error: Option<&str>) {
+        *self.label_delete_error.lock().unwrap() = error.map(str::to_owned);
+    }
 }
 
 impl GcRuleClient for FakeRules {
@@ -275,6 +285,9 @@ impl GcRuleClient for FakeRules {
     }
 
     fn delete_label_rules(&self, rules: Vec<tidb_ddl_label::Rule>) -> GcResult<()> {
+        if let Some(error) = self.label_delete_error.lock().unwrap().clone() {
+            return Err(GcError::new(error));
+        }
         self.deleted_label_rules.lock().unwrap().push(rules.into_iter().map(|rule| rule.id).collect());
         Ok(())
     }
@@ -2251,6 +2264,23 @@ fn test_gc_placement_rules() {
     do_gc_placement_rules(session.as_mut(), s.rules.as_ref(), 1, &range, &cache).unwrap();
     assert!(cache.lock().unwrap().contains(&10));
     assert_eq!(1, s.rules.put_bundles.lock().unwrap().len());
+}
+
+/// A dropped table's delete-range task whose label-rule delete fails (a
+/// rule the PD journal cutover held back) stays pending, and completes once
+/// the delete goes through.
+#[test]
+fn a_failed_label_rule_delete_keeps_its_delete_range_task() {
+    let s = create_gc_worker_suite();
+    s.sessions.state.lock().unwrap().history_job = Some(mock_history_job_for_delete_ranges);
+    s.insert_delete_ranges(&[(1, 2, "1", "2", 10)]);
+    let concurrency = GcConcurrency { v: 1, is_auto: false };
+    s.rules.fail_label_deletes(Some("held back at the PD journal cutover"));
+    s.job().delete_ranges(20, concurrency).unwrap();
+    assert_eq!(s.load_delete_ranges(false, 20).len(), 1, "the task stays pending");
+    s.rules.fail_label_deletes(None);
+    s.job().delete_ranges(20, concurrency).unwrap();
+    assert!(s.load_delete_ranges(false, 20).is_empty());
 }
 
 #[test]

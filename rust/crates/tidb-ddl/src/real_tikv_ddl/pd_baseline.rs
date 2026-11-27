@@ -126,35 +126,33 @@ pub(crate) fn catalog_values<S: MetaSnapshot>(
     Ok(found)
 }
 
-/// The catalog's physical IDs, as of `snapshot`, of what a TiDB label rule
-/// of database `db`, table `table` and partition `partition` (lower-case,
-/// "" for a table rule) covers: the table's and its partitions' (Go
-/// `getIDs`) or the partition's. `None` when the catalog holds no such
-/// table or partition. The PD journal cutover checks a rule's ranges
-/// against them ([`tidb_ddl_pdjournal::owner::CatalogIds`]).
+/// The tables of the database `db` (lower-case) as of `snapshot`, with
+/// their lower-case names and their partitions', which the PD journal
+/// cutover checks a label rule's ranges against
+/// ([`tidb_ddl_pdjournal::owner::CatalogTables`]); `None` when the catalog
+/// holds no such database.
 ///
 /// # Errors
 /// The catalog could not be read.
-pub(crate) fn rule_table_ids<S: MetaSnapshot>(
+pub(crate) fn catalog_tables<S: MetaSnapshot>(
     snapshot: &mut S,
     db: &str,
-    table: &str,
-    partition: &str,
-) -> Result<Option<Vec<i64>>, String> {
+) -> Result<Option<Vec<tidb_ddl_pdjournal::owner::CatalogTable>>, String> {
     for stored in scan(snapshot, &key::databases_kv_prefix())? {
         let database = value::parse_db_info(&stored).map_err(|error| error.to_string())?;
         if database.name.lowercase() != db {
             continue;
         }
         let tables = tidb_infoschema::cluster_catalog::list_tables(snapshot, database.id).map_err(|error| error.to_string())?;
-        let Some(info) = tables.iter().find(|info| info.name.lowercase() == table) else {
-            return Ok(None);
-        };
-        let names = tidb_ddl_build::label_rules::LabelRuleTable::from_table_info(info);
-        if partition.is_empty() {
-            return Ok(Some(names.ids()));
-        }
-        return Ok(names.partitions.iter().find(|(name, _)| name == partition).map(|(_, id)| vec![*id]));
+        return Ok(Some(
+            tables
+                .iter()
+                .map(|info| {
+                    let names = tidb_ddl_build::label_rules::LabelRuleTable::from_table_info(info);
+                    tidb_ddl_pdjournal::owner::CatalogTable { name: names.name, id: names.id, partitions: names.partitions }
+                })
+                .collect(),
+        ));
     }
     Ok(None)
 }

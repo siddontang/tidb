@@ -1749,13 +1749,13 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&owner));
         // The PD journal cutover checks a label rule's ranges against the
-        // catalog's table IDs, read from a fresh snapshot.
-        let catalog: tidb_ddl_pdjournal::owner::CatalogIds = {
+        // catalog's tables, read from a fresh snapshot.
+        let catalog: tidb_ddl_pdjournal::owner::CatalogTables = {
             let opener = Arc::clone(&opener);
-            Arc::new(move |db: &str, table: &str, partition: &str| {
+            Arc::new(move |db: &str| {
                 let mut txn = opener.begin().map_err(|error| error.to_string())?;
                 let mut snapshot = tidb_infoschema_issyncer::real_tikv_catalog::TransactionMetaSnapshot::new(&mut txn, timeout);
-                crate::real_tikv_ddl::pd_baseline::rule_table_ids(&mut snapshot, db, table, partition)
+                crate::real_tikv_ddl::pd_baseline::catalog_tables(&mut snapshot, db)
             })
         };
         owner.set_listener(tidb_ddl_pdjournal::owner::with_scheduler(Arc::new(tidb_store_driver_txn::meta_txn::MetaStore::new(Arc::clone(&opener), timeout)), { let pool = Arc::clone(&scheduler.session_pool); Arc::new(move || pool.info_syncer()) }, catalog, &owner, scheduler.clone()));

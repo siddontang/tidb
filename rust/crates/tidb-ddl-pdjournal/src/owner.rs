@@ -40,12 +40,51 @@ fn cutover_asked(keyspace_id: Option<u32>) -> bool {
     })
 }
 
-/// The catalog's physical IDs of the object a TiDB label rule of `(db,
-/// table, partition)` covers, as of now: for a table rule (partition "")
-/// the table's and then its partitions' (Go `getIDs`), for a partition
-/// rule the partition's; `None` when the catalog holds no such table or
-/// partition. The names are lower-case, as TiDB's rules carry them.
-pub type CatalogIds = Arc<dyn Fn(&str, &str, &str) -> Result<Option<Vec<i64>>, String> + Send + Sync>;
+/// One table of a database as the cutover checks a TiDB label rule against
+/// it: its lower-case name, its physical ID, and its partitions'
+/// lower-case names and IDs in definition order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CatalogTable {
+    /// Go `tblInfo.Name.L`.
+    pub name: String,
+    /// Go `tblInfo.ID`.
+    pub id: i64,
+    /// The partitions' `Name.L` and `ID`.
+    pub partitions: Vec<(String, i64)>,
+}
+
+/// The catalog's tables of the database the argument names (lower-case),
+/// read afresh; `None` when the catalog holds no such database.
+pub type CatalogTables = Arc<dyn Fn(&str) -> Result<Option<Vec<CatalogTable>>, String> + Send + Sync>;
+
+/// One cutover run's reads of the catalog: each database's tables are
+/// listed once and reused for every rule in it.
+struct Catalog<'a> {
+    tables: &'a CatalogTables,
+    by_db: BTreeMap<String, Result<Option<Vec<CatalogTable>>, String>>,
+}
+
+impl<'a> Catalog<'a> {
+    fn new(tables: &'a CatalogTables) -> Self {
+        Self { tables, by_db: BTreeMap::new() }
+    }
+
+    /// The physical IDs a TiDB rule of `(db, table, partition)` covers: the
+    /// table's and then its partitions' (Go `getIDs`) for a table rule
+    /// (partition ""), the partition's for a partition rule; `None` when
+    /// the catalog holds no such table or partition.
+    fn ids(&mut self, db: &str, table: &str, partition: &str) -> Result<Option<Vec<i64>>, String> {
+        let tables = self.tables;
+        let listed = self.by_db.entry(db.to_owned()).or_insert_with(|| tables(db)).clone()?;
+        let Some(found) = listed.unwrap_or_default().into_iter().find(|candidate| candidate.name == table) else {
+            return Ok(None);
+        };
+        if partition.is_empty() {
+            return Ok(Some(std::iter::once(found.id).chain(found.partitions.iter().map(|(_, id)| *id)).collect()));
+        }
+        Ok(found.partitions.iter().find(|(name, _)| name == partition).map(|(_, id)| vec![*id]))
+    }
+}
 
 /// What the cutover makes of a label rule PD holds.
 #[derive(Debug, PartialEq)]
@@ -60,13 +99,17 @@ enum Ownership {
 }
 
 /// Whether `rule` is TiDB's own for this keyspace. `Rule::reset` keeps the
-/// database, table, partition and keyspace in labels, so the rule is
-/// TiDB's only when its ID is the one [`tidb_ddl_label::new_rule_id`]
-/// rebuilds from those labels for the keyspace's codec, its keyspace label
-/// is this keyspace's, and its key ranges are exactly the catalog's
-/// physical ranges of that table or partition. A rule under TiDB's ID
-/// prefix that fails any of that is ambiguous.
-fn ownership(syncer: &InfoSyncer, catalog: &CatalogIds, rule: &tidb_ddl_label::Rule) -> Ownership {
+/// database, table, partition and keyspace in labels and sets every other
+/// field TiDB writes, so the rule is TiDB's only when its ID is the one
+/// [`tidb_ddl_label::new_rule_id`] rebuilds from those labels for the
+/// keyspace's codec and the whole rule equals the one `Rule::reset` builds
+/// from its own labels over the catalog's physical IDs of that table or
+/// partition: its index (2 for a table, 3 for a partition), type, reserved
+/// labels (the keyspace's on a keyspace-aware codec) and key ranges. The
+/// expected rule is decoded afresh from the PD rule, so resetting it never
+/// touches the rule it is compared with (a `Rule` clone shares its labels).
+/// A rule under TiDB's ID prefix that fails any of that is ambiguous.
+fn ownership(syncer: &InfoSyncer, catalog: &mut Catalog<'_>, rule: &tidb_ddl_label::Rule) -> Ownership {
     let codec = syncer.label_codec();
     let prefix = tidb_ddl_label::new_rule_id(codec, "", "", "");
     if !rule.id.starts_with(&format!("{}/", prefix.trim_end_matches('/'))) {
@@ -83,27 +126,33 @@ fn ownership(syncer: &InfoSyncer, catalog: &CatalogIds, rule: &tidb_ddl_label::R
     if rebuilt != rule.id {
         return ambiguous(format!("its labels make the rule ID {rebuilt}"));
     }
-    if tidb_ddl_label::use_keyspace_aware_rules(codec) && label("keyspace") != Some(codec.keyspace_id().to_string()) {
-        return ambiguous("its keyspace label is not this keyspace's".to_owned());
-    }
-    if rule.rule_type != tidb_ddl_label::RULE_TYPE {
-        return ambiguous(format!("its type is {:?}, not {}", rule.rule_type, tidb_ddl_label::RULE_TYPE));
-    }
-    let ids = match catalog(&db, &table, &partition) {
+    let ids = match catalog.ids(&db, &table, &partition) {
         Ok(Some(ids)) => ids,
         Ok(None) => return ambiguous("the catalog holds no such table or partition".to_owned()),
         Err(error) => return ambiguous(format!("the catalog could not be read: {error}")),
     };
-    let mut expected = rule.clone();
+    let held = label_rule_value(rule);
+    let mut expected = match serde_json::from_value::<tidb_ddl_label::Rule>(held.clone()) {
+        Ok(expected) => expected,
+        Err(error) => return ambiguous(format!("it does not decode: {error}")),
+    };
     expected.reset(codec, &db, &table, &partition, &ids);
     let key = ObjectKey::label_rule(&rule.id);
-    let ranges = |rule: &tidb_ddl_label::Rule| {
-        crate::normalize::projection(&key, &label_rule_value(rule), syncer.keyspace_id()).map(|projected| projected["data"].clone())
-    };
-    match (ranges(&expected), ranges(rule)) {
+    let project = |value: &PdValue| crate::normalize::projection(&key, value, syncer.keyspace_id());
+    match (project(&label_rule_value(&expected)), project(&held)) {
         (Ok(wanted), Ok(held)) if wanted == held => Ownership::Tidb,
-        (Ok(_), Ok(_)) => ambiguous(format!("its key ranges are not those of physical tables {ids:?}")),
-        (Err(error), _) | (_, Err(error)) => ambiguous(format!("its ranges could not be read: {error}")),
+        (Ok(wanted), Ok(held)) => {
+            let differs = ["index", "rule_type", "labels", "data"]
+                .into_iter()
+                .filter(|field| wanted.get(field) != held.get(field))
+                .map(|field| if field == "data" { "key ranges" } else { field })
+                .collect::<Vec<_>>();
+            ambiguous(format!(
+                "it differs from the rule TiDB builds for physical tables {ids:?} in its {}",
+                if differs.is_empty() { "fields".to_owned() } else { differs.join(", ") }
+            ))
+        }
+        (Err(error), _) | (_, Err(error)) => ambiguous(format!("it could not be compared: {error}")),
     }
 }
 
@@ -113,7 +162,7 @@ fn ownership(syncer: &InfoSyncer, catalog: &CatalogIds, rule: &tidb_ddl_label::R
 /// adopted), and the label rules held back with why.
 type PdOnly = (BTreeMap<ObjectKey, PdValue>, BTreeMap<ObjectKey, String>);
 
-fn pd_only_objects(syncer: &InfoSyncer, catalog: &CatalogIds) -> Result<PdOnly, String> {
+fn pd_only_objects(syncer: &InfoSyncer, catalog: &mut Catalog<'_>) -> Result<PdOnly, String> {
     let (mut objects, mut held_back) = (BTreeMap::new(), BTreeMap::new());
     let rules = syncer.label_rule_manager().get_all_label_rules(syncer.label_codec())?;
     for rule in tidb_domain_infosync::label_manager::filter_rules_by_keyspace(rules, syncer.label_codec()) {
@@ -153,38 +202,60 @@ pub struct CutoverReport {
 }
 
 /// The operator's cutover of the keyspace `syncer` serves, from what PD
-/// holds now: a record of each of TiDB's PD-only objects, and each label
-/// rule of TiDB's ID shape that is not provably TiDB's
-/// ([`ownership`], against `catalog`) held back durably
-/// ([`crate::journal::seed_cutover_holding_back`]). After an earlier
-/// cutover, re-checks the objects it held back, which the operator has
-/// fixed in PD: one that is now TiDB's is adopted, one PD no longer holds
-/// gets a tombstone, and the others stay held back
-/// ([`crate::journal::resolve_held_back`]).
+/// holds now. It reads the cutover marker and the held-back objects first.
+/// On the first cutover: a record of each of TiDB's PD-only objects, and
+/// each label rule of TiDB's ID shape that is not provably TiDB's
+/// ([`ownership`], against `catalog`, which it lists once per database)
+/// held back durably ([`crate::journal::seed_cutover_holding_back`]).
+/// After an earlier cutover it reads only the held-back rules from PD,
+/// which the operator has fixed there: one that is now TiDB's is adopted,
+/// one PD no longer holds gets a tombstone, and the others stay held back
+/// ([`crate::journal::resolve_held_back`]); with none held back it reads
+/// neither PD nor the catalog.
 ///
 /// # Errors
 /// PD or the journal could not be read, or the seeding not committed.
 pub fn seed_from_pd(
     store: &dyn tidb_meta::MetaStore,
     syncer: &InfoSyncer,
-    catalog: &CatalogIds,
+    catalog: &CatalogTables,
 ) -> Result<CutoverReport, String> {
-    let (objects, held_back) = pd_only_objects(syncer, catalog)?;
-    if let Some(seeded) = crate::journal::seed_cutover_holding_back(store, &objects, &held_back)? {
-        return Ok(CutoverReport { first: true, seeded, held_back: held_back.into_iter().collect() });
-    }
-    let mut pending = Vec::new();
+    let (mut cutover, mut pending) = (false, Vec::new());
     crate::journal::run(store, &mut |txn| {
-        pending = crate::journal::scan_held_back(&mut crate::TxnRead(txn))?;
+        let mut reader = crate::TxnRead(txn);
+        cutover = crate::journal::read_cutover(&mut reader)?.is_some();
+        pending = crate::journal::scan_held_back(&mut reader)?;
         Ok(())
     })?;
+    let mut catalog = Catalog::new(catalog);
+    if !cutover {
+        let (objects, held_back) = pd_only_objects(syncer, &mut catalog)?;
+        let seeded = crate::journal::seed_cutover_holding_back(store, &objects, &held_back)?;
+        return Ok(match seeded {
+            Some(seeded) => CutoverReport { first: true, seeded, held_back: held_back.into_iter().collect() },
+            // Another owner's cutover committed meanwhile.
+            None => CutoverReport::default(),
+        });
+    }
+    if pending.is_empty() {
+        return Ok(CutoverReport::default());
+    }
+    let ids = pending.iter().map(|held| held.key.id.clone()).collect::<Vec<_>>();
+    let rules = syncer.label_rule_manager().get_label_rules(&ids)?;
     let mut resolved = BTreeMap::new();
     let mut still = Vec::new();
     for held in pending {
-        if let Some(reason) = held_back.get(&held.key) {
-            still.push((held.key, reason.clone()));
-        } else {
-            resolved.insert(held.key.clone(), objects.get(&held.key).cloned());
+        match rules.get(&held.key.id) {
+            None => {
+                resolved.insert(held.key, None);
+            }
+            Some(rule) => match ownership(syncer, &mut catalog, rule) {
+                Ownership::Tidb => {
+                    resolved.insert(held.key, Some(label_rule_value(rule)));
+                }
+                Ownership::Ambiguous(reason) => still.push((held.key, reason)),
+                Ownership::Foreign => still.push((held.key, held.reason)),
+            },
         }
     }
     let seeded = crate::journal::resolve_held_back(store, &resolved)?;
@@ -196,7 +267,7 @@ pub fn seed_from_pd(
 /// build writes the keyspace's PD-only objects before (they are refused
 /// until the cutover); the variable is the operator's word that no older
 /// node does either. Each object held back is logged for the operator.
-fn cutover_if_asked(store: &dyn tidb_meta::MetaStore, syncer: &InfoSyncer, catalog: &CatalogIds) {
+fn cutover_if_asked(store: &dyn tidb_meta::MetaStore, syncer: &InfoSyncer, catalog: &CatalogTables) {
     use tidb_log::{Field, Value};
     if !cutover_asked(syncer.keyspace_id()) {
         return;
@@ -234,7 +305,7 @@ fn cutover_if_asked(store: &dyn tidb_meta::MetaStore, syncer: &InfoSyncer, catal
 pub fn with_scheduler(
     store: Arc<dyn tidb_meta::MetaStore>,
     info_syncer: SyncerOf,
-    catalog: CatalogIds,
+    catalog: CatalogTables,
     owner: &Arc<dyn tidb_owner::Manager>,
     scheduler: Arc<dyn tidb_owner::Listener>,
 ) -> Arc<dyn tidb_owner::Listener> {
@@ -254,7 +325,7 @@ pub type SyncerOf = Arc<dyn Fn() -> Option<Arc<InfoSyncer>> + Send + Sync>;
 struct PdJournalDuties {
     store: Arc<dyn tidb_meta::MetaStore>,
     info_syncer: SyncerOf,
-    catalog: CatalogIds,
+    catalog: CatalogTables,
     /// Weak: the owner manager holds this listener.
     owner: std::sync::Weak<dyn tidb_owner::Manager>,
     /// The running reconciler's stop flag.
