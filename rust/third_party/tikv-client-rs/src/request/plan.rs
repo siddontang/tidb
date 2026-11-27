@@ -2090,10 +2090,11 @@ where
                 // deadline exhaustion after its typed region-error branches.
                 Ok(RegionErrorRetry::Immediate)
             } else {
-                Box::pin(handle_region_error(
+                Box::pin(handle_region_error_in(
                     pd_client.clone(),
                     e.clone(),
                     region_store.clone(),
+                    plan.region_error_codec(),
                 ))
                 .await
             };
@@ -2480,6 +2481,19 @@ pub(crate) async fn handle_region_error<PdC: PdClient>(
     e: errorpb::Error,
     region_store: RegionStore,
 ) -> Result<RegionErrorRetry> {
+    handle_region_error_in(pd_client, e, region_store, None).await
+}
+
+/// [`handle_region_error`] for an error `codec` (the request's API V2
+/// response codec) decoded: its replacement regions and bucket keys are
+/// logical and scoped to the keyspace, as the returned error carries them,
+/// and are installed into the region cache with physical keys.
+pub(crate) async fn handle_region_error_in<PdC: PdClient>(
+    pd_client: Arc<PdC>,
+    e: errorpb::Error,
+    region_store: RegionStore,
+    codec: Option<crate::request::ApiV2Codec>,
+) -> Result<RegionErrorRetry> {
     let ver_id = region_store.region_with_leader.ver_id();
     let store_id = region_store.region_with_leader.get_store_id();
     // Source checks this flag before the ordered errorpb branch chain. A
@@ -2545,19 +2559,19 @@ pub(crate) async fn handle_region_error<PdC: PdClient>(
         pd_client.invalidate_region_cache(ver_id).await;
         Err(Error::RegionError(Box::new(e)))
     } else if let Some(epoch_not_match) = e.epoch_not_match.clone() {
-        match on_region_epoch_not_match(pd_client.clone(), region_store, epoch_not_match).await? {
+        match on_region_epoch_not_match_in(pd_client.clone(), region_store, epoch_not_match, codec).await? {
             EpochNotMatchOutcome::RetryAfterBackoff => {
                 Ok(RegionErrorRetry::Backoff(BO_REGION_MISS))
             }
             EpochNotMatchOutcome::Stop => Err(Error::RegionError(Box::new(e))),
         }
     } else if let Some(bucket_mismatch) = e.bucket_version_not_match.as_ref() {
+        let keys = match codec {
+            Some(codec) => codec.physical_bucket_keys(&bucket_mismatch.keys),
+            None => bucket_mismatch.keys.clone(),
+        };
         pd_client
-            .update_buckets(
-                ver_id,
-                bucket_mismatch.version,
-                bucket_mismatch.keys.clone(),
-            )
+            .update_buckets(ver_id, bucket_mismatch.version, keys)
             .await;
         // client-go updates the bucket cache but deliberately returns this
         // region error to its bucket-aware caller, which must reschedule the
@@ -2636,6 +2650,18 @@ pub(crate) async fn on_region_epoch_not_match<PdC: PdClient>(
     region_store: RegionStore,
     error: EpochNotMatch,
 ) -> Result<EpochNotMatchOutcome> {
+    on_region_epoch_not_match_in(pd_client, region_store, error, None).await
+}
+
+/// [`on_region_epoch_not_match`] for replacement regions `codec` decoded to
+/// logical keys: the cache, which keeps physical keys, gets them with the
+/// keyspace prefix restored.
+pub(crate) async fn on_region_epoch_not_match_in<PdC: PdClient>(
+    pd_client: Arc<PdC>,
+    region_store: RegionStore,
+    error: EpochNotMatch,
+    codec: Option<crate::request::ApiV2Codec>,
+) -> Result<EpochNotMatchOutcome> {
     let ver_id = region_store.region_with_leader.ver_id();
     if error.current_regions.is_empty() {
         pd_client
@@ -2688,7 +2714,11 @@ pub(crate) async fn on_region_epoch_not_match<PdC: PdClient>(
     let replacements = error
         .current_regions
         .into_iter()
-        .map(|region| {
+        .map(|mut region| {
+            if let Some(codec) = codec {
+                (region.start_key, region.end_key) =
+                    codec.physical_region_range(&region.start_key, &region.end_key);
+            }
             let initial_leader_store_id = if response_is_tiflash {
                 region
                     .peers
@@ -5794,6 +5824,129 @@ mod test {
             source_server_busy_backoff_config(&tiflash_compute),
             BO_TIFLASH_SERVER_BUSY
         );
+    }
+
+    /// An API V2 region error as the cloud engine sends it: memcomparable
+    /// physical bounds, a sibling region of the neighbouring tenant, and a
+    /// message that formats the keys. The region cache gets the replacement
+    /// regions and bucket keys of this keyspace with physical keys; the error
+    /// the handler returns carries only this keyspace's logical bounds and no
+    /// byte of the neighbour's keys or of the keyspace prefix, in its fields,
+    /// its message, its Display or its Debug. A KeyNotInRegion whose raw
+    /// bounds do not decode still invalidates the region, with both bounds
+    /// cleared.
+    #[tokio::test]
+    async fn api_v2_region_errors_install_physical_regions_and_return_tenant_safe_errors() {
+        use crate::request::{ApiV2Codec, KeyMode};
+
+        let codec = ApiV2Codec::new(KeyMode::Txn, 1).unwrap();
+        let neighbour = ApiV2Codec::new(KeyMode::Txn, 2).unwrap();
+        let encoded = |raw: &[u8]| {
+            let mut encoded = Vec::new();
+            crate::kv::codec::encode_bytes(&mut encoded, raw);
+            encoded
+        };
+        let secret_key = neighbour.encode_key(b"OTHERTENANT-secret");
+        let bytes = |key: &[u8]| format!("{key:?}").trim_matches(|c| c == '[' || c == ']').to_owned();
+        let leaked = |error: &Error| {
+            let text = format!("{error} {error:?}");
+            text.contains("OTHERTENANT")
+                || text.contains(&bytes(&secret_key))
+                || text.contains(&bytes(&neighbour.end_key()))
+                || text.contains(&bytes(&codec.prefix()))
+        };
+        let region = |id, start: &[u8], end: &[u8]| crate::proto::metapb::Region {
+            id,
+            start_key: encoded(start),
+            end_key: encoded(end),
+            region_epoch: Some(crate::proto::metapb::RegionEpoch { conf_ver: 1, version: 9 }),
+            ..Default::default()
+        };
+        let left = codec.encode_key(b"t\x80left");
+        let right = codec.encode_key(b"t\x80right");
+        let mut error = errorpb::Error {
+            message: format!("EpochNotMatch current epoch of region 1 is newer, key {secret_key:?}, OTHERTENANT"),
+            epoch_not_match: Some(EpochNotMatch {
+                current_regions: vec![
+                    region(11, &left, &right),
+                    // Its end lies in the neighbour's keyspace.
+                    region(12, &right, &secret_key),
+                    region(13, &secret_key, &neighbour.end_key()),
+                ],
+            }),
+            ..Default::default()
+        };
+        codec.decode_region_error(&mut error).unwrap();
+        let pd_client = Arc::new(MockPdClient::default());
+        let returned = handle_region_error_in(pd_client.clone(), error, region_store(), Some(codec))
+            .await
+            .unwrap_err();
+        let installed = pd_client
+            .epoch_not_match_regions()
+            .iter()
+            .map(|region| (region.id(), region.region.start_key.clone(), region.region.end_key.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            installed,
+            [(11, left.clone(), right.clone()), (12, right.clone(), codec.end_key().to_vec())],
+            "the cache gets this keyspace's regions with physical keys"
+        );
+        let Error::RegionError(returned_error) = &returned else {
+            panic!("{returned:?}");
+        };
+        let bounds = returned_error
+            .epoch_not_match
+            .as_ref()
+            .unwrap()
+            .current_regions
+            .iter()
+            .map(|region| (region.start_key.clone(), region.end_key.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(bounds, [(b"t\x80left".to_vec(), b"t\x80right".to_vec()), (b"t\x80right".to_vec(), Vec::new())]);
+        assert!(!leaked(&returned), "{returned:?}");
+
+        let mut buckets = errorpb::Error {
+            message: format!("bucket version not match: {secret_key:?} OTHERTENANT"),
+            bucket_version_not_match: Some(errorpb::BucketVersionNotMatch {
+                version: 4,
+                keys: vec![encoded(&left), encoded(&right), encoded(&secret_key)],
+            }),
+            ..Default::default()
+        };
+        codec.decode_region_error(&mut buckets).unwrap();
+        let returned = handle_region_error_in(pd_client.clone(), buckets, region_store(), Some(codec))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            pd_client.bucket_updates().pop().unwrap().2,
+            [left.clone(), right.clone(), codec.end_key().to_vec()],
+            "the cache gets physical bucket keys"
+        );
+        assert!(!leaked(&returned), "{returned:?}");
+
+        let mut not_in_region = errorpb::Error {
+            message: format!("Key {secret_key:?} is not in region 1 [{secret_key:?}, ) OTHERTENANT"),
+            key_not_in_region: Some(errorpb::KeyNotInRegion {
+                key: codec.encode_key(b"mDDLJobHistory"),
+                region_id: 1,
+                // Raw, as the cloud engine's read path answers them.
+                start_key: secret_key.clone(),
+                end_key: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        codec.decode_region_error(&mut not_in_region).unwrap();
+        let ver_id = region_store().region_with_leader.ver_id();
+        let returned = handle_region_error_in(pd_client.clone(), not_in_region, region_store(), Some(codec))
+            .await
+            .unwrap_err();
+        assert!(pd_client.invalidated_regions().contains(&ver_id), "the region is invalidated");
+        let Error::RegionError(returned_error) = &returned else {
+            panic!("{returned:?}");
+        };
+        let missed = returned_error.key_not_in_region.as_ref().unwrap();
+        assert!(missed.start_key.is_empty() && missed.end_key.is_empty(), "{missed:?}");
+        assert!(!leaked(&returned), "{returned:?}");
     }
 
     async fn source_epoch_not_match_installs_replacements_from_responding_store() {

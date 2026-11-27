@@ -683,52 +683,98 @@ impl ApiV2Codec {
         if let Some(key_not_in_region) = &mut error.key_not_in_region {
             key_not_in_region.key = self.decode_key(&key_not_in_region.key)?;
             // The bounds only describe the region the request missed, which
-            // the caller invalidates before it retries. Bounds a store
-            // answers raw rather than memcomparable (the cloud engine's read
-            // path does) are kept as they are: failing their decode turned a
-            // misrouted read into a hard "invalid marker byte" error instead
-            // of a reload and a retry.
-            if let Ok((start_key, end_key)) =
-                self.decode_region_range(&key_not_in_region.start_key, &key_not_in_region.end_key)
-            {
-                (key_not_in_region.start_key, key_not_in_region.end_key) = (start_key, end_key);
+            // the caller invalidates before it retries. Bounds that do not
+            // decode into this keyspace (the cloud engine's read path answers
+            // them raw; a region boundary can be a neighbouring tenant's key)
+            // are cleared rather than failing the request with "invalid
+            // marker byte" or passing another tenant's key bytes on.
+            match self.decode_region_range(&key_not_in_region.start_key, &key_not_in_region.end_key) {
+                Ok((start_key, end_key)) => {
+                    (key_not_in_region.start_key, key_not_in_region.end_key) = (start_key, end_key);
+                }
+                Err(_) => {
+                    key_not_in_region.start_key.clear();
+                    key_not_in_region.end_key.clear();
+                }
             }
+            // A store's message for it carries the key and both bounds.
+            error.message = format!("key not in region {}", key_not_in_region.region_id);
         }
 
-        // The replacement regions and bucket keys of a region error are
-        // installed into the native region cache, which keeps PHYSICAL keys
-        // (the keyspace prefix retained, as PD-loaded regions are; see
-        // `pd/codec.rs`). Decoding them to client-go's logical keys here put
-        // prefix-less bounds into that cache: the keyspace's last region came
-        // back as [logical start, "") and covered every physical key above
-        // it, so a lookup of the keyspace's meta range could hit a table
-        // region whose read answered nothing and whose write was lost. Only
-        // TiKV's memcomparable layer is removed; client-go's omission of
-        // sibling regions entirely outside the keyspace is kept.
+        // Replacement regions and bucket keys stay client-go's logical keys,
+        // scoped to this keyspace, as a caller of the error sees them; the
+        // region cache, which keeps physical keys, gets them through
+        // `physical_region_range` and `physical_bucket_keys`.
+        if error.epoch_not_match.is_some() {
+            error.message = "epoch not match".to_owned();
+        }
+        if error.bucket_version_not_match.is_some() {
+            error.message = "bucket version not match".to_owned();
+        }
         if let Some(epoch_not_match) = &mut error.epoch_not_match {
             let mut decoded_regions = Vec::with_capacity(epoch_not_match.current_regions.len());
             for mut region in std::mem::take(&mut epoch_not_match.current_regions) {
-                let (start_key, end_key) =
-                    ApiV1Codec::new(KeyMode::Txn).decode_region_range(&region.start_key, &region.end_key)?;
-                let outside = start_key.as_slice() >= self.end_key.as_slice()
-                    || (!end_key.is_empty() && end_key.as_slice() <= self.prefix.as_slice());
-                if outside {
-                    // client-go omits sibling regions entirely outside this keyspace.
-                    continue;
+                match self.decode_region_range(&region.start_key, &region.end_key) {
+                    Ok((start_key, end_key)) => {
+                        region.start_key = start_key;
+                        region.end_key = end_key;
+                        decoded_regions.push(region);
+                    }
+                    Err(error) if is_keyspace_out_of_bound(&error) => {
+                        // client-go omits sibling regions entirely outside this keyspace.
+                    }
+                    Err(error) => return Err(error),
                 }
-                region.start_key = start_key;
-                region.end_key = end_key;
-                decoded_regions.push(region);
             }
             epoch_not_match.current_regions = decoded_regions;
         }
 
         if let Some(bucket_version_not_match) = &mut error.bucket_version_not_match {
             bucket_version_not_match.keys =
-                ApiV1Codec::new(KeyMode::Txn).decode_bucket_keys(&bucket_version_not_match.keys)?;
+                self.decode_bucket_keys(&bucket_version_not_match.keys)?;
         }
 
         Ok(())
+    }
+
+    /// The physical bounds, as the native region cache keeps them (see
+    /// `pd/codec.rs`), of a region this codec decoded to logical bounds
+    /// scoped to the keyspace: the keyspace prefix restored, and an empty
+    /// bound being the keyspace's own. Installing the logical bounds put
+    /// prefix-less keys into that cache: the keyspace's last region came
+    /// back as [logical start, "") and covered every physical key above it,
+    /// so a lookup of the keyspace's meta range hit a table region whose
+    /// read answered nothing and whose write was lost.
+    pub fn physical_region_range(&self, start: &[u8], end: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut physical_start = self.prefix.to_vec();
+        physical_start.extend_from_slice(start);
+        let physical_end = if end.is_empty() {
+            self.end_key.to_vec()
+        } else {
+            let mut physical_end = self.prefix.to_vec();
+            physical_end.extend_from_slice(end);
+            physical_end
+        };
+        (physical_start, physical_end)
+    }
+
+    /// The physical form of bucket keys this codec decoded
+    /// ([`Self::decode_bucket_keys`]): an empty first or last key is the
+    /// keyspace's own bound.
+    pub fn physical_bucket_keys(&self, keys: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let last = keys.len().saturating_sub(1);
+        keys.iter()
+            .enumerate()
+            .map(|(index, key)| {
+                if key.is_empty() && index == last && index != 0 {
+                    self.end_key.to_vec()
+                } else {
+                    let mut physical = self.prefix.to_vec();
+                    physical.extend_from_slice(key);
+                    physical
+                }
+            })
+            .collect()
     }
 
     /// Decodes API V2 bucket boundary keys with client-go's edge suppression.
@@ -888,6 +934,9 @@ impl ApiV2Codec {
     }
 }
 
+fn is_keyspace_out_of_bound(error: &crate::Error) -> bool {
+    matches!(error, crate::Error::StringError(message) if message == "given key does not belong to the keyspace")
+}
 
 pub trait EncodeKeyspace {
     fn encode_keyspace(self, keyspace: Keyspace, key_mode: KeyMode) -> Self;
@@ -1471,9 +1520,8 @@ mod tests {
             [Vec::new(), b"middle".to_vec(), Vec::new()]
         );
 
-        // Bucket mismatch keys are consumed by RegionCache as region keys,
-        // and the cache keeps physical keys: the API-v2 response codec only
-        // removes the memcomparable layer, as PD-loaded buckets are decoded.
+        // Bucket mismatch keys are consumed by RegionCache as region keys, so
+        // the API-v2 response codec must decode them before they are cached.
         let mut region_error = crate::proto::errorpb::Error {
             bucket_version_not_match: Some(crate::proto::errorpb::BucketVersionNotMatch {
                 keys: physical_bucket_keys.clone(),
@@ -1484,7 +1532,7 @@ mod tests {
         v2.decode_region_error(&mut region_error).unwrap();
         assert_eq!(
             region_error.bucket_version_not_match.unwrap().keys,
-            ApiV1Codec::new(KeyMode::Txn).decode_bucket_keys(&physical_bucket_keys).unwrap()
+            [Vec::new(), b"middle".to_vec(), Vec::new()]
         );
 
         let mut malformed = crate::proto::errorpb::Error {
@@ -1519,22 +1567,6 @@ mod tests {
         assert_eq!(key_not_in_region.start_key, b"a");
         assert_eq!(key_not_in_region.end_key, b"z");
 
-        // Raw bounds, as the cloud engine's read path answers them, are kept
-        // rather than failing the decode: the request is retried after the
-        // region is invalidated.
-        let raw_start = codec.encode_key(b"t\x80\0\0\0\0\0\x1f\x8c");
-        let mut raw = errorpb::Error {
-            key_not_in_region: Some(errorpb::KeyNotInRegion {
-                key: codec.encode_key(b"mDDLJobHistory"),
-                start_key: raw_start.clone(),
-                end_key: Vec::new(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        codec.decode_region_error(&mut raw).unwrap();
-        assert_eq!(raw.key_not_in_region.unwrap().start_key, raw_start);
-
         let before = ApiV2Codec::new(KeyMode::Raw, 0x101)
             .unwrap()
             .encode_region_range(b"", b"");
@@ -1559,9 +1591,8 @@ mod tests {
         codec.decode_region_error(&mut epoch_not_match).unwrap();
         let regions = epoch_not_match.epoch_not_match.unwrap().current_regions;
         assert_eq!(regions.len(), 1);
-        // Physical bounds, as the region cache keeps them.
-        assert_eq!(regions[0].start_key, codec.encode_key(b"a"));
-        assert_eq!(regions[0].end_key, codec.encode_key(b"z"));
+        assert_eq!(regions[0].start_key, b"a");
+        assert_eq!(regions[0].end_key, b"z");
     }
 
     #[test]
@@ -2309,28 +2340,28 @@ mod tests {
                 regions[0].start_key.as_slice(),
                 regions[0].end_key.as_slice()
             ),
-            (prefix.as_slice(), end.as_slice())
+            (b"".as_slice(), b"".as_slice())
         );
         assert_eq!(
             (
                 regions[1].start_key.as_slice(),
                 regions[1].end_key.as_slice()
             ),
-            (before.as_slice(), after.as_slice())
+            (b"".as_slice(), b"".as_slice())
         );
         assert_eq!(
             (
                 regions[2].start_key.as_slice(),
                 regions[2].end_key.as_slice()
             ),
-            (before.as_slice(), inside_left.as_slice())
+            (b"".as_slice(), b"left".as_slice())
         );
         assert_eq!(
             (
                 regions[3].start_key.as_slice(),
                 regions[3].end_key.as_slice()
             ),
-            (inside_left.as_slice(), inside_right.as_slice())
+            (b"left".as_slice(), b"right".as_slice())
         );
     }
 

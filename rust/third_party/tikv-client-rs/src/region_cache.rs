@@ -5306,13 +5306,13 @@ mod test {
     }
 
     /// A keyspace's last region splits and TiKV answers a request with
-    /// EpochNotMatch carrying both halves. The response codec hands them to
-    /// the cache, which keeps physical keys: decoded to client-go's logical
-    /// keys, the right half came back as [`t...`, "") and covered every
-    /// physical key of the keyspace above `t`, its `m` meta range included,
-    /// so it evicted the keyspace's meta region and a meta read or write went
-    /// to that table region (its read answered nothing, its write never
-    /// reached the meta region).
+    /// EpochNotMatch carrying both halves, which the response codec decodes
+    /// to logical keys scoped to the keyspace. The cache keeps physical keys,
+    /// so they are installed in physical form: installed as they decode, the
+    /// right half [`t...`, "") covered every physical key of the keyspace
+    /// above `t`, its `m` meta range included, so it evicted the keyspace's
+    /// meta region and a meta read or write went to that table region (its
+    /// read answered nothing, its write never reached the meta region).
     #[tokio::test]
     async fn an_api_v2_epoch_not_match_installs_physical_regions() {
         use crate::proto::errorpb;
@@ -5338,20 +5338,22 @@ mod test {
         };
         codec.decode_region_error(&mut error).unwrap();
         let replacements = error.epoch_not_match.unwrap().current_regions;
-        let bounds = replacements.iter().map(|half| (half.start_key.clone(), half.end_key.clone())).collect::<Vec<_>>();
-        assert_eq!(bounds, [(left.clone(), right.clone()), (right.clone(), next_keyspace)], "physical bounds");
 
         // The keyspace's meta region, loaded from PD (physical bounds); the
         // replacements must neither evict it nor cover its keys.
         let cache = RegionCache::new(Arc::new(MockRetryClient::default()));
         cache.add_region(region(10, codec.encode_key(b""), left.clone())).await;
-        for replacement in replacements {
+        for mut replacement in replacements {
+            (replacement.start_key, replacement.end_key) =
+                codec.physical_region_range(&replacement.start_key, &replacement.end_key);
             cache.add_region(RegionWithLeader::new(replacement, None)).await;
         }
         let meta: Key = codec.encode_key(b"mPDJrnl/A/pb/x").into();
         assert_eq!(cache.try_locate_key(&meta).await.map(|region| region.id()), Some(10), "the meta key stays in the meta region");
         let table: Key = codec.encode_key(b"t\x80\0\0\0\0\0\x22\xa1_r").into();
         assert_eq!(cache.try_locate_key(&table).await.map(|region| region.id()), Some(12));
+        let next: Key = next_keyspace.into();
+        assert_eq!(cache.try_locate_key(&next).await.map(|region| region.id()), None, "the next keyspace is not covered");
     }
 
     #[tokio::test]

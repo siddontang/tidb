@@ -1285,10 +1285,11 @@ impl<PdC: PdClient> Client<PdC> {
             return match resp {
                 Ok(mut r) => {
                     if let Some(err) = r.region_error() {
-                        let action = match plan::handle_region_error(
+                        let action = match plan::handle_region_error_in(
                             self.rpc.clone(),
                             err.clone(),
                             store.clone(),
+                            self.keyspace.response_codec(crate::request::KeyMode::Raw),
                         )
                         .await
                         {

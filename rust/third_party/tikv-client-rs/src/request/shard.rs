@@ -103,6 +103,10 @@ macro_rules! impl_inner_shardable {
             self.inner.mark_retry_request();
         }
 
+        fn region_error_codec(&self) -> Option<$crate::request::ApiV2Codec> {
+            self.inner.region_error_codec()
+        }
+
         fn reset_replica_selector_state(&mut self) {
             self.inner.reset_replica_selector_state();
         }
@@ -261,6 +265,13 @@ pub trait Shardable {
     /// Source `RegionRequestSender` marks every resend in the wire context.
     /// Plans without a TiKV request retain a no-op implementation.
     fn mark_retry_request(&mut self) {}
+
+    /// The API V2 codec that decoded this plan's region errors, which the
+    /// region-error handler needs to install their regions into the region
+    /// cache with physical keys ([`crate::request::ApiV2Codec::physical_region_range`]).
+    fn region_error_codec(&self) -> Option<crate::request::ApiV2Codec> {
+        None
+    }
 
     /// Source `doActionOnMutations` builds a new `RegionRequestSender`, and
     /// with it a new replica selector, for every re-split batch. Plans that
@@ -694,6 +705,10 @@ impl<Req: KvRequest + Shardable> Shardable for Dispatch<Req> {
         self.request.retries_undetermined_result()
     }
 
+    fn region_error_codec(&self) -> Option<crate::request::ApiV2Codec> {
+        self.response_codec
+    }
+
     fn mark_retry_request(&mut self) {
         self.request.set_is_retry_request();
         if let Some(timeout) = self.retry_request_timeout {
@@ -862,6 +877,10 @@ impl<P: Plan + Shardable> Shardable for PreserveShard<P> {
         self.inner.mark_retry_request();
     }
 
+    fn region_error_codec(&self) -> Option<crate::request::ApiV2Codec> {
+        self.inner.region_error_codec()
+    }
+
     fn reset_replica_selector_state(&mut self) {
         self.inner.reset_replica_selector_state();
     }
@@ -992,6 +1011,10 @@ impl<P: Plan + Shardable, PdC: PdClient> Shardable for CleanupLocks<P, PdC> {
 
     fn mark_retry_request(&mut self) {
         self.inner.mark_retry_request();
+    }
+
+    fn region_error_codec(&self) -> Option<crate::request::ApiV2Codec> {
+        self.inner.region_error_codec()
     }
 
     fn reset_replica_selector_state(&mut self) {

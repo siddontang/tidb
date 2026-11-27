@@ -35,7 +35,7 @@ use crate::proto::kvrpcpb;
 use crate::proto::kvrpcpb::TxnInfo;
 use crate::proto::pdpb::Timestamp;
 use crate::region::RegionVerId;
-use crate::request::plan::handle_region_error;
+use crate::request::plan::handle_region_error_in;
 use crate::request::plan::{invalidate_connection_for_error, is_grpc_error};
 use crate::request::CollectSingle;
 use crate::request::CollectWithShard;
@@ -1643,8 +1643,13 @@ async fn resolve_lite_locks_with_retry_for_read_cleanup(
                 Ok(_) => {}
                 Err(Error::ExtractedErrors(mut errors)) => match errors.pop() {
                     Some(Error::RegionError(error)) => {
-                        let action =
-                            handle_region_error(pd_client.clone(), *error.clone(), store).await?;
+                        let action = handle_region_error_in(
+                            pd_client.clone(),
+                            *error.clone(),
+                            store,
+                            keyspace.response_codec(KeyMode::Txn),
+                        )
+                        .await?;
                         use crate::request::plan::RegionErrorRetry;
                         let config = match action {
                             RegionErrorRetry::Backoff(config)
@@ -1876,9 +1881,13 @@ async fn resolve_lock_with_retry_inner(
                 // ResolveLockResponse can have at most 1 error
                 match errors.pop() {
                     Some(Error::RegionError(e)) => {
-                        let action =
-                            handle_region_error(pd_client.clone(), *e.clone(), store.clone())
-                                .await?;
+                        let action = handle_region_error_in(
+                            pd_client.clone(),
+                            *e.clone(),
+                            store.clone(),
+                            keyspace.response_codec(KeyMode::Txn),
+                        )
+                        .await?;
                         use crate::request::plan::RegionErrorRetry;
                         match action {
                             RegionErrorRetry::Immediate => {

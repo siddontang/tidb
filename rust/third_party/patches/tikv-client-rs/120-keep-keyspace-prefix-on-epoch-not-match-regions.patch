@@ -1,19 +1,36 @@
+diff --git a/src/raw/client.rs b/src/raw/client.rs
+index 0439004877..97277928db 100644
+--- a/src/raw/client.rs
++++ b/src/raw/client.rs
+@@ -1285,10 +1285,11 @@ impl<PdC: PdClient> Client<PdC> {
+             return match resp {
+                 Ok(mut r) => {
+                     if let Some(err) = r.region_error() {
+-                        let action = match plan::handle_region_error(
++                        let action = match plan::handle_region_error_in(
+                             self.rpc.clone(),
+                             err.clone(),
+                             store.clone(),
++                            self.keyspace.response_codec(crate::request::KeyMode::Raw),
+                         )
+                         .await
+                         {
 diff --git a/src/region_cache.rs b/src/region_cache.rs
-index 6b5ce7078a..6b9c8509d5 100644
+index 6b5ce7078a..6ac4c8f745 100644
 --- a/src/region_cache.rs
 +++ b/src/region_cache.rs
-@@ -5305,6 +5305,55 @@ mod test {
+@@ -5305,6 +5305,57 @@ mod test {
          Ok(())
      }
  
 +    /// A keyspace's last region splits and TiKV answers a request with
-+    /// EpochNotMatch carrying both halves. The response codec hands them to
-+    /// the cache, which keeps physical keys: decoded to client-go's logical
-+    /// keys, the right half came back as [`t...`, "") and covered every
-+    /// physical key of the keyspace above `t`, its `m` meta range included,
-+    /// so it evicted the keyspace's meta region and a meta read or write went
-+    /// to that table region (its read answered nothing, its write never
-+    /// reached the meta region).
++    /// EpochNotMatch carrying both halves, which the response codec decodes
++    /// to logical keys scoped to the keyspace. The cache keeps physical keys,
++    /// so they are installed in physical form: installed as they decode, the
++    /// right half [`t...`, "") covered every physical key of the keyspace
++    /// above `t`, its `m` meta range included, so it evicted the keyspace's
++    /// meta region and a meta read or write went to that table region (its
++    /// read answered nothing, its write never reached the meta region).
 +    #[tokio::test]
 +    async fn an_api_v2_epoch_not_match_installs_physical_regions() {
 +        use crate::proto::errorpb;
@@ -39,203 +56,463 @@ index 6b5ce7078a..6b9c8509d5 100644
 +        };
 +        codec.decode_region_error(&mut error).unwrap();
 +        let replacements = error.epoch_not_match.unwrap().current_regions;
-+        let bounds = replacements.iter().map(|half| (half.start_key.clone(), half.end_key.clone())).collect::<Vec<_>>();
-+        assert_eq!(bounds, [(left.clone(), right.clone()), (right.clone(), next_keyspace)], "physical bounds");
 +
 +        // The keyspace's meta region, loaded from PD (physical bounds); the
 +        // replacements must neither evict it nor cover its keys.
 +        let cache = RegionCache::new(Arc::new(MockRetryClient::default()));
 +        cache.add_region(region(10, codec.encode_key(b""), left.clone())).await;
-+        for replacement in replacements {
++        for mut replacement in replacements {
++            (replacement.start_key, replacement.end_key) =
++                codec.physical_region_range(&replacement.start_key, &replacement.end_key);
 +            cache.add_region(RegionWithLeader::new(replacement, None)).await;
 +        }
 +        let meta: Key = codec.encode_key(b"mPDJrnl/A/pb/x").into();
 +        assert_eq!(cache.try_locate_key(&meta).await.map(|region| region.id()), Some(10), "the meta key stays in the meta region");
 +        let table: Key = codec.encode_key(b"t\x80\0\0\0\0\0\x22\xa1_r").into();
 +        assert_eq!(cache.try_locate_key(&table).await.map(|region| region.id()), Some(12));
++        let next: Key = next_keyspace.into();
++        assert_eq!(cache.try_locate_key(&next).await.map(|region| region.id()), None, "the next keyspace is not covered");
 +    }
 +
      #[tokio::test]
      async fn test_add_disjoint_regions() {
          let retry_client = Arc::new(MockRetryClient::default());
 diff --git a/src/request/keyspace.rs b/src/request/keyspace.rs
-index 29354e3b8d..92a6f79e52 100644
+index 29354e3b8d..11b8f14059 100644
 --- a/src/request/keyspace.rs
 +++ b/src/request/keyspace.rs
-@@ -682,31 +682,50 @@ impl ApiV2Codec {
+@@ -682,10 +682,35 @@ impl ApiV2Codec {
      ) -> crate::Result<()> {
          if let Some(key_not_in_region) = &mut error.key_not_in_region {
              key_not_in_region.key = self.decode_key(&key_not_in_region.key)?;
 -            (key_not_in_region.start_key, key_not_in_region.end_key) =
 -                self.decode_region_range(&key_not_in_region.start_key, &key_not_in_region.end_key)?;
 +            // The bounds only describe the region the request missed, which
-+            // the caller invalidates before it retries. Bounds a store
-+            // answers raw rather than memcomparable (the cloud engine's read
-+            // path does) are kept as they are: failing their decode turned a
-+            // misrouted read into a hard "invalid marker byte" error instead
-+            // of a reload and a retry.
-+            if let Ok((start_key, end_key)) =
-+                self.decode_region_range(&key_not_in_region.start_key, &key_not_in_region.end_key)
-+            {
-+                (key_not_in_region.start_key, key_not_in_region.end_key) = (start_key, end_key);
++            // the caller invalidates before it retries. Bounds that do not
++            // decode into this keyspace (the cloud engine's read path answers
++            // them raw; a region boundary can be a neighbouring tenant's key)
++            // are cleared rather than failing the request with "invalid
++            // marker byte" or passing another tenant's key bytes on.
++            match self.decode_region_range(&key_not_in_region.start_key, &key_not_in_region.end_key) {
++                Ok((start_key, end_key)) => {
++                    (key_not_in_region.start_key, key_not_in_region.end_key) = (start_key, end_key);
++                }
++                Err(_) => {
++                    key_not_in_region.start_key.clear();
++                    key_not_in_region.end_key.clear();
++                }
 +            }
++            // A store's message for it carries the key and both bounds.
++            error.message = format!("key not in region {}", key_not_in_region.region_id);
          }
  
-+        // The replacement regions and bucket keys of a region error are
-+        // installed into the native region cache, which keeps PHYSICAL keys
-+        // (the keyspace prefix retained, as PD-loaded regions are; see
-+        // `pd/codec.rs`). Decoding them to client-go's logical keys here put
-+        // prefix-less bounds into that cache: the keyspace's last region came
-+        // back as [logical start, "") and covered every physical key above
-+        // it, so a lookup of the keyspace's meta range could hit a table
-+        // region whose read answered nothing and whose write was lost. Only
-+        // TiKV's memcomparable layer is removed; client-go's omission of
-+        // sibling regions entirely outside the keyspace is kept.
++        // Replacement regions and bucket keys stay client-go's logical keys,
++        // scoped to this keyspace, as a caller of the error sees them; the
++        // region cache, which keeps physical keys, gets them through
++        // `physical_region_range` and `physical_bucket_keys`.
++        if error.epoch_not_match.is_some() {
++            error.message = "epoch not match".to_owned();
++        }
++        if error.bucket_version_not_match.is_some() {
++            error.message = "bucket version not match".to_owned();
++        }
          if let Some(epoch_not_match) = &mut error.epoch_not_match {
              let mut decoded_regions = Vec::with_capacity(epoch_not_match.current_regions.len());
              for mut region in std::mem::take(&mut epoch_not_match.current_regions) {
--                match self.decode_region_range(&region.start_key, &region.end_key) {
--                    Ok((start_key, end_key)) => {
--                        region.start_key = start_key;
--                        region.end_key = end_key;
--                        decoded_regions.push(region);
--                    }
--                    Err(error) if is_keyspace_out_of_bound(&error) => {
--                        // client-go omits sibling regions entirely outside this keyspace.
--                    }
--                    Err(error) => return Err(error),
-+                let (start_key, end_key) =
-+                    ApiV1Codec::new(KeyMode::Txn).decode_region_range(&region.start_key, &region.end_key)?;
-+                let outside = start_key.as_slice() >= self.end_key.as_slice()
-+                    || (!end_key.is_empty() && end_key.as_slice() <= self.prefix.as_slice());
-+                if outside {
-+                    // client-go omits sibling regions entirely outside this keyspace.
-+                    continue;
-                 }
-+                region.start_key = start_key;
-+                region.end_key = end_key;
-+                decoded_regions.push(region);
-             }
-             epoch_not_match.current_regions = decoded_regions;
-         }
- 
-         if let Some(bucket_version_not_match) = &mut error.bucket_version_not_match {
-             bucket_version_not_match.keys =
--                self.decode_bucket_keys(&bucket_version_not_match.keys)?;
-+                ApiV1Codec::new(KeyMode::Txn).decode_bucket_keys(&bucket_version_not_match.keys)?;
-         }
- 
+@@ -712,6 +737,46 @@ impl ApiV2Codec {
          Ok(())
-@@ -869,9 +888,6 @@ impl ApiV2Codec {
      }
- }
  
--fn is_keyspace_out_of_bound(error: &crate::Error) -> bool {
--    matches!(error, crate::Error::StringError(message) if message == "given key does not belong to the keyspace")
--}
- 
- pub trait EncodeKeyspace {
-     fn encode_keyspace(self, keyspace: Keyspace, key_mode: KeyMode) -> Self;
-@@ -1455,8 +1471,9 @@ mod tests {
-             [Vec::new(), b"middle".to_vec(), Vec::new()]
++    /// The physical bounds, as the native region cache keeps them (see
++    /// `pd/codec.rs`), of a region this codec decoded to logical bounds
++    /// scoped to the keyspace: the keyspace prefix restored, and an empty
++    /// bound being the keyspace's own. Installing the logical bounds put
++    /// prefix-less keys into that cache: the keyspace's last region came
++    /// back as [logical start, "") and covered every physical key above it,
++    /// so a lookup of the keyspace's meta range hit a table region whose
++    /// read answered nothing and whose write was lost.
++    pub fn physical_region_range(&self, start: &[u8], end: &[u8]) -> (Vec<u8>, Vec<u8>) {
++        let mut physical_start = self.prefix.to_vec();
++        physical_start.extend_from_slice(start);
++        let physical_end = if end.is_empty() {
++            self.end_key.to_vec()
++        } else {
++            let mut physical_end = self.prefix.to_vec();
++            physical_end.extend_from_slice(end);
++            physical_end
++        };
++        (physical_start, physical_end)
++    }
++
++    /// The physical form of bucket keys this codec decoded
++    /// ([`Self::decode_bucket_keys`]): an empty first or last key is the
++    /// keyspace's own bound.
++    pub fn physical_bucket_keys(&self, keys: &[Vec<u8>]) -> Vec<Vec<u8>> {
++        let last = keys.len().saturating_sub(1);
++        keys.iter()
++            .enumerate()
++            .map(|(index, key)| {
++                if key.is_empty() && index == last && index != 0 {
++                    self.end_key.to_vec()
++                } else {
++                    let mut physical = self.prefix.to_vec();
++                    physical.extend_from_slice(key);
++                    physical
++                }
++            })
++            .collect()
++    }
++
+     /// Decodes API V2 bucket boundary keys with client-go's edge suppression.
+     pub fn decode_bucket_keys(&self, keys: &[Vec<u8>]) -> crate::Result<Vec<Vec<u8>>> {
+         let mut decoded_keys = Vec::with_capacity(keys.len());
+diff --git a/src/request/plan.rs b/src/request/plan.rs
+index 13f31ee612..e3dbcae01f 100644
+--- a/src/request/plan.rs
++++ b/src/request/plan.rs
+@@ -2090,10 +2090,11 @@ where
+                 // deadline exhaustion after its typed region-error branches.
+                 Ok(RegionErrorRetry::Immediate)
+             } else {
+-                Box::pin(handle_region_error(
++                Box::pin(handle_region_error_in(
+                     pd_client.clone(),
+                     e.clone(),
+                     region_store.clone(),
++                    plan.region_error_codec(),
+                 ))
+                 .await
+             };
+@@ -2479,6 +2480,19 @@ pub(crate) async fn handle_region_error<PdC: PdClient>(
+     pd_client: Arc<PdC>,
+     e: errorpb::Error,
+     region_store: RegionStore,
++) -> Result<RegionErrorRetry> {
++    handle_region_error_in(pd_client, e, region_store, None).await
++}
++
++/// [`handle_region_error`] for an error `codec` (the request's API V2
++/// response codec) decoded: its replacement regions and bucket keys are
++/// logical and scoped to the keyspace, as the returned error carries them,
++/// and are installed into the region cache with physical keys.
++pub(crate) async fn handle_region_error_in<PdC: PdClient>(
++    pd_client: Arc<PdC>,
++    e: errorpb::Error,
++    region_store: RegionStore,
++    codec: Option<crate::request::ApiV2Codec>,
+ ) -> Result<RegionErrorRetry> {
+     let ver_id = region_store.region_with_leader.ver_id();
+     let store_id = region_store.region_with_leader.get_store_id();
+@@ -2545,19 +2559,19 @@ pub(crate) async fn handle_region_error<PdC: PdClient>(
+         pd_client.invalidate_region_cache(ver_id).await;
+         Err(Error::RegionError(Box::new(e)))
+     } else if let Some(epoch_not_match) = e.epoch_not_match.clone() {
+-        match on_region_epoch_not_match(pd_client.clone(), region_store, epoch_not_match).await? {
++        match on_region_epoch_not_match_in(pd_client.clone(), region_store, epoch_not_match, codec).await? {
+             EpochNotMatchOutcome::RetryAfterBackoff => {
+                 Ok(RegionErrorRetry::Backoff(BO_REGION_MISS))
+             }
+             EpochNotMatchOutcome::Stop => Err(Error::RegionError(Box::new(e))),
+         }
+     } else if let Some(bucket_mismatch) = e.bucket_version_not_match.as_ref() {
++        let keys = match codec {
++            Some(codec) => codec.physical_bucket_keys(&bucket_mismatch.keys),
++            None => bucket_mismatch.keys.clone(),
++        };
+         pd_client
+-            .update_buckets(
+-                ver_id,
+-                bucket_mismatch.version,
+-                bucket_mismatch.keys.clone(),
+-            )
++            .update_buckets(ver_id, bucket_mismatch.version, keys)
+             .await;
+         // client-go updates the bucket cache but deliberately returns this
+         // region error to its bucket-aware caller, which must reschedule the
+@@ -2635,6 +2649,18 @@ pub(crate) async fn on_region_epoch_not_match<PdC: PdClient>(
+     pd_client: Arc<PdC>,
+     region_store: RegionStore,
+     error: EpochNotMatch,
++) -> Result<EpochNotMatchOutcome> {
++    on_region_epoch_not_match_in(pd_client, region_store, error, None).await
++}
++
++/// [`on_region_epoch_not_match`] for replacement regions `codec` decoded to
++/// logical keys: the cache, which keeps physical keys, gets them with the
++/// keyspace prefix restored.
++pub(crate) async fn on_region_epoch_not_match_in<PdC: PdClient>(
++    pd_client: Arc<PdC>,
++    region_store: RegionStore,
++    error: EpochNotMatch,
++    codec: Option<crate::request::ApiV2Codec>,
+ ) -> Result<EpochNotMatchOutcome> {
+     let ver_id = region_store.region_with_leader.ver_id();
+     if error.current_regions.is_empty() {
+@@ -2688,7 +2714,11 @@ pub(crate) async fn on_region_epoch_not_match<PdC: PdClient>(
+     let replacements = error
+         .current_regions
+         .into_iter()
+-        .map(|region| {
++        .map(|mut region| {
++            if let Some(codec) = codec {
++                (region.start_key, region.end_key) =
++                    codec.physical_region_range(&region.start_key, &region.end_key);
++            }
+             let initial_leader_store_id = if response_is_tiflash {
+                 region
+                     .peers
+@@ -5796,6 +5826,129 @@ mod test {
          );
+     }
  
--        // Bucket mismatch keys are consumed by RegionCache as region keys, so
--        // the API-v2 response codec must decode them before they are cached.
-+        // Bucket mismatch keys are consumed by RegionCache as region keys,
-+        // and the cache keeps physical keys: the API-v2 response codec only
-+        // removes the memcomparable layer, as PD-loaded buckets are decoded.
-         let mut region_error = crate::proto::errorpb::Error {
-             bucket_version_not_match: Some(crate::proto::errorpb::BucketVersionNotMatch {
-                 keys: physical_bucket_keys.clone(),
-@@ -1467,7 +1484,7 @@ mod tests {
-         v2.decode_region_error(&mut region_error).unwrap();
-         assert_eq!(
-             region_error.bucket_version_not_match.unwrap().keys,
--            [Vec::new(), b"middle".to_vec(), Vec::new()]
-+            ApiV1Codec::new(KeyMode::Txn).decode_bucket_keys(&physical_bucket_keys).unwrap()
-         );
- 
-         let mut malformed = crate::proto::errorpb::Error {
-@@ -1502,6 +1519,22 @@ mod tests {
-         assert_eq!(key_not_in_region.start_key, b"a");
-         assert_eq!(key_not_in_region.end_key, b"z");
- 
-+        // Raw bounds, as the cloud engine's read path answers them, are kept
-+        // rather than failing the decode: the request is retried after the
-+        // region is invalidated.
-+        let raw_start = codec.encode_key(b"t\x80\0\0\0\0\0\x1f\x8c");
-+        let mut raw = errorpb::Error {
-+            key_not_in_region: Some(errorpb::KeyNotInRegion {
-+                key: codec.encode_key(b"mDDLJobHistory"),
-+                start_key: raw_start.clone(),
-+                end_key: Vec::new(),
-+                ..Default::default()
++    /// An API V2 region error as the cloud engine sends it: memcomparable
++    /// physical bounds, a sibling region of the neighbouring tenant, and a
++    /// message that formats the keys. The region cache gets the replacement
++    /// regions and bucket keys of this keyspace with physical keys; the error
++    /// the handler returns carries only this keyspace's logical bounds and no
++    /// byte of the neighbour's keys or of the keyspace prefix, in its fields,
++    /// its message, its Display or its Debug. A KeyNotInRegion whose raw
++    /// bounds do not decode still invalidates the region, with both bounds
++    /// cleared.
++    #[tokio::test]
++    async fn api_v2_region_errors_install_physical_regions_and_return_tenant_safe_errors() {
++        use crate::request::{ApiV2Codec, KeyMode};
++
++        let codec = ApiV2Codec::new(KeyMode::Txn, 1).unwrap();
++        let neighbour = ApiV2Codec::new(KeyMode::Txn, 2).unwrap();
++        let encoded = |raw: &[u8]| {
++            let mut encoded = Vec::new();
++            crate::kv::codec::encode_bytes(&mut encoded, raw);
++            encoded
++        };
++        let secret_key = neighbour.encode_key(b"OTHERTENANT-secret");
++        let bytes = |key: &[u8]| format!("{key:?}").trim_matches(|c| c == '[' || c == ']').to_owned();
++        let leaked = |error: &Error| {
++            let text = format!("{error} {error:?}");
++            text.contains("OTHERTENANT")
++                || text.contains(&bytes(&secret_key))
++                || text.contains(&bytes(&neighbour.end_key()))
++                || text.contains(&bytes(&codec.prefix()))
++        };
++        let region = |id, start: &[u8], end: &[u8]| crate::proto::metapb::Region {
++            id,
++            start_key: encoded(start),
++            end_key: encoded(end),
++            region_epoch: Some(crate::proto::metapb::RegionEpoch { conf_ver: 1, version: 9 }),
++            ..Default::default()
++        };
++        let left = codec.encode_key(b"t\x80left");
++        let right = codec.encode_key(b"t\x80right");
++        let mut error = errorpb::Error {
++            message: format!("EpochNotMatch current epoch of region 1 is newer, key {secret_key:?}, OTHERTENANT"),
++            epoch_not_match: Some(EpochNotMatch {
++                current_regions: vec![
++                    region(11, &left, &right),
++                    // Its end lies in the neighbour's keyspace.
++                    region(12, &right, &secret_key),
++                    region(13, &secret_key, &neighbour.end_key()),
++                ],
 +            }),
 +            ..Default::default()
 +        };
-+        codec.decode_region_error(&mut raw).unwrap();
-+        assert_eq!(raw.key_not_in_region.unwrap().start_key, raw_start);
++        codec.decode_region_error(&mut error).unwrap();
++        let pd_client = Arc::new(MockPdClient::default());
++        let returned = handle_region_error_in(pd_client.clone(), error, region_store(), Some(codec))
++            .await
++            .unwrap_err();
++        let installed = pd_client
++            .epoch_not_match_regions()
++            .iter()
++            .map(|region| (region.id(), region.region.start_key.clone(), region.region.end_key.clone()))
++            .collect::<Vec<_>>();
++        assert_eq!(
++            installed,
++            [(11, left.clone(), right.clone()), (12, right.clone(), codec.end_key().to_vec())],
++            "the cache gets this keyspace's regions with physical keys"
++        );
++        let Error::RegionError(returned_error) = &returned else {
++            panic!("{returned:?}");
++        };
++        let bounds = returned_error
++            .epoch_not_match
++            .as_ref()
++            .unwrap()
++            .current_regions
++            .iter()
++            .map(|region| (region.start_key.clone(), region.end_key.clone()))
++            .collect::<Vec<_>>();
++        assert_eq!(bounds, [(b"t\x80left".to_vec(), b"t\x80right".to_vec()), (b"t\x80right".to_vec(), Vec::new())]);
++        assert!(!leaked(&returned), "{returned:?}");
 +
-         let before = ApiV2Codec::new(KeyMode::Raw, 0x101)
-             .unwrap()
-             .encode_region_range(b"", b"");
-@@ -1526,8 +1559,9 @@ mod tests {
-         codec.decode_region_error(&mut epoch_not_match).unwrap();
-         let regions = epoch_not_match.epoch_not_match.unwrap().current_regions;
-         assert_eq!(regions.len(), 1);
--        assert_eq!(regions[0].start_key, b"a");
--        assert_eq!(regions[0].end_key, b"z");
-+        // Physical bounds, as the region cache keeps them.
-+        assert_eq!(regions[0].start_key, codec.encode_key(b"a"));
-+        assert_eq!(regions[0].end_key, codec.encode_key(b"z"));
++        let mut buckets = errorpb::Error {
++            message: format!("bucket version not match: {secret_key:?} OTHERTENANT"),
++            bucket_version_not_match: Some(errorpb::BucketVersionNotMatch {
++                version: 4,
++                keys: vec![encoded(&left), encoded(&right), encoded(&secret_key)],
++            }),
++            ..Default::default()
++        };
++        codec.decode_region_error(&mut buckets).unwrap();
++        let returned = handle_region_error_in(pd_client.clone(), buckets, region_store(), Some(codec))
++            .await
++            .unwrap_err();
++        assert_eq!(
++            pd_client.bucket_updates().pop().unwrap().2,
++            [left.clone(), right.clone(), codec.end_key().to_vec()],
++            "the cache gets physical bucket keys"
++        );
++        assert!(!leaked(&returned), "{returned:?}");
++
++        let mut not_in_region = errorpb::Error {
++            message: format!("Key {secret_key:?} is not in region 1 [{secret_key:?}, ) OTHERTENANT"),
++            key_not_in_region: Some(errorpb::KeyNotInRegion {
++                key: codec.encode_key(b"mDDLJobHistory"),
++                region_id: 1,
++                // Raw, as the cloud engine's read path answers them.
++                start_key: secret_key.clone(),
++                end_key: Vec::new(),
++            }),
++            ..Default::default()
++        };
++        codec.decode_region_error(&mut not_in_region).unwrap();
++        let ver_id = region_store().region_with_leader.ver_id();
++        let returned = handle_region_error_in(pd_client.clone(), not_in_region, region_store(), Some(codec))
++            .await
++            .unwrap_err();
++        assert!(pd_client.invalidated_regions().contains(&ver_id), "the region is invalidated");
++        let Error::RegionError(returned_error) = &returned else {
++            panic!("{returned:?}");
++        };
++        let missed = returned_error.key_not_in_region.as_ref().unwrap();
++        assert!(missed.start_key.is_empty() && missed.end_key.is_empty(), "{missed:?}");
++        assert!(!leaked(&returned), "{returned:?}");
++    }
++
+     async fn source_epoch_not_match_installs_replacements_from_responding_store() {
+         let pd_client = Arc::new(MockPdClient::default());
+         let mut replacement = MockPdClient::region2().region;
+diff --git a/src/request/shard.rs b/src/request/shard.rs
+index a2651fb52e..53d54a2b94 100644
+--- a/src/request/shard.rs
++++ b/src/request/shard.rs
+@@ -103,6 +103,10 @@ macro_rules! impl_inner_shardable {
+             self.inner.mark_retry_request();
+         }
+ 
++        fn region_error_codec(&self) -> Option<$crate::request::ApiV2Codec> {
++            self.inner.region_error_codec()
++        }
++
+         fn reset_replica_selector_state(&mut self) {
+             self.inner.reset_replica_selector_state();
+         }
+@@ -262,6 +266,13 @@ pub trait Shardable {
+     /// Plans without a TiKV request retain a no-op implementation.
+     fn mark_retry_request(&mut self) {}
+ 
++    /// The API V2 codec that decoded this plan's region errors, which the
++    /// region-error handler needs to install their regions into the region
++    /// cache with physical keys ([`crate::request::ApiV2Codec::physical_region_range`]).
++    fn region_error_codec(&self) -> Option<crate::request::ApiV2Codec> {
++        None
++    }
++
+     /// Source `doActionOnMutations` builds a new `RegionRequestSender`, and
+     /// with it a new replica selector, for every re-split batch. Plans that
+     /// carry selector attempt state clear it here; the default carries none.
+@@ -694,6 +705,10 @@ impl<Req: KvRequest + Shardable> Shardable for Dispatch<Req> {
+         self.request.retries_undetermined_result()
      }
  
-     #[test]
-@@ -2275,28 +2309,28 @@ mod tests {
-                 regions[0].start_key.as_slice(),
-                 regions[0].end_key.as_slice()
-             ),
--            (b"".as_slice(), b"".as_slice())
-+            (prefix.as_slice(), end.as_slice())
-         );
-         assert_eq!(
-             (
-                 regions[1].start_key.as_slice(),
-                 regions[1].end_key.as_slice()
-             ),
--            (b"".as_slice(), b"".as_slice())
-+            (before.as_slice(), after.as_slice())
-         );
-         assert_eq!(
-             (
-                 regions[2].start_key.as_slice(),
-                 regions[2].end_key.as_slice()
-             ),
--            (b"".as_slice(), b"left".as_slice())
-+            (before.as_slice(), inside_left.as_slice())
-         );
-         assert_eq!(
-             (
-                 regions[3].start_key.as_slice(),
-                 regions[3].end_key.as_slice()
-             ),
--            (b"left".as_slice(), b"right".as_slice())
-+            (inside_left.as_slice(), inside_right.as_slice())
-         );
++    fn region_error_codec(&self) -> Option<crate::request::ApiV2Codec> {
++        self.response_codec
++    }
++
+     fn mark_retry_request(&mut self) {
+         self.request.set_is_retry_request();
+         if let Some(timeout) = self.retry_request_timeout {
+@@ -862,6 +877,10 @@ impl<P: Plan + Shardable> Shardable for PreserveShard<P> {
+         self.inner.mark_retry_request();
      }
  
-diff --git a/src/transaction/requests.rs b/src/transaction/requests.rs
-index 0d35dc5bc7..2c8700c61c 100644
---- a/src/transaction/requests.rs
-+++ b/src/transaction/requests.rs
-@@ -3897,7 +3897,8 @@ mod tests {
-                 .as_ref()
-                 .unwrap()
-                 .keys,
--            [b"batch-bucket-a".to_vec(), b"batch-bucket-b".to_vec()]
-+            // Physical, as the region cache keeps bucket keys.
-+            [codec.encode_key(b"batch-bucket-a"), codec.encode_key(b"batch-bucket-b")]
-         );
++    fn region_error_codec(&self) -> Option<crate::request::ApiV2Codec> {
++        self.inner.region_error_codec()
++    }
++
+     fn reset_replica_selector_state(&mut self) {
+         self.inner.reset_replica_selector_state();
+     }
+@@ -994,6 +1013,10 @@ impl<P: Plan + Shardable, PdC: PdClient> Shardable for CleanupLocks<P, PdC> {
+         self.inner.mark_retry_request();
+     }
  
-         let mut malformed_response = crate::proto::coprocessor::Response {
++    fn region_error_codec(&self) -> Option<crate::request::ApiV2Codec> {
++        self.inner.region_error_codec()
++    }
++
+     fn reset_replica_selector_state(&mut self) {
+         self.inner.reset_replica_selector_state();
+     }
+diff --git a/src/transaction/gc.rs b/src/transaction/gc.rs
+index ff3cdb59c3..a18a77928c 100644
+--- a/src/transaction/gc.rs
++++ b/src/transaction/gc.rs
+@@ -243,10 +243,11 @@ impl<PdC: PdClient> RegionLockResolver for BaseRegionLockResolver<PdC> {
+                 // next `LocateKey` sees the split or the new leader. Its
+                 // retry decision is not this loop's: client-go backs off
+                 // `BoRegionMiss` and locates again, as below.
+-                let _ = crate::request::plan::handle_region_error(
++                let _ = crate::request::plan::handle_region_error_in(
+                     self.store.pd_client(),
+                     (*region_error).clone(),
+                     store,
++                    keyspace.response_codec(KeyMode::Txn),
+                 )
+                 .await;
+                 backoff_or(backoff, Error::RegionError(region_error)).await?;
+diff --git a/src/transaction/lock.rs b/src/transaction/lock.rs
+index fd923d638e..90a0e05b77 100644
+--- a/src/transaction/lock.rs
++++ b/src/transaction/lock.rs
+@@ -35,7 +35,7 @@ use crate::proto::kvrpcpb;
+ use crate::proto::kvrpcpb::TxnInfo;
+ use crate::proto::pdpb::Timestamp;
+ use crate::region::RegionVerId;
+-use crate::request::plan::handle_region_error;
++use crate::request::plan::handle_region_error_in;
+ use crate::request::plan::{invalidate_connection_for_error, is_grpc_error};
+ use crate::request::CollectSingle;
+ use crate::request::CollectWithShard;
+@@ -1643,8 +1643,13 @@ async fn resolve_lite_locks_with_retry_for_read_cleanup(
+                 Ok(_) => {}
+                 Err(Error::ExtractedErrors(mut errors)) => match errors.pop() {
+                     Some(Error::RegionError(error)) => {
+-                        let action =
+-                            handle_region_error(pd_client.clone(), *error.clone(), store).await?;
++                        let action = handle_region_error_in(
++                            pd_client.clone(),
++                            *error.clone(),
++                            store,
++                            keyspace.response_codec(KeyMode::Txn),
++                        )
++                        .await?;
+                         use crate::request::plan::RegionErrorRetry;
+                         let config = match action {
+                             RegionErrorRetry::Backoff(config)
+@@ -1876,9 +1881,13 @@ async fn resolve_lock_with_retry_inner(
+                 // ResolveLockResponse can have at most 1 error
+                 match errors.pop() {
+                     Some(Error::RegionError(e)) => {
+-                        let action =
+-                            handle_region_error(pd_client.clone(), *e.clone(), store.clone())
+-                                .await?;
++                        let action = handle_region_error_in(
++                            pd_client.clone(),
++                            *e.clone(),
++                            store.clone(),
++                            keyspace.response_codec(KeyMode::Txn),
++                        )
++                        .await?;
+                         use crate::request::plan::RegionErrorRetry;
+                         match action {
+                             RegionErrorRetry::Immediate => {

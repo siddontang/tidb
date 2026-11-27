@@ -243,10 +243,11 @@ impl<PdC: PdClient> RegionLockResolver for BaseRegionLockResolver<PdC> {
                 // next `LocateKey` sees the split or the new leader. Its
                 // retry decision is not this loop's: client-go backs off
                 // `BoRegionMiss` and locates again, as below.
-                let _ = crate::request::plan::handle_region_error(
+                let _ = crate::request::plan::handle_region_error_in(
                     self.store.pd_client(),
                     (*region_error).clone(),
                     store,
+                    keyspace.response_codec(KeyMode::Txn),
                 )
                 .await;
                 backoff_or(backoff, Error::RegionError(region_error)).await?;
