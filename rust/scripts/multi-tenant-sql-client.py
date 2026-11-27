@@ -321,9 +321,12 @@ class TenantSQLTests(unittest.TestCase):
             cursor.fetchall()
         for cursor, own, other in zip(self.clients, markers, reversed(markers)):
             for table in ("slow_query", "cluster_slow_query"):
+                # The probe passes the marker reversed, so a probe that is itself slow does not
+                # add the marker to this tenant's slow log.
                 count = lambda marker: self.scalar(
-                    cursor, f"SELECT COUNT(*) FROM information_schema.{table} WHERE query LIKE %s",
-                    ("%" + marker + "%",))
+                    cursor, f"SELECT COUNT(*) FROM information_schema.{table} "
+                            "WHERE query LIKE CONCAT('%%', REVERSE(%s), '%%')",
+                    (marker[::-1],))
                 self.assertEqual(count(own), 1, table)
                 self.assertEqual(count(other), 0, table)
             cursor.execute("ADMIN SHOW SLOW RECENT 200")
