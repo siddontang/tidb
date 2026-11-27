@@ -78,7 +78,7 @@ index 6b5ce7078a..6ac4c8f745 100644
      async fn test_add_disjoint_regions() {
          let retry_client = Arc::new(MockRetryClient::default());
 diff --git a/src/request/keyspace.rs b/src/request/keyspace.rs
-index 29354e3b8d..11b8f14059 100644
+index 29354e3b8d..a552f1f5ed 100644
 --- a/src/request/keyspace.rs
 +++ b/src/request/keyspace.rs
 @@ -682,10 +682,35 @@ impl ApiV2Codec {
@@ -119,7 +119,25 @@ index 29354e3b8d..11b8f14059 100644
          if let Some(epoch_not_match) = &mut error.epoch_not_match {
              let mut decoded_regions = Vec::with_capacity(epoch_not_match.current_regions.len());
              for mut region in std::mem::take(&mut epoch_not_match.current_regions) {
-@@ -712,6 +737,46 @@ impl ApiV2Codec {
+@@ -698,20 +723,61 @@ impl ApiV2Codec {
+                     Err(error) if is_keyspace_out_of_bound(&error) => {
+                         // client-go omits sibling regions entirely outside this keyspace.
+                     }
+-                    Err(error) => return Err(error),
++                    Err(_) => return Err(malformed_region_metadata(&format!("region {}", region.id))),
+                 }
+             }
+             epoch_not_match.current_regions = decoded_regions;
+         }
+ 
+         if let Some(bucket_version_not_match) = &mut error.bucket_version_not_match {
+-            bucket_version_not_match.keys =
+-                self.decode_bucket_keys(&bucket_version_not_match.keys)?;
++            bucket_version_not_match.keys = self
++                .decode_bucket_keys(&bucket_version_not_match.keys)
++                .map_err(|_| malformed_region_metadata("buckets"))?;
+         }
+ 
          Ok(())
      }
  
@@ -166,8 +184,27 @@ index 29354e3b8d..11b8f14059 100644
      /// Decodes API V2 bucket boundary keys with client-go's edge suppression.
      pub fn decode_bucket_keys(&self, keys: &[Vec<u8>]) -> crate::Result<Vec<Vec<u8>>> {
          let mut decoded_keys = Vec::with_capacity(keys.len());
+@@ -869,6 +935,18 @@ impl ApiV2Codec {
+     }
+ }
+ 
++/// The error for a region error's region or bucket bounds that do not
++/// decode. The codec's own error quotes the offending bytes, which may be a
++/// neighbouring tenant's keys, and this one is returned before the client
++/// knows whose they are: it keeps the `ApiCodecDecode` classification with a
++/// cause that names no byte in its Display, Debug or `source()` chain. The
++/// response is dropped, so the region cache is left as it was.
++fn malformed_region_metadata(what: &str) -> crate::Error {
++    crate::Error::ApiCodecDecode(Box::new(crate::Error::StringError(format!(
++        "malformed region metadata in {what}"
++    ))))
++}
++
+ fn is_keyspace_out_of_bound(error: &crate::Error) -> bool {
+     matches!(error, crate::Error::StringError(message) if message == "given key does not belong to the keyspace")
+ }
 diff --git a/src/request/plan.rs b/src/request/plan.rs
-index 13f31ee612..e3dbcae01f 100644
+index 13f31ee612..62ec21f034 100644
 --- a/src/request/plan.rs
 +++ b/src/request/plan.rs
 @@ -2090,10 +2090,11 @@ where
@@ -261,7 +298,7 @@ index 13f31ee612..e3dbcae01f 100644
              let initial_leader_store_id = if response_is_tiflash {
                  region
                      .peers
-@@ -5796,6 +5826,129 @@ mod test {
+@@ -5796,6 +5826,205 @@ mod test {
          );
      }
  
@@ -386,6 +423,82 @@ index 13f31ee612..e3dbcae01f 100644
 +        let missed = returned_error.key_not_in_region.as_ref().unwrap();
 +        assert!(missed.start_key.is_empty() && missed.end_key.is_empty(), "{missed:?}");
 +        assert!(!leaked(&returned), "{returned:?}");
++    }
++
++    /// A region error whose replacement regions or bucket keys carry
++    /// malformed bounds (here, a neighbouring tenant's raw key) fails the
++    /// request with the `ApiCodecDecode` classification and a cause that
++    /// quotes none of the bounds' bytes in its Display, Debug or `source()`
++    /// chain, and leaves the region cache untouched.
++    #[tokio::test]
++    async fn api_v2_malformed_region_metadata_fails_without_bytes_or_cache_changes() {
++        use crate::request::{ApiV2Codec, KeyMode};
++
++        let codec = ApiV2Codec::new(KeyMode::Txn, 1).unwrap();
++        let neighbour = ApiV2Codec::new(KeyMode::Txn, 2).unwrap();
++        // Raw, not memcomparable: the codec's decode error would quote it.
++        let secret_key = neighbour.encode_key(b"OTHERTENANT-secret");
++        let bytes = |key: &[u8]| format!("{key:?}").trim_matches(|c| c == '[' || c == ']').to_owned();
++        let malformed_errors = [
++            errorpb::Error {
++                epoch_not_match: Some(EpochNotMatch {
++                    current_regions: vec![crate::proto::metapb::Region {
++                        id: 11,
++                        start_key: secret_key.clone(),
++                        end_key: Vec::new(),
++                        ..Default::default()
++                    }],
++                }),
++                ..Default::default()
++            },
++            errorpb::Error {
++                bucket_version_not_match: Some(errorpb::BucketVersionNotMatch {
++                    version: 4,
++                    keys: vec![secret_key.clone()],
++                }),
++                ..Default::default()
++            },
++        ];
++        for region_error in malformed_errors {
++            let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook({
++                let region_error = region_error.clone();
++                move |_request: &dyn std::any::Any| {
++                    Ok(Box::new(kvrpcpb::GetResponse {
++                        region_error: Some(Box::new(region_error.clone())),
++                        ..Default::default()
++                    }) as Box<dyn std::any::Any>)
++                }
++            })));
++            let error = PlanBuilder::new(
++                pd_client.clone(),
++                Keyspace::Enable { keyspace_id: 1 },
++                kvrpcpb::GetRequest {
++                    key: codec.encode_key(b"mDDLJobHistory"),
++                    ..Default::default()
++                },
++            )
++            .retry_multi_region(Backoff::no_jitter_backoff(0, 0, 1))
++            .plan()
++            .execute()
++            .await
++            .unwrap_err();
++            assert!(crate::request::is_decode_error(&error), "{error:?}");
++            let mut text = format!("{error} {error:?}");
++            let mut source = std::error::Error::source(&error);
++            while let Some(cause) = source {
++                text.push_str(&format!(" {cause} {cause:?}"));
++                source = cause.source();
++            }
++            assert!(
++                // The codec quotes a group as `"x\x00\x00\x02OTHER"`.
++                !text.contains("OTHER")
++                    && !text.contains(r"\x00\x00\x02")
++                    && !text.contains(&bytes(&secret_key[..4])),
++                "{text}"
++            );
++            assert!(pd_client.epoch_not_match_regions().is_empty(), "the cache is untouched");
++            assert!(pd_client.bucket_updates().is_empty(), "the cache is untouched");
++        }
 +    }
 +
      async fn source_epoch_not_match_installs_replacements_from_responding_store() {

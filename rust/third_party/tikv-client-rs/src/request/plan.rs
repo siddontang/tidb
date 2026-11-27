@@ -5949,6 +5949,82 @@ mod test {
         assert!(!leaked(&returned), "{returned:?}");
     }
 
+    /// A region error whose replacement regions or bucket keys carry
+    /// malformed bounds (here, a neighbouring tenant's raw key) fails the
+    /// request with the `ApiCodecDecode` classification and a cause that
+    /// quotes none of the bounds' bytes in its Display, Debug or `source()`
+    /// chain, and leaves the region cache untouched.
+    #[tokio::test]
+    async fn api_v2_malformed_region_metadata_fails_without_bytes_or_cache_changes() {
+        use crate::request::{ApiV2Codec, KeyMode};
+
+        let codec = ApiV2Codec::new(KeyMode::Txn, 1).unwrap();
+        let neighbour = ApiV2Codec::new(KeyMode::Txn, 2).unwrap();
+        // Raw, not memcomparable: the codec's decode error would quote it.
+        let secret_key = neighbour.encode_key(b"OTHERTENANT-secret");
+        let bytes = |key: &[u8]| format!("{key:?}").trim_matches(|c| c == '[' || c == ']').to_owned();
+        let malformed_errors = [
+            errorpb::Error {
+                epoch_not_match: Some(EpochNotMatch {
+                    current_regions: vec![crate::proto::metapb::Region {
+                        id: 11,
+                        start_key: secret_key.clone(),
+                        end_key: Vec::new(),
+                        ..Default::default()
+                    }],
+                }),
+                ..Default::default()
+            },
+            errorpb::Error {
+                bucket_version_not_match: Some(errorpb::BucketVersionNotMatch {
+                    version: 4,
+                    keys: vec![secret_key.clone()],
+                }),
+                ..Default::default()
+            },
+        ];
+        for region_error in malformed_errors {
+            let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook({
+                let region_error = region_error.clone();
+                move |_request: &dyn std::any::Any| {
+                    Ok(Box::new(kvrpcpb::GetResponse {
+                        region_error: Some(Box::new(region_error.clone())),
+                        ..Default::default()
+                    }) as Box<dyn std::any::Any>)
+                }
+            })));
+            let error = PlanBuilder::new(
+                pd_client.clone(),
+                Keyspace::Enable { keyspace_id: 1 },
+                kvrpcpb::GetRequest {
+                    key: codec.encode_key(b"mDDLJobHistory"),
+                    ..Default::default()
+                },
+            )
+            .retry_multi_region(Backoff::no_jitter_backoff(0, 0, 1))
+            .plan()
+            .execute()
+            .await
+            .unwrap_err();
+            assert!(crate::request::is_decode_error(&error), "{error:?}");
+            let mut text = format!("{error} {error:?}");
+            let mut source = std::error::Error::source(&error);
+            while let Some(cause) = source {
+                text.push_str(&format!(" {cause} {cause:?}"));
+                source = cause.source();
+            }
+            assert!(
+                // The codec quotes a group as `"x\x00\x00\x02OTHER"`.
+                !text.contains("OTHER")
+                    && !text.contains(r"\x00\x00\x02")
+                    && !text.contains(&bytes(&secret_key[..4])),
+                "{text}"
+            );
+            assert!(pd_client.epoch_not_match_regions().is_empty(), "the cache is untouched");
+            assert!(pd_client.bucket_updates().is_empty(), "the cache is untouched");
+        }
+    }
+
     async fn source_epoch_not_match_installs_replacements_from_responding_store() {
         let pd_client = Arc::new(MockPdClient::default());
         let mut replacement = MockPdClient::region2().region;

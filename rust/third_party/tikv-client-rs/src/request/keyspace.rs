@@ -723,15 +723,16 @@ impl ApiV2Codec {
                     Err(error) if is_keyspace_out_of_bound(&error) => {
                         // client-go omits sibling regions entirely outside this keyspace.
                     }
-                    Err(error) => return Err(error),
+                    Err(_) => return Err(malformed_region_metadata(&format!("region {}", region.id))),
                 }
             }
             epoch_not_match.current_regions = decoded_regions;
         }
 
         if let Some(bucket_version_not_match) = &mut error.bucket_version_not_match {
-            bucket_version_not_match.keys =
-                self.decode_bucket_keys(&bucket_version_not_match.keys)?;
+            bucket_version_not_match.keys = self
+                .decode_bucket_keys(&bucket_version_not_match.keys)
+                .map_err(|_| malformed_region_metadata("buckets"))?;
         }
 
         Ok(())
@@ -932,6 +933,18 @@ impl ApiV2Codec {
         }
         Ok(())
     }
+}
+
+/// The error for a region error's region or bucket bounds that do not
+/// decode. The codec's own error quotes the offending bytes, which may be a
+/// neighbouring tenant's keys, and this one is returned before the client
+/// knows whose they are: it keeps the `ApiCodecDecode` classification with a
+/// cause that names no byte in its Display, Debug or `source()` chain. The
+/// response is dropped, so the region cache is left as it was.
+fn malformed_region_metadata(what: &str) -> crate::Error {
+    crate::Error::ApiCodecDecode(Box::new(crate::Error::StringError(format!(
+        "malformed region metadata in {what}"
+    ))))
 }
 
 fn is_keyspace_out_of_bound(error: &crate::Error) -> bool {
