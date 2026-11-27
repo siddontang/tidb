@@ -16,7 +16,7 @@
 //! and the reconciler's loop for as long as it owns the DDL
 //! ([`crate::reconcile`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -57,16 +57,22 @@ pub struct CatalogTable {
 /// read afresh; `None` when the catalog holds no such database.
 pub type CatalogTables = Arc<dyn Fn(&str) -> Result<Option<Vec<CatalogTable>>, String> + Send + Sync>;
 
+/// One database's tables by lower-case name, `None` for a database the
+/// catalog does not hold.
+type Tables = Option<HashMap<String, CatalogTable>>;
+
 /// One cutover run's reads of the catalog: each database's tables are
-/// listed once and reused for every rule in it.
+/// listed once, indexed by name, and borrowed for every rule in it, so a
+/// cutover over many rules costs one listing per database and one lookup
+/// per rule.
 struct Catalog<'a> {
     tables: &'a CatalogTables,
-    by_db: BTreeMap<String, Result<Option<Vec<CatalogTable>>, String>>,
+    by_db: HashMap<String, Result<Tables, String>>,
 }
 
 impl<'a> Catalog<'a> {
     fn new(tables: &'a CatalogTables) -> Self {
-        Self { tables, by_db: BTreeMap::new() }
+        Self { tables, by_db: HashMap::new() }
     }
 
     /// The physical IDs a TiDB rule of `(db, table, partition)` covers: the
@@ -74,9 +80,13 @@ impl<'a> Catalog<'a> {
     /// (partition ""), the partition's for a partition rule; `None` when
     /// the catalog holds no such table or partition.
     fn ids(&mut self, db: &str, table: &str, partition: &str) -> Result<Option<Vec<i64>>, String> {
-        let tables = self.tables;
-        let listed = self.by_db.entry(db.to_owned()).or_insert_with(|| tables(db)).clone()?;
-        let Some(found) = listed.unwrap_or_default().into_iter().find(|candidate| candidate.name == table) else {
+        if !self.by_db.contains_key(db) {
+            let listed = (self.tables)(db)
+                .map(|tables| tables.map(|tables| tables.into_iter().map(|table| (table.name.clone(), table)).collect()));
+            self.by_db.insert(db.to_owned(), listed);
+        }
+        let listed = self.by_db[db].as_ref().map_err(Clone::clone)?;
+        let Some(found) = listed.as_ref().and_then(|tables| tables.get(table)) else {
             return Ok(None);
         };
         if partition.is_empty() {
@@ -394,5 +404,45 @@ impl tidb_owner::Listener for PdJournalDuties {
         if let Some(stop) = self.stop.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
             stop.store(true, Ordering::Release);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::{Catalog, CatalogTable, CatalogTables};
+
+    /// A cutover over thousands of rules of one database lists the database
+    /// once and finds each rule's table by name; a partition and a missing
+    /// table or database answer as before.
+    #[test]
+    fn the_catalog_is_listed_once_per_database_and_indexed_by_name() {
+        let listed = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&listed);
+        let tables: CatalogTables = Arc::new(move |db: &str| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok((db == "db").then(|| {
+                (0..4_000)
+                    .map(|index| CatalogTable {
+                        name: format!("t{index}"),
+                        id: 100 + index,
+                        partitions: vec![(format!("p{index}"), 10_000 + index)],
+                    })
+                    .collect()
+            }))
+        });
+        let mut catalog = Catalog::new(&tables);
+        for index in 0..4_000 {
+            let ids = catalog.ids("db", &format!("t{index}"), "").unwrap();
+            assert_eq!(ids, Some(vec![100 + index, 10_000 + index]));
+        }
+        assert_eq!(catalog.ids("db", "t7", "p7").unwrap(), Some(vec![10_007]));
+        assert_eq!(catalog.ids("db", "t7", "p8").unwrap(), None);
+        assert_eq!(catalog.ids("db", "missing", "").unwrap(), None);
+        assert_eq!(listed.load(Ordering::SeqCst), 1);
+        assert_eq!(catalog.ids("other", "t1", "").unwrap(), None);
+        assert_eq!(listed.load(Ordering::SeqCst), 2);
     }
 }
