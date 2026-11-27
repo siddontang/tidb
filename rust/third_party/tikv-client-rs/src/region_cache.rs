@@ -5305,6 +5305,55 @@ mod test {
         Ok(())
     }
 
+    /// A keyspace's last region splits and TiKV answers a request with
+    /// EpochNotMatch carrying both halves. The response codec hands them to
+    /// the cache, which keeps physical keys: decoded to client-go's logical
+    /// keys, the right half came back as [`t...`, "") and covered every
+    /// physical key of the keyspace above `t`, its `m` meta range included,
+    /// so it evicted the keyspace's meta region and a meta read or write went
+    /// to that table region (its read answered nothing, its write never
+    /// reached the meta region).
+    #[tokio::test]
+    async fn an_api_v2_epoch_not_match_installs_physical_regions() {
+        use crate::proto::errorpb;
+        use crate::request::{ApiV2Codec, KeyMode};
+
+        let codec = ApiV2Codec::new(KeyMode::Txn, 1).unwrap();
+        let encoded = |raw: &[u8]| {
+            let mut encoded = Vec::new();
+            crate::kv::codec::encode_bytes(&mut encoded, raw);
+            encoded
+        };
+        let left = codec.encode_key(b"t\x80\0\0\0\0\0\x20\x3d");
+        let right = codec.encode_key(b"t\x80\0\0\0\0\0\x22\xa1");
+        let next_keyspace = codec.end_key().to_vec();
+        let halves = [(11, &left, &right), (12, &right, &next_keyspace)].map(|(id, start, end)| {
+            let mut half = region(id, encoded(start), encoded(end)).region;
+            half.region_epoch = Some(RegionEpoch { conf_ver: 1, version: 2 });
+            half
+        });
+        let mut error = errorpb::Error {
+            epoch_not_match: Some(errorpb::EpochNotMatch { current_regions: halves.to_vec() }),
+            ..Default::default()
+        };
+        codec.decode_region_error(&mut error).unwrap();
+        let replacements = error.epoch_not_match.unwrap().current_regions;
+        let bounds = replacements.iter().map(|half| (half.start_key.clone(), half.end_key.clone())).collect::<Vec<_>>();
+        assert_eq!(bounds, [(left.clone(), right.clone()), (right.clone(), next_keyspace)], "physical bounds");
+
+        // The keyspace's meta region, loaded from PD (physical bounds); the
+        // replacements must neither evict it nor cover its keys.
+        let cache = RegionCache::new(Arc::new(MockRetryClient::default()));
+        cache.add_region(region(10, codec.encode_key(b""), left.clone())).await;
+        for replacement in replacements {
+            cache.add_region(RegionWithLeader::new(replacement, None)).await;
+        }
+        let meta: Key = codec.encode_key(b"mPDJrnl/A/pb/x").into();
+        assert_eq!(cache.try_locate_key(&meta).await.map(|region| region.id()), Some(10), "the meta key stays in the meta region");
+        let table: Key = codec.encode_key(b"t\x80\0\0\0\0\0\x22\xa1_r").into();
+        assert_eq!(cache.try_locate_key(&table).await.map(|region| region.id()), Some(12));
+    }
+
     #[tokio::test]
     async fn test_add_disjoint_regions() {
         let retry_client = Arc::new(MockRetryClient::default());

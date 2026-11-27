@@ -3897,7 +3897,8 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .keys,
-            [b"batch-bucket-a".to_vec(), b"batch-bucket-b".to_vec()]
+            // Physical, as the region cache keeps bucket keys.
+            [codec.encode_key(b"batch-bucket-a"), codec.encode_key(b"batch-bucket-b")]
         );
 
         let mut malformed_response = crate::proto::coprocessor::Response {
