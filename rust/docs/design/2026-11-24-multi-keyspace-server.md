@@ -986,8 +986,10 @@ rule client. A tenant's PD effects then go through its own clients:
   recorded durably in the journal (`PDJrnl/H/...`), and every write of it
   -- a job step, ALTER RANGE, GC -- fails before PD with an error naming
   it, across restarts and owner changes, so an abort can never take it for
-  absent and delete it; GC's delete of a dropped table's rule fails too,
-  so its delete-range task stays pending until the rule is resolved. The operator resolves it by inspecting the rule in
+  absent and delete it; GC's delete of a dropped table's rule fails too
+  (GC reads the records and the holds in one snapshot, and a resolution
+  after it is caught by the delete's prepare), so its delete-range task
+  stays pending until the rule is resolved. The operator resolves it by inspecting the rule in
   PD and either deleting it (`pd-ctl region-label delete <id>`; re-apply
   the table's attributes by DDL afterwards if they were TiDB's) or making
   it the table's own (its labels and ranges), then restarting the DDL

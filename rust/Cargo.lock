@@ -7605,6 +7605,7 @@ dependencies = [
  "tidb-domain-infosync",
  "tidb-extworkload",
  "tidb-go-time-layout",
+ "tidb-gocontext",
  "tidb-intest",
  "tidb-keyspace",
  "tidb-log",

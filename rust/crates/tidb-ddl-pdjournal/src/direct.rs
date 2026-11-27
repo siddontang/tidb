@@ -119,8 +119,7 @@ fn abandon(store: &dyn MetaStore, pd: &dyn PdObjects, prepared: &journal::Prepar
 }
 
 /// The records of `keys` and whether the keyspace had its cutover, read in
-/// one transaction: what a writer that chooses objects by their record (GC)
-/// chooses from.
+/// one transaction ([`read_choice`]).
 ///
 /// # Errors
 /// The journal could not be read.
@@ -128,36 +127,39 @@ pub fn read_current(
     store: &dyn MetaStore,
     keys: &[crate::ObjectKey],
 ) -> Result<(std::collections::BTreeMap<crate::ObjectKey, crate::Record>, bool), String> {
-    let mut read = (std::collections::BTreeMap::new(), false);
-    journal::run(store, &mut |txn| {
-        let mut reader = TxnRead(txn);
-        read.0.clear();
-        for key in keys {
-            if let Some(record) = journal::read_record(&mut reader, key)? {
-                read.0.insert(key.clone(), record);
-            }
-        }
-        read.1 = journal::read_cutover(&mut reader)?.is_some();
-        Ok(())
-    })?;
-    Ok(read)
+    read_choice(store, keys).map(|(records, _, cutover)| (records, cutover))
 }
 
-/// The objects among `keys` the keyspace's cutover held back, read in one
-/// transaction: a writer that chooses objects by their record (GC) must not
-/// take one of them for an object without a record and skip it.
+/// What a writer that chooses objects by their record (GC) chooses from,
+/// read in one transaction, so one snapshot classifies every one of `keys`
+/// as recorded, held back by the cutover, or neither: the records, the
+/// held-back objects, and whether the keyspace had its cutover. An
+/// operator's resolution of a held-back object (its record and the end of
+/// its hold commit together) is seen whole or not at all; one that commits
+/// after the read is caught by the write's prepare, which requires the
+/// record it chose.
 ///
 /// # Errors
 /// The journal could not be read.
-pub fn read_held_back(store: &dyn MetaStore, keys: &[crate::ObjectKey]) -> Result<Vec<crate::HeldBack>, String> {
-    let mut held = Vec::new();
+pub fn read_choice(
+    store: &dyn MetaStore,
+    keys: &[crate::ObjectKey],
+) -> Result<(std::collections::BTreeMap<crate::ObjectKey, crate::Record>, Vec<crate::HeldBack>, bool), String> {
+    let mut read = (std::collections::BTreeMap::new(), Vec::new(), false);
     journal::run(store, &mut |txn| {
         let mut reader = TxnRead(txn);
-        held.clear();
+        read.0.clear();
+        read.1.clear();
         for key in keys {
-            held.extend(journal::read_held_back(&mut reader, key)?);
+            match journal::read_record(&mut reader, key)? {
+                Some(record) => {
+                    read.0.insert(key.clone(), record);
+                }
+                None => read.1.extend(journal::read_held_back(&mut reader, key)?),
+            }
         }
+        read.2 = journal::read_cutover(&mut reader)?.is_some();
         Ok(())
     })?;
-    Ok(held)
+    Ok(read)
 }

@@ -58,3 +58,4 @@ fail = { version = "0.4", features = ["failpoints"] }
 # Go's `tikvclient/...` failpoints, which the GC tests enable.
 tikv-client = { workspace = true, features = ["failpoints"] }
 tidb-unistore = { path = "../tidb-unistore" }
+tidb-gocontext = { path = "../tidb-gocontext" }
